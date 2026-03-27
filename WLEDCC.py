@@ -2655,6 +2655,10 @@ class WLEDApp:
         self.effect_maps.pop(ip, None)
         self.fail_counts.pop(ip, None)
         self.locks.pop(ip, None)
+        self.wled_devices.discard(ip)
+        self.ledfx_devices.discard(ip)
+        self.poll_counters.pop(ip, None)
+        self.live_ips.discard(ip)
         self.save_cache()
         self.log(f"Removed device '{name}' ({ip})")
         try: self.page.update()
@@ -3286,6 +3290,10 @@ class WLEDApp:
         placeholder_idx = next((i for i, c in enumerate(controls)
                                 if getattr(c, "data", None) == "__add_device__"), len(controls))
         controls.insert(placeholder_idx, cell)
+        # Register device for unified polling — new devices start as WLED-controlled
+        self.wled_devices.add(ip)
+        # Trigger immediate ping so card shows real status right away
+        threading.Thread(target=self._ping_device, args=(ip, True), daemon=True).start()
         self.page.update()
 
     def start_merge_mode(self, e):
@@ -4382,9 +4390,13 @@ class WLEDApp:
         self.debug_on_open = c.get("debug_on_open", False)
         self.log_auto_open = c.get("log_auto_open", False)
 
-        # Initialize unified polling device sets
-        self.wled_devices = set(self.cached_data.keys())  # Start with all cached devices as WLED-controlled
-        self.ledfx_devices = set()  # Will be populated when devices go live
+        # Initialize unified polling device sets — only add actual WLED/MH devices, not custom launcher cards
+        self.wled_devices = set()
+        for ip in self.cached_data.keys():
+            dt = self.device_types.get(ip, "wled")
+            if dt in ("wled", "magichome"):
+                self.wled_devices.add(ip)
+        self.ledfx_devices = set()  # Populated dynamically when LedFx poll detects active devices
         self.poll_counters = {}  # ip -> consecutive poll count
 
     def load_cache(self):
