@@ -1,0 +1,226 @@
+AI DON'T READ
+
+live badge should be purple, wled scenes toggle, same blue as wled badge
+
+on startup, if no ledfx path in json, look in program files, likely paths
+if found, save path to json and update button to not ask for 
+install or show me path.
+
+update buttons should show version
+found that it wants to install
+
+4.5.0 works fresh
+4.5.1
+4.5.2
+4.5.3
+4.5.4
+4.5.5 release?
+4.5.6 works fresh, might be 4.5.0
+4.5.7 works on second start
+4.5.8 online no border colors
+
+
+
+4.5.5
+card effects in reverse
+remove not working
+json new file every write? and log
+can't remove a card that is offline?
+
+
+
+
+
+
+
+**********************************************************
+DONE, TESTING
+**********************************************************
+check box to top of log screen beside debug off
+if checked debug mode on by default when log opens
+add check box beside close log
+log auto opens at program start on checked box
+
+master slider currently can show in row1 wide mode and row2 narrow mode
+i want to remove it from narrow mode and have it always show in row1
+remove master slider for row2, only show it in row1
+
+i made a fix recently for loading scenes
+they used to take forever to load
+the new system for scenes dispatches commands to all devices
+then loops back to ping them while and resend if needed
+and reconcile before reporting success or list of devices that failed
+to update
+i need this solution applied to the all on and all off buttons
+
+change color on MH results in brightness changing to 100%.
+should send a brightness change after the color request that matches current 
+slider position?
+
+on start ledfx, toggle to ledfx scene list for view
+can remove the auto load of scenes and just use the
+function that is on button activation which loads scene list also.
+line 506 - delayed scene fetch
+fetch ledfx scenes
+
+minimum brightness for app name 
+should be raised higher, still to dark at lowest setting.
+set constraint, min 25% brightness on cards and app name in top bar, device sliders should be unaffected by this change.
+
+scenes fail to set a device running preset effect to solid color request
+need to set effect solid, then color
+
+
+
+
+**********************************************************
+CHANGES PLANNED
+**********************************************************
+update manual with new features
+explain in user terms, not programmer
+better formatting
+
+add auto backup preset and config
+add auto upload   "           "
+
+note on log screen, after close log, 
+small text, 
+clearing log only clears screen data, 
+logs are still saved in file
+
+JSON - missing, loads backup
+corrupted, fails with no error and starts fresh.
+
+
+
+
+
+on exiting app
+display popup
+add all off button
+runs same code as main all off button
+add stop ledfx button
+runs same code as main stop ledfx button
+add cancel button
+closes popup, leaves app open
+add exit button
+closes app
+
+
+
+
+
+show status of how many lights user has, online offline count
+
+move live badge between ip and reboot
+do not hide online(%) in ledfx live mode
+was hoping after moving live badge and adding online (%) 
+that card would be shorter 
+maybe move reboot button to the left of power switch
+move sanitize up as high as possible and put live under that.
+when auto scroll is off in debug console,
+and max lines is reached
+user can not read text due to is scrolling off screen.
+
+
+**********************************************************
+IDEAS
+**********************************************************
+your text here, 
+vu meter here, 
+reboot icon near power, 
+sanitize up or icon, 
+live goes where it is now
+
+
+issue is
+[21:06:00] [DBG] LedFx Poll house (192.168.0.8): active=False streaming=False bri=N/A effect=N/A
+[21:07:00] [DBG] Ping HOUSE (192.168.0.8): on=False bri=50% fx=Solid color=#ffa000 signal=100% live=False
+device showing in both wled and ledfx polls
+
+
+locked_ips = variable for ledfx device list?
+line 345 - may need to delete from list here devices not active=True
+
+line 390 
+def _ledfx_virtual_to_ip(self, vid, virtuals):
+        """Legacy fallback — no longer used by main poll loop."""
+        """Legacy fallback — no longer used by main poll loop."""
+        return None
+may be able to delete
+
+line 3324
+ device_count = len(self.wled_devices)
+ possible name for moving devices from wled to ledfx
+
+ line 3352
+ if self.ledfx_running and current_time - _ledfx_last_poll >= LEDFX_POLL_INTERVAL:
+ possible name for ledfx poll list
+
+ line 3408
+ if device_ip not in ledfx_active or active or streaming:
+
+live 3417
+ # Apply live state changes to cards
+                    for ip, should_be_live in ledfx_active.items():
+                        was_live = ip in self.live_ips
+                        if should_be_live != was_live:
+                            if should_be_live:
+                                self._set_card_live(ip)
+                            else:
+                                self._set_card_unlive(ip, ping_delay=0)
+
+                    # Check for devices that should be unlive but aren't in active map
+                    for ip in list(self.live_ips):
+                        if ip not in ledfx_active:
+                            self._set_card_unlive(ip, ping_delay=0)
+
+
+[19:19:32] [DBG] [LedFx Poll] SULLYSSIGNS (192.168.0.94): active=False was_live=False
+card shows live false, 
+all wled devices still polling ledfx even though not live.
+need to switch polling to wled if live false
+
+
+
+
+
+******************************
+CHANGES SHOULD BE DONE BEFORE EXE MADE
+******************************
+
+
+
+keep slider on row1 for wide and narrow modes
+only move scenes to row2
+try master brightness slider on same row as app name, centered
+may be fixed with new measure process
+
+manual
+some text alignment is off in manual
+title for sections in caps, color green
+	features name under title in caps color cyan
+		indents on new lines that are part of above feature
+
+******************************
+NOTES TO KEEP
+******************************
+Steps to build:
+
+Update line 23 — change wledapp423.py to whatever your current file is named
+Place the spec file in the same folder as your .py file
+Open a command prompt in that folder and run:
+
+pyinstaller WLED_Controller.spec
+The EXE will appear in dist\WLED Controller.exe. The build\ folder and .spec file can stay — just re-run that same command whenever you want to rebuild after changes.
+
+***************************
+MAJOR CHANGES, DO AFTER GOOD EXE
+******************************
+Scene thumbnails or color swatches showing what a scene looks like before activating it
+
+Grouping — tag devices into rooms and control a whole room at once
+
+Schedules — turn things on/off or activate scenes at set times
+
+Mobile build once you're ready to tackle that

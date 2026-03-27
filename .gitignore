@@ -1,0 +1,18 @@
+# Python temporary files
+__pycache__/
+*.py[cod]
+
+# Distribution / Build folders
+build/
+dist/
+@backups/
+*.spec
+
+# Editor-specific settings
+.vscode/
+.idea/
+
+# Local system files
+Thumbs.db
+.DS_Store
+*.exe
