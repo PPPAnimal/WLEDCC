@@ -1,12 +1,12 @@
 # Python temporary files
 __pycache__/
 *.py[cod]
+*.py
 
 # Distribution / Build folders
 build/
 dist/
 @backups/
-*.spec
 
 # Editor-specific settings
 .vscode/
@@ -16,3 +16,10 @@ dist/
 Thumbs.db
 .DS_Store
 *.exe
+
+!WLEDCC.py
+!NewBuilder.bat
+!version.txt
+!WLEDCC.spec
+!WLEDCC_setup.iss
+!wledccicon.ico

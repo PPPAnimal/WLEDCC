@@ -505,10 +505,6 @@ class WLEDApp:
                     except: pass
                 def _delayed_scene_fetch():
                     time.sleep(3)
-                    
-                    # ppp self._fetch_ledfx_scenes()
-                    
-                    # ppp
                     self.toggle_scene_mode()
                     
                 threading.Thread(target=_delayed_scene_fetch, daemon=True).start()
@@ -2655,6 +2651,10 @@ class WLEDApp:
         self.effect_maps.pop(ip, None)
         self.fail_counts.pop(ip, None)
         self.locks.pop(ip, None)
+        self.wled_devices.discard(ip)
+        self.ledfx_devices.discard(ip)
+        self.poll_counters.pop(ip, None)
+        self.live_ips.discard(ip)
         self.save_cache()
         self.log(f"Removed device '{name}' ({ip})")
         try: self.page.update()
@@ -2823,19 +2823,6 @@ class WLEDApp:
                     else:
                         self.log(f"{card_name} — Color {cname} failed ({ip})", color="red400")
                 threading.Thread(target=_send, daemon=True).start()
-         
-         
-            # PPP - was setting color to full brightness on change
-            # else:
-                # self.mh_last_rgb[ip] = (r, g, b)
-                # self.mh_mode[ip] = {"pattern": None}
-                # self.log(f"{card_name} — Color {cname} ({ip})", color="cyan")
-                # def _send_mh():
-                    # self.send_magic_home_cmd(ip, [0x31, r, g, b, 0x00, 0xF0, 0x0F])
-                    # self.send_magic_home_cmd(ip, [0x71, 0x23, 0x0F])
-                    # self._mh_confirm_ping(ip)
-                # threading.Thread(target=_send_mh, daemon=True).start()
-            
             else:
                 # Store base color (unscaled) for future brightness math
                 self.mh_last_rgb[ip] = (r, g, b)
@@ -3051,6 +3038,12 @@ class WLEDApp:
             self.card_id_to_ip[cid] = ip
         else:
             self.card_id_to_ip[self.card_ids[ip]] = ip  # ensure reverse map is current
+            # Register in unified poll loop
+            # ppp should this be in the eles or outside it
+            if dev_type in ("wled", "magichome"):
+                self.wled_devices.add(ip)
+            self.fail_counts.setdefault(ip, 0)
+            self.locks.setdefault(ip, 0)
 
         display_name = self.custom_names.get(ip) or self.display_names.get(ip) or self._default_display_name(name, dev_type)
         is_wled = dev_type == "wled"
@@ -3286,6 +3279,10 @@ class WLEDApp:
         placeholder_idx = next((i for i, c in enumerate(controls)
                                 if getattr(c, "data", None) == "__add_device__"), len(controls))
         controls.insert(placeholder_idx, cell)
+        # Register device for unified polling — new devices start as WLED-controlled
+        self.wled_devices.add(ip)
+        # Trigger immediate ping so card shows real status right away
+        threading.Thread(target=self._ping_device, args=(ip, True), daemon=True).start()
         self.page.update()
 
     def start_merge_mode(self, e):
@@ -3768,10 +3765,9 @@ class WLEDApp:
             # Poll WLED devices if enough time has passed
             if current_time - _wled_round_start >= wled_interval:
                 _wled_round_start = current_time
-
+                polled_wled = []
                 if self.wled_devices:
                     # Poll WLED devices sequentially with offline backoff
-                    polled_wled = []
                     for ip in list(self.wled_devices):
                         if not self.running or not self.is_focused:
                             break
@@ -3786,9 +3782,10 @@ class WLEDApp:
 
                         polled_wled.append((self.cards.get(ip, {}).get('name_label').value if self.cards.get(ip, {}).get('name_label') else ip))
                         self._ping_device(ip)
-                else:
                     if polled_wled:
-                      self.dbg_unique('wled_poll_summary', '[WLED Poll] Polled: ' + ', '.join(polled_wled) + ' (' + str(len(polled_wled)) + ')')
+                      self.dbg_unique('wled_poll_summary', '[WLED Poll] Polled: ' + ', '.join(polled_wled) + ' (' + str(len(polled_wled)) + ')')    
+                else:
+                    
                     # No WLED devices to poll, short sleep
                     time.sleep(1)
 
@@ -4382,9 +4379,13 @@ class WLEDApp:
         self.debug_on_open = c.get("debug_on_open", False)
         self.log_auto_open = c.get("log_auto_open", False)
 
-        # Initialize unified polling device sets
-        self.wled_devices = set(self.cached_data.keys())  # Start with all cached devices as WLED-controlled
-        self.ledfx_devices = set()  # Will be populated when devices go live
+        # Initialize unified polling device sets — only add actual WLED/MH devices, not custom launcher cards
+        self.wled_devices = set()
+        for ip in self.cached_data.keys():
+            dt = self.device_types.get(ip, "wled")
+            if dt in ("wled", "magichome"):
+                self.wled_devices.add(ip)
+        self.ledfx_devices = set()  # Populated dynamically when LedFx poll detects active devices
         self.poll_counters = {}  # ip -> consecutive poll count
 
     def load_cache(self):
@@ -4865,7 +4866,9 @@ class WLEDApp:
         self.dbg(f"_set_card_live: {ip}", color="orange400")
         self.live_ips.add(ip)
         # Move device from WLED control to LedFx control
-        self.wled_devices.discard(ip)
+        #ppp disabled to try pinging live devices to get remote status changes
+        #also need to change set_card_unlive if adding this back in
+        #self.wled_devices.discard(ip)
         self.ledfx_devices.add(ip)
         self.poll_counters.pop(ip, None)  # Reset poll counter for new mode
         # Lock and dim all effect/color controls uniformly
@@ -4909,7 +4912,9 @@ class WLEDApp:
         self.lor2_ips.discard(ip)
         # Move device from LedFx control back to WLED control
         self.ledfx_devices.discard(ip)
-        self.wled_devices.add(ip)
+        #ppp disabled to try pinging live devices to get remote status changes
+        #also need to change set_card_live if adding this back in
+        #self.wled_devices.add(ip)
         self.poll_counters.pop(ip, None)  # Reset poll counter for new mode
         # Restore all effect/color controls uniformly
         for key in ("color_btn", "action_btn"):
