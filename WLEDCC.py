@@ -4495,84 +4495,92 @@ class WLEDApp:
         threading.Thread(target=self.refresh_all_statuses, args=(True,), daemon=True).start()
         threading.Thread(target=self.rescan_devices, daemon=True).start()
 
+    
+    
+    # ppp new scan
     def rescan_devices(self):
-        """Discovery scan — 10 second window, MagicHome broadcast sent 3 times (every 3s).
+        """Discovery scan — Two 5-second passes for better reliability.
         Prints a full device report at the end showing online/offline/new status.
         """
         self.log("─" * 40)
-        self.log("Scanning for devices (30s)...")
+        self.log("Starting dual-pass scan (10s total)...")
         found_mh_ips = set()
         known_ips_before = set(self.cards.keys())
-        SCAN_DURATION = 30
+        PASS_DURATION = 5  # 5 seconds per pass
         
-        #nonetype fix start
         from zeroconf import Zeroconf, ServiceBrowser
 
-        # Ensure clean mDNS state
-        try:
-            if self.browser:
-                self.browser.cancel()
-                self.browser = None
-        except:
-            pass
+        # Run two separate discovery passes
+        for pass_idx in range(2):
+            self.log(f"Scan pass {pass_idx + 1}/2...")
+            
+            # Ensure clean mDNS state for this pass
+            try:
+                if hasattr(self, 'browser') and self.browser:
+                    self.browser.cancel()
+                    self.browser = None
+            except: pass
 
-        try:
-            if self.zeroconf:
-                self.zeroconf.close()
-                self.zeroconf = None
-        except:
-            pass
+            try:
+                if hasattr(self, 'zeroconf') and self.zeroconf:
+                    self.zeroconf.close()
+                    self.zeroconf = None
+            except: pass
 
-        self.zeroconf = Zeroconf()
-        #nonetype fix end
+            self.zeroconf = Zeroconf()
 
-        # Start WLED mDNS browser — runs for full scan duration
-        try:
-            if self.browser:
-                self.browser.cancel()
-            self.browser = ServiceBrowser(self.zeroconf, "_wled._tcp.local.", WLEDListener(self))
-        except Exception as ex:
-            self.log(f"[Scan] WLED mDNS error: {ex}", color="red400")
+            # Start WLED mDNS browser
+            try:
+                self.browser = ServiceBrowser(self.zeroconf, "_wled._tcp.local.", WLEDListener(self))
+            except Exception as ex:
+                self.log(f"[Scan] WLED mDNS error: {ex}", color="red400")
 
-        # MagicHome broadcast — runs concurrently for full scan duration
-        try:
-            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-            s.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
-            s.settimeout(0.5)
-            deadline = time.time() + SCAN_DURATION
-            next_broadcast = 0
-            while time.time() < deadline:
-                if time.time() >= next_broadcast:
-                    s.sendto("HF-A11ASSISTHREAD".encode(), ('255.255.255.255', 48899))
-                    next_broadcast = time.time() + 5
-                try:
-                    d, a = s.recvfrom(1024)
-                    r = d.decode().split(',')
-                    if len(r) >= 2:
-                        mh_ip = r[0]
-                        if mh_ip not in found_mh_ips:
-                            found_mh_ips.add(mh_ip)
-                            name = f"MH-{r[1][-6:]}"
-                            is_new = mh_ip not in known_ips_before
-                            tag = "NEW" if is_new else "ONLINE"
-                            self.log(f"  ✓ {name} ({mh_ip})  [{tag}]", color="green400")
-                            self.page.run_task(self.async_add, name, mh_ip, "magichome")
-                except: pass
-            s.close()
-        except Exception as ex:
-            self.log(f"[Scan] MagicHome error: {ex}", color="red400")
+            # MagicHome broadcast loop
+            try:
+                s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                s.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+                s.settimeout(0.5)
+                deadline = time.time() + PASS_DURATION
+                next_broadcast = 0
+                
+                while time.time() < deadline:
+                    if time.time() >= next_broadcast:
+                        s.sendto("HF-A11ASSISTHREAD".encode(), ('255.255.255.255', 48899))
+                        next_broadcast = time.time() + 2 # Faster broadcast for short scan
+                    try:
+                        d, a = s.recvfrom(1024)
+                        r = d.decode().split(',')
+                        if len(r) >= 2:
+                            mh_ip = r[0]
+                            if mh_ip not in found_mh_ips:
+                                found_mh_ips.add(mh_ip)
+                                name = f"MH-{r[1][-6:]}"
+                                is_new = mh_ip not in known_ips_before
+                                tag = "NEW" if is_new else "ONLINE"
+                                self.log(f"  ✓ {name} ({mh_ip})  [{tag}]", color="green400")
+                                self.page.run_task(self.async_add, name, mh_ip, "magichome")
+                    except: pass
+                s.close()
+            except Exception as ex:
+                self.log(f"[Scan] MagicHome error: {ex}", color="red400")
 
-        # Shut down mDNS browser
-        try:
-            if self.browser:
-                self.browser.cancel()
-                self.browser = None
-        except: pass
+            # Shut down mDNS browser for this pass
+            try:
+                if self.browser:
+                    self.browser.cancel()
+                    self.browser = None
+                if self.zeroconf:
+                    self.zeroconf.close()
+                    self.zeroconf = None
+            except: pass
+            
+            if pass_idx == 0:
+                time.sleep(0.5) # Short breather between passes
 
         # Brief pause so heartbeat has time to update glow states on new devices
         time.sleep(1)
 
-        # ── Device report ─────────────────────────────────────────────────────
+        # ── Device report (Runs once after both passes) ───────────────────────
         wled_online, wled_offline, wled_new = [], [], []
         mh_online, mh_offline, mh_new = [], [], []
         for ip, c in list(self.cards.items()):
@@ -4582,8 +4590,8 @@ class WLEDApp:
             if dev_type == "wled":
                 state = c.get("_glow_state", "offline")
             else:
-                # MagicHome: online if found during this scan, offline otherwise
                 state = "online" if ip in found_mh_ips else "offline"
+            
             entry = (name, ip, is_new, state)
             if dev_type == "wled":
                 if is_new:               wled_new.append(entry)
@@ -4614,6 +4622,7 @@ class WLEDApp:
             self.log(f"  MagicHome — OFFLINE ({len(mh_offline)}):")
             for name, ip, _, _ in mh_offline:
                 self.log(f"    ✗ {name} ({ip})")
+        
         total = len(self.cards)
         total_on = len(wled_online) + len(wled_new) + len(mh_online) + len(mh_new)
         total_off = len(wled_offline) + len(mh_offline)
@@ -4627,8 +4636,143 @@ class WLEDApp:
         self.refresh_btn.disabled = False
         try: self.refresh_btn.update()
         except: pass
-        # Save cache after every scan — ensures json exists after first run
         self.save_cache()
+    
+    # ppp - new two time pass above
+    # def rescan_devices(self):
+        # """Discovery scan — 10 second window, MagicHome broadcast sent 3 times (every 3s).
+        # Prints a full device report at the end showing online/offline/new status.
+        # """
+        # self.log("─" * 40)
+        # self.log("Scanning for devices (30s)...")
+        # found_mh_ips = set()
+        # known_ips_before = set(self.cards.keys())
+        # SCAN_DURATION = 30
+        
+        # #nonetype fix start
+        # from zeroconf import Zeroconf, ServiceBrowser
+
+        # # Ensure clean mDNS state
+        # try:
+            # if self.browser:
+                # self.browser.cancel()
+                # self.browser = None
+        # except:
+            # pass
+
+        # try:
+            # if self.zeroconf:
+                # self.zeroconf.close()
+                # self.zeroconf = None
+        # except:
+            # pass
+
+        # self.zeroconf = Zeroconf()
+        # #nonetype fix end
+
+        # # Start WLED mDNS browser — runs for full scan duration
+        # try:
+            # if self.browser:
+                # self.browser.cancel()
+            # self.browser = ServiceBrowser(self.zeroconf, "_wled._tcp.local.", WLEDListener(self))
+        # except Exception as ex:
+            # self.log(f"[Scan] WLED mDNS error: {ex}", color="red400")
+
+        # # MagicHome broadcast — runs concurrently for full scan duration
+        # try:
+            # s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            # s.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+            # s.settimeout(0.5)
+            # deadline = time.time() + 5 # ppp SCAN_DURATION
+            # next_broadcast = 0
+            # while time.time() < deadline:
+                # if time.time() >= next_broadcast:
+                    # s.sendto("HF-A11ASSISTHREAD".encode(), ('255.255.255.255', 48899))
+                    # next_broadcast = time.time() + 5
+                # try:
+                    # d, a = s.recvfrom(1024)
+                    # r = d.decode().split(',')
+                    # if len(r) >= 2:
+                        # mh_ip = r[0]
+                        # if mh_ip not in found_mh_ips:
+                            # found_mh_ips.add(mh_ip)
+                            # name = f"MH-{r[1][-6:]}"
+                            # is_new = mh_ip not in known_ips_before
+                            # tag = "NEW" if is_new else "ONLINE"
+                            # self.log(f"  ✓ {name} ({mh_ip})  [{tag}]", color="green400")
+                            # self.page.run_task(self.async_add, name, mh_ip, "magichome")
+                # except: pass
+            # s.close()
+        # except Exception as ex:
+            # self.log(f"[Scan] MagicHome error: {ex}", color="red400")
+
+        # # Shut down mDNS browser
+        # try:
+            # if self.browser:
+                # self.browser.cancel()
+                # self.browser = None
+        # except: pass
+
+        # # Brief pause so heartbeat has time to update glow states on new devices
+        # time.sleep(1)
+
+        # # ── Device report ─────────────────────────────────────────────────────
+        # wled_online, wled_offline, wled_new = [], [], []
+        # mh_online, mh_offline, mh_new = [], [], []
+        # for ip, c in list(self.cards.items()):
+            # name = c["name_label"].value or ip
+            # is_new = ip not in known_ips_before
+            # dev_type = self.device_types.get(ip, "wled")
+            # if dev_type == "wled":
+                # state = c.get("_glow_state", "offline")
+            # else:
+                # # MagicHome: online if found during this scan, offline otherwise
+                # state = "online" if ip in found_mh_ips else "offline"
+            # entry = (name, ip, is_new, state)
+            # if dev_type == "wled":
+                # if is_new:               wled_new.append(entry)
+                # elif state == "offline": wled_offline.append(entry)
+                # else:                    wled_online.append(entry)
+            # else:
+                # if is_new:               mh_new.append(entry)
+                # elif state == "offline": mh_offline.append(entry)
+                # else:                    mh_online.append(entry)
+
+        # self.log("─" * 40)
+        # self.log("DEVICE REPORT", color="white")
+        # if wled_online or wled_new:
+            # self.log(f"  WLED — ONLINE ({len(wled_online) + len(wled_new)}):")
+            # for name, ip, is_new, _ in wled_online + wled_new:
+                # tag = " [NEW]" if is_new else ""
+                # self.log(f"    ✓ {name} ({ip}){tag}", color="green400")
+        # if wled_offline:
+            # self.log(f"  WLED — OFFLINE ({len(wled_offline)}):")
+            # for name, ip, _, _ in wled_offline:
+                # self.log(f"    ✗ {name} ({ip})", color="red400")
+        # if mh_online or mh_new:
+            # self.log(f"  MagicHome — ONLINE ({len(mh_online) + len(mh_new)}):")
+            # for name, ip, is_new, _ in mh_online + mh_new:
+                # tag = " [NEW]" if is_new else ""
+                # self.log(f"    ✓ {name} ({ip}){tag}")
+        # if mh_offline:
+            # self.log(f"  MagicHome — OFFLINE ({len(mh_offline)}):")
+            # for name, ip, _, _ in mh_offline:
+                # self.log(f"    ✗ {name} ({ip})")
+        # total = len(self.cards)
+        # total_on = len(wled_online) + len(wled_new) + len(mh_online) + len(mh_new)
+        # total_off = len(wled_offline) + len(mh_offline)
+        # self.log(f"  Total: {total} devices — {total_on} online, {total_off} offline", color="white")
+        # self.log("─" * 40)
+
+        # # Re-enable refresh button
+        # self._refresh_icon.color = "grey400"
+        # self._refresh_text.value = "SCAN"
+        # self._refresh_text.color = "grey400"
+        # self.refresh_btn.disabled = False
+        # try: self.refresh_btn.update()
+        # except: pass
+        # # Save cache after every scan — ensures json exists after first run
+        # self.save_cache()
 
     def refresh_all_statuses(self, force_full=False):
         """Manual refresh — stagger pings 150ms apart so we don't flood the network.
