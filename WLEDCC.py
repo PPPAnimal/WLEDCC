@@ -1,3 +1,15 @@
+# ledfx_monitor_loop
+# fetch_latest_release
+# check_ledfx_updates
+# brightness_worker
+# rainbow_loop
+# unified_poll_loop
+#
+#
+#
+#
+#
+
 import flet as ft
 import requests
 from zeroconf import Zeroconf, ServiceBrowser
@@ -3979,9 +3991,14 @@ class WLEDApp:
         if ip in self.cards and not self._is_locked(ip):
             c = self.cards[ip]
             if is_online:
+                # --- THE FIX: Reset state immediately to prevent log spam ---
                 if c.get("_glow_state") == "offline":
                     display = c["name_label"].value or ip
                     self.log(f"[Device] {display} ({ip}) back ONLINE", color="green400")
+                    # Force state out of offline so the NEXT ping doesn't trigger this log
+                    c["_glow_state"] = "on" if is_on else "off" 
+                # -------------------------------------------------------------
+
                 if new_name:
                     c["name_label"].value = new_name.upper()
                     self.display_names[ip] = new_name.upper()
@@ -4032,18 +4049,46 @@ class WLEDApp:
                             # Version matches — hide button even if it was shown before
                             c["update_btn"].visible = False
                 
-                # Live state is managed by ledfx_poll_loop — skip status updates for live cards
+                # ppp ledfx not updating UI fix below.
+                # if ip in self.live_ips:
+                    # pass  # don't overwrite live badge or glow state
+                # else:
+                    # # Only hide badge if LedFx is not running — if it is running,
+                    # # the grey badge should stay so user can re-activate from the card
+                    # if not self.ledfx_running:
+                        # c["live_badge"].visible = False
+                    # c["status"].value = f"ONLINE ({rssi}%)" if rssi else "ONLINE"
+                    # c["status"].color = "cyan"
+                    # c["status"].visible = True
+                    # # Glow state: ON=rainbow (handled by rainbow_loop), OFF=dim teal
+                    # if is_on is True:
+                        # c["glow"].bgcolor = "#0a1a1a"
+                        # c["_glow_state"] = "on"
+                    # elif is_on is False:
+                        # c["glow"].bgcolor = "#16161e"
+                        # c["glow"].border = ft.border.all(2, "#2b2b3b")
+                        # c["_glow_state"] = "off"
+                
+                #ppp --- NEW RECOVERY LOGIC ---
+                # If we are live, we still need to clear the "OFFLINE" state
                 if ip in self.live_ips:
-                    pass  # don't overwrite live badge or glow state
+                    c["status"].value = f"ONLINE ({rssi}%)" if rssi else "ONLINE"
+                    c["status"].color = "cyan" # Or "purple700" if you prefer
+                    c["status"].visible = True
+                    
+                    # Ensure we aren't showing the red offline border anymore
+                    if c.get("_glow_state") == "offline":
+                        c["_glow_state"] = "on"
+                        c["glow"].bgcolor = "#0a1a1a" # Back to dark teal/black
                 else:
-                    # Only hide badge if LedFx is not running — if it is running,
-                    # the grey badge should stay so user can re-activate from the card
+                    # Standard WLED (Not Live) Logic
                     if not self.ledfx_running:
                         c["live_badge"].visible = False
+                    
                     c["status"].value = f"ONLINE ({rssi}%)" if rssi else "ONLINE"
                     c["status"].color = "cyan"
                     c["status"].visible = True
-                    # Glow state: ON=rainbow (handled by rainbow_loop), OFF=dim teal
+
                     if is_on is True:
                         c["glow"].bgcolor = "#0a1a1a"
                         c["_glow_state"] = "on"
@@ -4051,6 +4096,7 @@ class WLEDApp:
                         c["glow"].bgcolor = "#16161e"
                         c["glow"].border = ft.border.all(2, "#2b2b3b")
                         c["_glow_state"] = "off"
+                    #ppp fix stops here
             else:
                 if c.get("_glow_state") not in ("offline",) and ip not in self.live_ips:
                     display = c["name_label"].value or self.custom_names.get(ip) or ip
@@ -4185,14 +4231,35 @@ class WLEDApp:
                 _last_error = _e
                 if _attempt < 2:
                     time.sleep(0.3)
+                    
+        # ppp            
         # All 3 attempts failed
-        if not self.ledfx_running:
-            already_offline = self.cards.get(ip, {}).get("_glow_state") == "offline"
-            self.fail_counts[ip] = self.fail_counts.get(ip, 0) + 1
-            if not already_offline:
-                self.log(f"[Ping] {_disp} ({ip}) failed 3 attempts: {_last_error}", color="orange400")
-            if self.fail_counts[ip] > 2:
-                self.page.run_task(self.async_update_status, ip, False)
+        _card = self.cards.get(ip, {})
+        already_offline = _card.get("_glow_state") == "offline"
+        
+        # Increment failure count regardless of LedFx status
+        self.fail_counts[ip] = self.fail_counts.get(ip, 0) + 1
+        
+        if not already_offline:
+            # Log the failure so you can see it in the console
+            self.log(f"[Ping] {_disp} ({ip}) failed 3 attempts: {_last_error}", color="orange400")
+        
+        # If we've failed consistently, push the offline status to the UI
+        if self.fail_counts[ip] > 2:
+            self.page.run_task(self.async_update_status, ip, False)
+            
+        return False # Explicitly return False so the poll loop knows it failed            
+        # ppp fix not offline when ledfx running
+        # All 3 attempts failed
+        # if not self.ledfx_running:
+            # already_offline = self.cards.get(ip, {}).get("_glow_state") == "offline"
+            # self.fail_counts[ip] = self.fail_counts.get(ip, 0) + 1
+            # if not already_offline:
+                # self.log(f"[Ping] {_disp} ({ip}) failed 3 attempts: {_last_error}", color="orange400")
+            # if self.fail_counts[ip] > 2:
+                # self.page.run_task(self.async_update_status, ip, False)
+                
+                
     def brightness_worker(self):
         while self.running:
             item = self.brightness_queue.get()

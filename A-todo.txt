@@ -10,13 +10,7 @@ some other way to check status of wled devices
 stream status live from wled device?
 or just more frequent pings?
 
-have app scan common folder for ledfx if no path in json
-on c drive and also any internal hard drives it might be on like d:
-not external usb sticks, cd or dvd drives
-
 add browse option when adding exe to a new card
- 
-offline ledfx devices should go red border also.
 
 drag drop of card should allow screen to scroll up/down if dragged to edge of border
 
@@ -26,8 +20,6 @@ found that it wants to install
 
 do mh report mode-7 color fade on ping?
 
-ceiling got live orange when ledfx reported it as offline still.
-was on but not live
 
 
 
@@ -112,6 +104,17 @@ live badge should be purple, wled scenes toggle, same blue as wled badge
 on startup, if no ledfx path in json, look in program files, likely paths
 if found, save path to json and update button to not ask for 
 install or show me path.
+
+ledfx_monitor_loop not detecting offline devices.
+unified loop should still be pinging all wled devices
+so why is it not detecting offline.
+i clicked adjusted brightness on offline device and still
+not detected as offline
+got log, ceiling failed all 3 attempts
+still shows online
+
+
+
 
 
 **********************************************************
