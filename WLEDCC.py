@@ -636,12 +636,69 @@ class WLEDApp:
                         self.log("[LedFx] Process terminated.")
                 except: pass
         else:
-            if self.ledfx_path and os.path.exists(self.ledfx_path):
-                self._launch_ledfx()
-            else:
+            # if self.ledfx_path and os.path.exists(self.ledfx_path):
+                # self._launch_ledfx()
+            # else:
                 # No path known — show install/browse dialog
-                self._show_ledfx_setup_dialog()
+                # ppp auto search path
+                #self._show_ledfx_setup_dialog()
+            if not self.ledfx_path or not os.path.exists(self.ledfx_path):
+                # Path is missing or broken — try to find it automatically
+                self.log("LedFx path unknown. Searching local drives...", color="blue400")
+                auto_path = self._find_ledfx_locally()
+                
+                if auto_path:
+                    self.ledfx_path = auto_path
+                    self.save_cache() # Save it to your JSON immediately
+                    self.log(f"✓ LedFx auto-located at: {auto_path}", color="green400")
+                    self._launch_ledfx()
+                else:
+                    # Still nothing? Show the setup dialog
+                    self._show_ledfx_setup_dialog()
+            else:
+                # Path exists in JSON and is valid — just launch
+                self._launch_ledfx()
+    
+    # ppp find available paths to LEDFX
+    def _find_ledfx_locally(self):
+        """Search all internal fixed drives for ledfx.exe, ignoring USB/Removable."""
+        possible_roots = []
+        
+        # 1. Get all internal fixed drives (HDD/SSD)
+        try:
+            for part in psutil.disk_partitions(all=False):
+                # 'fixed' filters out USB sticks, CD-ROMs, and network drives
+                if 'fixed' in part.opts:
+                    # Look in "Program Files" and "Program Files (x86)" on every internal drive
+                    possible_roots.append(os.path.join(part.mountpoint, "Program Files"))
+                    possible_roots.append(os.path.join(part.mountpoint, "Program Files (x86)"))
+        except:
+            # Fallback to C: and D: if psutil fails to query partitions
+            possible_roots.extend(["C:\\Program Files", "D:\\Program Files"])
 
+        # 2. Add User-specific AppData paths (usually on C:)
+        possible_roots.append(os.environ.get("LOCALAPPDATA", ""))
+        possible_roots.append(os.environ.get("APPDATA", ""))
+
+        # 3. Known sub-folders for LedFx
+        sub_paths = [
+            "LedFx\\ledfx.exe",
+            "LedFx\\ledfx\\ledfx.exe",
+            "Programs\\LedFx\\ledfx.exe", # LocalAppData variant
+        ]
+
+        self.log("Searching internal drives for LedFx...", color="blue400")
+
+        for root in possible_roots:
+            if not root or not os.path.exists(root):
+                continue
+            for sub in sub_paths:
+                full_path = os.path.join(root, sub)
+                if os.path.exists(full_path):
+                    return full_path
+        
+        return None
+    
     def _show_ledfx_setup_dialog(self):
         """Show dialog offering Fresh Install or Browse to existing exe."""
         def close(_):
@@ -721,7 +778,7 @@ class WLEDApp:
                 self.page.update()
             else:
                 if path_missing:
-                    self.log(f"LedFx: not installed (latest: v{self.ledfx_latest_ver}) — use START LEDFX to install")
+                    self.log(f"LedFx: No path saved (latest: v{self.ledfx_latest_ver}) — use START LEDFX button, it will auto search path, prompt to install or browse to path")
                 else:
                     self.log(f"LedFx: v{self.ledfx_current_ver} (up to date)")
         except: pass
@@ -5045,18 +5102,39 @@ class WLEDApp:
             san.content.opacity = 0.3
             try: san.update()
             except: pass
+        # ppp live color orange
+        # c["live_badge"].visible = True
+        # c["live_icon"].color = "#ff6600"
+        # c["live_text"].color = "#ff6600"
+        # c["live_badge"].bgcolor = "#3a1a00"
+        # c["live_badge"].border = ft.border.all(1, "#ff6600")
+        # c["live_badge"].tooltip = "LedFx has control — click to release back to WLED"
+        # c["status"].visible = False
+        # c["glow"].bgcolor = "#0a1a1a"
+        # c["glow"].border = ft.border.all(2, self._hue_to_hex(self.rainbow_hue))
+        # c["_glow_state"] = "on"  # rainbow_loop animates this just like a powered-on card
+        # try: c["card"].update(); c["glow"].update()
+        # except: pass
+        # ppp live color purple
         c["live_badge"].visible = True
-        c["live_icon"].color = "#ff6600"
-        c["live_text"].color = "#ff6600"
-        c["live_badge"].bgcolor = "#3a1a00"
-        c["live_badge"].border = ft.border.all(1, "#ff6600")
+        # Using purple700 (#7b1fa2) for the primary accents
+        c["live_icon"].color = "#7b1fa2" 
+        c["live_text"].color = "#7b1fa2"
+        
+        # Dark purple background to make the border pop
+        c["live_badge"].bgcolor = "#1a001a" 
+        c["live_badge"].border = ft.border.all(1, "#7b1fa2")
+        
         c["live_badge"].tooltip = "LedFx has control — click to release back to WLED"
         c["status"].visible = False
         c["glow"].bgcolor = "#0a1a1a"
         c["glow"].border = ft.border.all(2, self._hue_to_hex(self.rainbow_hue))
-        c["_glow_state"] = "on"  # rainbow_loop animates this just like a powered-on card
-        try: c["card"].update(); c["glow"].update()
+        c["_glow_state"] = "on" 
+        try: 
+            c["card"].update()
+            c["glow"].update()
         except: pass
+        
 
     def _set_card_unlive(self, ip, ping_delay=1.5, manual=False):
         """Release a WLED card from live mode — restore controls, show grey badge.

@@ -5,6 +5,8 @@ echo   WLED Control Center - GitHub Backup (Private)
 echo ===================================================
 echo.
 
+git status
+
 :: Ask for a quick note on what you changed
 set /p commit_msg="What did you update? (e.g. fixed slider bug): "
 

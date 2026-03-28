@@ -1,17 +1,9 @@
 AI DON'T READ
-does scan need 30 secs?
-most devices are picked up instantly, 
-those missed come up next scan instantly.
-maybe do a couple 10 sec fast scans
-not one slow 30sec one?
 
 wait for ledfx to fully load before
 toggle scenes switch that starts scene download.
+set to 5 secs from 3
 
-need to detect if a copy of wledcc.exe is running
-and refuse to start second.
-maybe bring running exe to front/forground 
-so its visable
 
 wled native phone app updates instantly to changes,
 some other way to check status of wled devices
@@ -21,16 +13,13 @@ or just more frequent pings?
 have app scan common folder for ledfx if no path in json
 on c drive and also any internal hard drives it might be on like d:
 not external usb sticks, cd or dvd drives
+
+add browse option when adding exe to a new card
  
 offline ledfx devices should go red border also.
 
 drag drop of card should allow screen to scroll up/down if dragged to edge of border
 
-live badge should be purple, wled scenes toggle, same blue as wled badge
-
-on startup, if no ledfx path in json, look in program files, likely paths
-if found, save path to json and update button to not ask for 
-install or show me path.
 
 update buttons should show version text
 found that it wants to install
@@ -106,7 +95,23 @@ set constraint, min 25% brightness on cards and app name in top bar, device slid
 scenes fail to set a device running preset effect to solid color request
 need to set effect solid, then color
 
+does scan need 30 secs?
+most devices are picked up instantly, 
+those missed come up next scan instantly.
+maybe do a couple 10 sec fast scans
+not one slow 30sec one?
 
+need to detect if a copy of wledcc.exe is running
+and refuse to start second.
+maybe bring running exe to front/forground 
+so its visable
+
+live badge should be purple, wled scenes toggle, same blue as wled badge
+5026 is orange code
+
+on startup, if no ledfx path in json, look in program files, likely paths
+if found, save path to json and update button to not ask for 
+install or show me path.
 
 
 **********************************************************
