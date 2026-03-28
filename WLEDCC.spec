@@ -58,6 +58,11 @@ a = Analysis(
         'uuid',
         'glob',
         're',
+		'win32gui',
+		'win32con',
+		'win32api',      
+        'pywintypes',
+        'pythoncom'
     ],
     hookspath=[],
     hooksconfig={},

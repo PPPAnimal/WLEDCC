@@ -14,8 +14,24 @@ from queue import Queue
 import psutil
 import platform
 from datetime import datetime
-
 import glob
+
+# ppp add 2 instance detection
+import win32gui
+import win32con
+
+def raise_if_running(window_title):
+    """If window exists, bring to front and return True, else False."""
+    hwnd = win32gui.FindWindow(None, window_title)
+    if hwnd:
+        # If minimized, restore
+        if win32gui.IsIconic(hwnd):
+            win32gui.ShowWindow(hwnd, win32con.SW_RESTORE)
+        # Bring to foreground
+        win32gui.SetForegroundWindow(hwnd)
+        return True
+    return False
+# ppp end to 2 instance check
 
 # Read version from @version.txt sitting next to the script/exe.
 # sys.frozen is True when running as a PyInstaller exe — use exe's folder.
@@ -504,7 +520,7 @@ class WLEDApp:
                     try: c["live_badge"].update()
                     except: pass
                 def _delayed_scene_fetch():
-                    time.sleep(3)
+                    time.sleep(5)
                     self.toggle_scene_mode()
                     
                 threading.Thread(target=_delayed_scene_fetch, daemon=True).start()
@@ -5696,6 +5712,12 @@ class WLEDListener:
     def update_service(self, zc, type_, name): self.add_service(zc, type_, name)
     def remove_service(self, zc, type_, name): pass
 
-def main(page: ft.Page): WLEDApp(page)
+# wrap flet in instance detector
 if __name__ == "__main__":
-    ft.app(target=main)
+    # Use the exact title from your app
+    if raise_if_running("WLED Command Center+"):
+        sys.exit(0)
+    
+    def main(page: ft.Page): WLEDApp(page)
+    if __name__ == "__main__":
+        ft.app(target=main)
