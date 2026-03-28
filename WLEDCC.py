@@ -27,8 +27,6 @@ import psutil
 import platform
 from datetime import datetime
 import glob
-
-# ppp add 2 instance detection
 import win32gui
 import win32con
 
@@ -43,11 +41,7 @@ def raise_if_running(window_title):
         win32gui.SetForegroundWindow(hwnd)
         return True
     return False
-# ppp end to 2 instance check
 
-# Read version from @version.txt sitting next to the script/exe.
-# sys.frozen is True when running as a PyInstaller exe — use exe's folder.
-# Falls back to hardcoded string if file not found.
 import sys as _sys
 _VERSION_DIR = os.path.dirname(_sys.executable if getattr(_sys, 'frozen', False) else os.path.abspath(__file__))
 _VERSION_FILE = os.path.join(_VERSION_DIR, "@version.txt")
@@ -170,6 +164,9 @@ class WLEDApp:
         self._log_fh = self._open_session_log()
         self.file_picker = ft.FilePicker(on_result=self.on_file_result)
         self.page.overlay.append(self.file_picker)
+        self._exe_pick_callback = None          # set before opening exe_picker
+        self.exe_picker = ft.FilePicker(on_result=self._on_exe_pick_result)
+        self.page.overlay.append(self.exe_picker)
 
         self.load_cache()
         self.setup_ui()
@@ -648,12 +645,6 @@ class WLEDApp:
                         self.log("[LedFx] Process terminated.")
                 except: pass
         else:
-            # if self.ledfx_path and os.path.exists(self.ledfx_path):
-                # self._launch_ledfx()
-            # else:
-                # No path known — show install/browse dialog
-                # ppp auto search path
-                #self._show_ledfx_setup_dialog()
             if not self.ledfx_path or not os.path.exists(self.ledfx_path):
                 # Path is missing or broken — try to find it automatically
                 self.log("LedFx path unknown. Searching local drives...", color="blue400")
@@ -670,8 +661,7 @@ class WLEDApp:
             else:
                 # Path exists in JSON and is valid — just launch
                 self._launch_ledfx()
-    
-    # ppp find available paths to LEDFX
+        
     def _find_ledfx_locally(self):
         """Search all internal fixed drives for ledfx.exe, ignoring USB/Removable."""
         possible_roots = []
@@ -950,6 +940,12 @@ class WLEDApp:
                 try: _u.update()
                 except: pass
             self._launch_ledfx()
+
+    def _on_exe_pick_result(self, e: ft.FilePickerResultEvent):
+        """Called when user browses to an EXE in the Add Device dialog."""
+        if e.files and self._exe_pick_callback:
+            self._exe_pick_callback(e.files[0].path)
+        self._exe_pick_callback = None
 
     def setup_ui(self):
         self.page.title = "WLED Command Center+"
@@ -1842,10 +1838,21 @@ class WLEDApp:
         """Show dialog for user to enter IP or URL to add a device."""
         field = ft.TextField(
             hint_text="192.168.0.x  or  house.local  or  sullyssigns.ca  or  C:\\path\\to\\app.exe",
-            autofocus=True, border_color="cyan", width=400,
+            autofocus=True, border_color="cyan", width=310,
             on_submit=lambda e: _probe(e),
         )
         status_text = ft.Text("", size=11, color="grey400")
+
+        def _browse_exe(_):
+            def _fill_path(path):
+                field.value = path
+                try: field.update()
+                except: pass
+            self._exe_pick_callback = _fill_path
+            self.exe_picker.pick_files(
+                dialog_title="Select EXE to launch",
+                allowed_extensions=["exe"],
+            )
 
         def _probe(_):
             val = field.value.strip()
@@ -1966,10 +1973,20 @@ class WLEDApp:
         dlg = ft.AlertDialog(
             title=ft.Text("Add Device", color="cyan"),
             content=ft.Column([
-                ft.Text("Enter an IP address, local hostname, or web URL:", size=12, color="grey400"),
-                field,
+                ft.Text("Enter an IP address, local hostname, web URL, or browse to an EXE:", size=12, color="grey400"),
+                ft.Row([
+                    field,
+                    ft.ElevatedButton(
+                        "Browse EXE",
+                        icon=ft.Icons.FOLDER_OPEN,
+                        bgcolor="#1e1e2e",
+                        color="cyan",
+                        on_click=_browse_exe,
+                        style=ft.ButtonStyle(side=ft.BorderSide(1, "cyan")),
+                    ),
+                ], spacing=8, vertical_alignment=ft.CrossAxisAlignment.CENTER),
                 status_text,
-            ], tight=True, spacing=10, width=380),
+            ], tight=True, spacing=10, width=480),
             actions=[
                 ft.ElevatedButton("Probe", bgcolor="cyan", color="black", on_click=_probe),
                 ft.TextButton("Cancel", on_click=_cancel),
@@ -3123,8 +3140,6 @@ class WLEDApp:
             self.card_id_to_ip[cid] = ip
         else:
             self.card_id_to_ip[self.card_ids[ip]] = ip  # ensure reverse map is current
-            # Register in unified poll loop
-            # ppp should this be in the eles or outside it
             if dev_type in ("wled", "magichome"):
                 self.wled_devices.add(ip)
             self.fail_counts.setdefault(ip, 0)
@@ -4049,27 +4064,7 @@ class WLEDApp:
                             # Version matches — hide button even if it was shown before
                             c["update_btn"].visible = False
                 
-                # ppp ledfx not updating UI fix below.
-                # if ip in self.live_ips:
-                    # pass  # don't overwrite live badge or glow state
-                # else:
-                    # # Only hide badge if LedFx is not running — if it is running,
-                    # # the grey badge should stay so user can re-activate from the card
-                    # if not self.ledfx_running:
-                        # c["live_badge"].visible = False
-                    # c["status"].value = f"ONLINE ({rssi}%)" if rssi else "ONLINE"
-                    # c["status"].color = "cyan"
-                    # c["status"].visible = True
-                    # # Glow state: ON=rainbow (handled by rainbow_loop), OFF=dim teal
-                    # if is_on is True:
-                        # c["glow"].bgcolor = "#0a1a1a"
-                        # c["_glow_state"] = "on"
-                    # elif is_on is False:
-                        # c["glow"].bgcolor = "#16161e"
-                        # c["glow"].border = ft.border.all(2, "#2b2b3b")
-                        # c["_glow_state"] = "off"
-                
-                #ppp --- NEW RECOVERY LOGIC ---
+                # --- NEW RECOVERY LOGIC ---
                 # If we are live, we still need to clear the "OFFLINE" state
                 if ip in self.live_ips:
                     c["status"].value = f"ONLINE ({rssi}%)" if rssi else "ONLINE"
@@ -4096,7 +4091,6 @@ class WLEDApp:
                         c["glow"].bgcolor = "#16161e"
                         c["glow"].border = ft.border.all(2, "#2b2b3b")
                         c["_glow_state"] = "off"
-                    #ppp fix stops here
             else:
                 if c.get("_glow_state") not in ("offline",) and ip not in self.live_ips:
                     display = c["name_label"].value or self.custom_names.get(ip) or ip
@@ -4232,7 +4226,7 @@ class WLEDApp:
                 if _attempt < 2:
                     time.sleep(0.3)
                     
-        # ppp            
+        # ppp - speed up offline detection            
         # All 3 attempts failed
         _card = self.cards.get(ip, {})
         already_offline = _card.get("_glow_state") == "offline"
@@ -4249,17 +4243,7 @@ class WLEDApp:
             self.page.run_task(self.async_update_status, ip, False)
             
         return False # Explicitly return False so the poll loop knows it failed            
-        # ppp fix not offline when ledfx running
-        # All 3 attempts failed
-        # if not self.ledfx_running:
-            # already_offline = self.cards.get(ip, {}).get("_glow_state") == "offline"
-            # self.fail_counts[ip] = self.fail_counts.get(ip, 0) + 1
-            # if not already_offline:
-                # self.log(f"[Ping] {_disp} ({ip}) failed 3 attempts: {_last_error}", color="orange400")
-            # if self.fail_counts[ip] > 2:
-                # self.page.run_task(self.async_update_status, ip, False)
-                
-                
+              
     def brightness_worker(self):
         while self.running:
             item = self.brightness_queue.get()
@@ -4635,9 +4619,6 @@ class WLEDApp:
         threading.Thread(target=self.refresh_all_statuses, args=(True,), daemon=True).start()
         threading.Thread(target=self.rescan_devices, daemon=True).start()
 
-    
-    
-    # ppp new scan
     def rescan_devices(self):
         """Discovery scan — Two 5-second passes for better reliability.
         Prints a full device report at the end showing online/offline/new status.
@@ -4778,142 +4759,6 @@ class WLEDApp:
         except: pass
         self.save_cache()
     
-    # ppp - new two time pass above
-    # def rescan_devices(self):
-        # """Discovery scan — 10 second window, MagicHome broadcast sent 3 times (every 3s).
-        # Prints a full device report at the end showing online/offline/new status.
-        # """
-        # self.log("─" * 40)
-        # self.log("Scanning for devices (30s)...")
-        # found_mh_ips = set()
-        # known_ips_before = set(self.cards.keys())
-        # SCAN_DURATION = 30
-        
-        # #nonetype fix start
-        # from zeroconf import Zeroconf, ServiceBrowser
-
-        # # Ensure clean mDNS state
-        # try:
-            # if self.browser:
-                # self.browser.cancel()
-                # self.browser = None
-        # except:
-            # pass
-
-        # try:
-            # if self.zeroconf:
-                # self.zeroconf.close()
-                # self.zeroconf = None
-        # except:
-            # pass
-
-        # self.zeroconf = Zeroconf()
-        # #nonetype fix end
-
-        # # Start WLED mDNS browser — runs for full scan duration
-        # try:
-            # if self.browser:
-                # self.browser.cancel()
-            # self.browser = ServiceBrowser(self.zeroconf, "_wled._tcp.local.", WLEDListener(self))
-        # except Exception as ex:
-            # self.log(f"[Scan] WLED mDNS error: {ex}", color="red400")
-
-        # # MagicHome broadcast — runs concurrently for full scan duration
-        # try:
-            # s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-            # s.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
-            # s.settimeout(0.5)
-            # deadline = time.time() + 5 # ppp SCAN_DURATION
-            # next_broadcast = 0
-            # while time.time() < deadline:
-                # if time.time() >= next_broadcast:
-                    # s.sendto("HF-A11ASSISTHREAD".encode(), ('255.255.255.255', 48899))
-                    # next_broadcast = time.time() + 5
-                # try:
-                    # d, a = s.recvfrom(1024)
-                    # r = d.decode().split(',')
-                    # if len(r) >= 2:
-                        # mh_ip = r[0]
-                        # if mh_ip not in found_mh_ips:
-                            # found_mh_ips.add(mh_ip)
-                            # name = f"MH-{r[1][-6:]}"
-                            # is_new = mh_ip not in known_ips_before
-                            # tag = "NEW" if is_new else "ONLINE"
-                            # self.log(f"  ✓ {name} ({mh_ip})  [{tag}]", color="green400")
-                            # self.page.run_task(self.async_add, name, mh_ip, "magichome")
-                # except: pass
-            # s.close()
-        # except Exception as ex:
-            # self.log(f"[Scan] MagicHome error: {ex}", color="red400")
-
-        # # Shut down mDNS browser
-        # try:
-            # if self.browser:
-                # self.browser.cancel()
-                # self.browser = None
-        # except: pass
-
-        # # Brief pause so heartbeat has time to update glow states on new devices
-        # time.sleep(1)
-
-        # # ── Device report ─────────────────────────────────────────────────────
-        # wled_online, wled_offline, wled_new = [], [], []
-        # mh_online, mh_offline, mh_new = [], [], []
-        # for ip, c in list(self.cards.items()):
-            # name = c["name_label"].value or ip
-            # is_new = ip not in known_ips_before
-            # dev_type = self.device_types.get(ip, "wled")
-            # if dev_type == "wled":
-                # state = c.get("_glow_state", "offline")
-            # else:
-                # # MagicHome: online if found during this scan, offline otherwise
-                # state = "online" if ip in found_mh_ips else "offline"
-            # entry = (name, ip, is_new, state)
-            # if dev_type == "wled":
-                # if is_new:               wled_new.append(entry)
-                # elif state == "offline": wled_offline.append(entry)
-                # else:                    wled_online.append(entry)
-            # else:
-                # if is_new:               mh_new.append(entry)
-                # elif state == "offline": mh_offline.append(entry)
-                # else:                    mh_online.append(entry)
-
-        # self.log("─" * 40)
-        # self.log("DEVICE REPORT", color="white")
-        # if wled_online or wled_new:
-            # self.log(f"  WLED — ONLINE ({len(wled_online) + len(wled_new)}):")
-            # for name, ip, is_new, _ in wled_online + wled_new:
-                # tag = " [NEW]" if is_new else ""
-                # self.log(f"    ✓ {name} ({ip}){tag}", color="green400")
-        # if wled_offline:
-            # self.log(f"  WLED — OFFLINE ({len(wled_offline)}):")
-            # for name, ip, _, _ in wled_offline:
-                # self.log(f"    ✗ {name} ({ip})", color="red400")
-        # if mh_online or mh_new:
-            # self.log(f"  MagicHome — ONLINE ({len(mh_online) + len(mh_new)}):")
-            # for name, ip, is_new, _ in mh_online + mh_new:
-                # tag = " [NEW]" if is_new else ""
-                # self.log(f"    ✓ {name} ({ip}){tag}")
-        # if mh_offline:
-            # self.log(f"  MagicHome — OFFLINE ({len(mh_offline)}):")
-            # for name, ip, _, _ in mh_offline:
-                # self.log(f"    ✗ {name} ({ip})")
-        # total = len(self.cards)
-        # total_on = len(wled_online) + len(wled_new) + len(mh_online) + len(mh_new)
-        # total_off = len(wled_offline) + len(mh_offline)
-        # self.log(f"  Total: {total} devices — {total_on} online, {total_off} offline", color="white")
-        # self.log("─" * 40)
-
-        # # Re-enable refresh button
-        # self._refresh_icon.color = "grey400"
-        # self._refresh_text.value = "SCAN"
-        # self._refresh_text.color = "grey400"
-        # self.refresh_btn.disabled = False
-        # try: self.refresh_btn.update()
-        # except: pass
-        # # Save cache after every scan — ensures json exists after first run
-        # self.save_cache()
-
     def refresh_all_statuses(self, force_full=False):
         """Manual refresh — stagger pings 150ms apart so we don't flood the network.
         Skips live devices (LedFx has control) and custom cards (not pingable via WLED/MH protocol).
@@ -5150,7 +4995,7 @@ class WLEDApp:
         self.dbg(f"_set_card_live: {ip}", color="orange400")
         self.live_ips.add(ip)
         # Move device from WLED control to LedFx control
-        #ppp disabled to try pinging live devices to get remote status changes
+        #ppp -works -disabled to try pinging live devices to get remote status changes
         #also need to change set_card_unlive if adding this back in
         #self.wled_devices.discard(ip)
         self.ledfx_devices.add(ip)
@@ -5169,20 +5014,8 @@ class WLEDApp:
             san.content.opacity = 0.3
             try: san.update()
             except: pass
-        # ppp live color orange
-        # c["live_badge"].visible = True
-        # c["live_icon"].color = "#ff6600"
-        # c["live_text"].color = "#ff6600"
-        # c["live_badge"].bgcolor = "#3a1a00"
-        # c["live_badge"].border = ft.border.all(1, "#ff6600")
-        # c["live_badge"].tooltip = "LedFx has control — click to release back to WLED"
-        # c["status"].visible = False
-        # c["glow"].bgcolor = "#0a1a1a"
-        # c["glow"].border = ft.border.all(2, self._hue_to_hex(self.rainbow_hue))
-        # c["_glow_state"] = "on"  # rainbow_loop animates this just like a powered-on card
-        # try: c["card"].update(); c["glow"].update()
-        # except: pass
-        # ppp live color purple
+       
+        # live color purple
         c["live_badge"].visible = True
         # Using purple700 (#7b1fa2) for the primary accents
         c["live_icon"].color = "#7b1fa2" 
@@ -5217,7 +5050,7 @@ class WLEDApp:
         self.lor2_ips.discard(ip)
         # Move device from LedFx control back to WLED control
         self.ledfx_devices.discard(ip)
-        #ppp disabled to try pinging live devices to get remote status changes
+        #ppp works - disabled to try pinging live devices to get remote status changes
         #also need to change set_card_live if adding this back in
         #self.wled_devices.add(ip)
         self.poll_counters.pop(ip, None)  # Reset poll counter for new mode
