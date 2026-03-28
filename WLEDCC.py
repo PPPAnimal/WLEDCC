@@ -3305,15 +3305,17 @@ class WLEDApp:
                         ft.Text(ip, size=11, color="grey500"),
                         info_text,
                         status,
-                        update_btn,
-                        live_badge,
                     ], spacing=2, expand=True),
                     _center_col,
                     ft.Row([color_btn, action_btn], spacing=8),
                 ], vertical_alignment="center", spacing=6),
 
-                # ROW 3: full-width slider
-                bri_slider,
+                # ROW 3: update btn + live badge + full-width slider
+                ft.Row([
+                    update_btn,
+                    live_badge,
+                    bri_slider,
+                ], spacing=6, vertical_alignment="center"),
 
             ], spacing=6)
         )
@@ -3700,14 +3702,14 @@ class WLEDApp:
                 border_color = None  # handled per-card below
             elif ef == "solid":
                 # Speed slider controls brightness — minimum 10% so border is always visible
-                _bri = max(0.10, self.border_speed / 20.0)
+                _bri = max(0.25, self.border_speed / 20.0)
                 border_color = self._dim_hex(self.border_color, _bri)
             elif ef == "breathing":
                 self._breath_border += 0.05 * self.border_speed / 4.0 * self._breath_border_dir
                 if self._breath_border >= 1.0:
                     self._breath_border = 1.0; self._breath_border_dir = -1
-                elif self._breath_border <= 0.10:
-                    self._breath_border = 0.10; self._breath_border_dir = 1
+                elif self._breath_border <= 0.25:
+                    self._breath_border = 0.25; self._breath_border_dir = 1
                 border_color = self._dim_hex(self.border_color, self._breath_border)
             elif ef == "strobe":
                 self._strobe_border = not self._strobe_border
@@ -3760,11 +3762,11 @@ class WLEDApp:
                     elif ef == "wave_lr":
                         # Wave travels left to right — offset by column
                         _spread = 300 / max(_cols - 1, 1)
-                        _c = self._hue_to_hex((_border_hue + _col * _spread) % 360)
+                        _c = self._hue_to_hex((_border_hue - _col * _spread) % 360)
                     elif ef == "wave_tb":
                         # Wave travels top to bottom — offset by row
                         _spread = 300 / max(_rows - 1, 1)
-                        _c = self._hue_to_hex((_border_hue + _row * _spread) % 360)
+                        _c = self._hue_to_hex((_border_hue - _row * _spread) % 360)
                     elif ef == "diagonal":
                         # Diagonal wave — offset by col + row
                         _spread = 300 / max(_cols + _rows - 2, 1)
@@ -3817,7 +3819,7 @@ class WLEDApp:
                         _tc.color = _c
                 elif tef == "solid":
                     # Speed slider controls brightness — minimum 10% so text stays visible
-                    _bri = max(0.10, self.title_speed / 20.0)
+                    _bri = max(0.25, self.title_speed / 20.0)
                     _c = self._dim_hex(self.title_color, _bri)
                     for _tc in self._title_chars:
                         _tc.color = _c
@@ -3825,8 +3827,8 @@ class WLEDApp:
                     self._breath_title += 0.05 * self.title_speed / 4.0 * self._breath_title_dir
                     if self._breath_title >= 1.0:
                         self._breath_title = 1.0; self._breath_title_dir = -1
-                    elif self._breath_title <= 0.10:
-                        self._breath_title = 0.10; self._breath_title_dir = 1
+                    elif self._breath_title <= 0.25:
+                        self._breath_title = 0.25; self._breath_title_dir = 1
                     _c = self._dim_hex(self.title_color, self._breath_title)
                     for _tc in self._title_chars:
                         _tc.color = _c
