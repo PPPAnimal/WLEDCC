@@ -1320,9 +1320,8 @@ class WLEDApp:
                 begin=ft.alignment.top_left, end=ft.alignment.bottom_right,
                 colors=["#FF0000","#FF8800","#FFFF00","#00FF00","#00FFFF","#0000FF","#FF00FF","#FF0000"],
             ),
-            border=ft.border.all(1, "#ffffff33"), tooltip="Title color",
+            tooltip="Title color",
             ink=True, on_click=lambda _: self.show_anim_color_picker("title"),
-            content=ft.Icon(ft.Icons.COLORIZE, size=14, color="#ffffff88"),
         )
         _title_effect_btn = ft.Container(
             width=28, height=28, border_radius=6,
@@ -1344,9 +1343,8 @@ class WLEDApp:
                 begin=ft.alignment.top_left, end=ft.alignment.bottom_right,
                 colors=["#FF0000","#FF8800","#FFFF00","#00FF00","#00FFFF","#0000FF","#FF00FF","#FF0000"],
             ),
-            border=ft.border.all(1, "#ffffff33"), tooltip="Border color",
+            tooltip="Border color",
             ink=True, on_click=lambda _: self.show_anim_color_picker("border"),
-            content=ft.Icon(ft.Icons.COLORIZE, size=14, color="#ffffff88"),
         )
         _border_effect_btn = ft.Container(
             width=28, height=28, border_radius=6,
@@ -3202,11 +3200,9 @@ class WLEDApp:
                 begin=ft.alignment.top_left, end=ft.alignment.bottom_right,
                 colors=["#FF0000","#FF8800","#FFFF00","#00FF00","#00FFFF","#0000FF","#FF00FF","#FF0000"],
             ),
-            border=ft.border.all(2, "#ffffff33"),
             tooltip="Pick color",
             ink=True,
             on_click=lambda _, i=ip: self.show_color_picker(i),
-            content=ft.Icon(ft.Icons.COLORIZE, size=20, color="#ffffff88"),
         )
 
         # ── preset / mode button ──────────────────────────────────────────────
@@ -3246,14 +3242,16 @@ class WLEDApp:
             on_tap=lambda _, i=ip: self.confirm_reboot(i),
             mouse_cursor=ft.MouseCursor.CLICK,
             content=ft.Container(
-                width=48, height=18,
-                border_radius=4,
+                width=62, height=26,
+                border_radius=6,
                 tooltip="Reboot device",
-                bgcolor="#00000000",
+                bgcolor="#1a0808",
+                border=ft.border.all(1, "#4a1a1a"),
+                alignment=ft.alignment.center,
+                ink=True,
                 content=ft.Text(
-                    "REBOOT", size=8, weight="bold",
-                    color="red400",
-                    overflow=ft.TextOverflow.VISIBLE,
+                    "REBOOT", size=9, weight="bold",
+                    color="#884444",
                 ),
             ),
         )
@@ -3263,14 +3261,16 @@ class WLEDApp:
             on_tap=lambda _, i=ip: None if i in self.live_ips else self.confirm_sanitize(i),
             mouse_cursor=ft.MouseCursor.CLICK,
             content=ft.Container(
-                width=48, height=18,
-                border_radius=4,
+                width=62, height=26,
+                border_radius=6,
                 tooltip="Sanitize presets",
-                bgcolor="#00000000",
+                bgcolor="#141000",
+                border=ft.border.all(1, "#3a3000"),
+                alignment=ft.alignment.center,
+                ink=True,
                 content=ft.Text(
-                    "SANITIZE", size=8, weight="bold",
-                    color="yellow700",
-                    overflow=ft.TextOverflow.VISIBLE,
+                    "SANITIZE", size=9, weight="bold",
+                    color="#6b5e00",
                 ),
             ),
         )
@@ -3844,14 +3844,20 @@ class WLEDApp:
 
     def unified_poll_loop(self):
         """Unified polling loop for both WLED and LedFx devices.
-        - Polls WLED devices from wled_devices set with adaptive timing based on device count
+        - Fires all WLED device pings concurrently — no waiting for slow/offline devices
+        - Collects results within a fixed window and logs a single summary line
         - Polls LedFx API every 3s when running to manage live state
-        - Handles device mode transitions between WLED/LedFx control
         """
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+
         _wled_round_start = time.time()
-        _ledfx_last_poll = 0
-        _offline_skip = {}
+        _ledfx_last_poll  = 0
+        _offline_skip     = {}
         _ledfx_poll_count = 0
+        # Window to wait for ping replies before moving on.
+        # Must be >= per-device timeout (1.5s) + retry gaps (0.6s) = ~2.1s per attempt.
+        # We allow 3 attempts max so worst-case is ~4.5s — clamp window to 5s.
+        POLL_WINDOW = 5.0
 
         while self.running:
             current_time = time.time()
@@ -3866,34 +3872,66 @@ class WLEDApp:
             wled_interval = WLED_BASE_INTERVAL + (device_count // 10) * WLED_SCALE_FACTOR
             wled_interval = min(wled_interval, WLED_MAX_INTERVAL)
 
-            # Poll WLED devices if enough time has passed
+            # ── WLED concurrent poll round ────────────────────────────────────
             if current_time - _wled_round_start >= wled_interval:
                 _wled_round_start = current_time
-                polled_wled = []
-                if self.wled_devices:
-                    # Poll WLED devices sequentially with offline backoff
-                    for ip in list(self.wled_devices):
-                        if not self.running or not self.is_focused:
-                            break
+                _to_poll = []
 
-                        is_offline = self.cards.get(ip, {}).get("_glow_state") == "offline"
-                        if is_offline:
-                            _offline_skip[ip] = _offline_skip.get(ip, 0) + 1
-                            if _offline_skip[ip] % 3 != 0:  # Poll offline devices every 3rd round
-                                continue
-                        else:
-                            _offline_skip.pop(ip, None)
+                for ip in list(self.wled_devices):
+                    if not self.running or not self.is_focused:
+                        break
+                    is_offline = self.cards.get(ip, {}).get("_glow_state") == "offline"
+                    if is_offline:
+                        _offline_skip[ip] = _offline_skip.get(ip, 0) + 1
+                        if _offline_skip[ip] % 3 != 0:
+                            continue  # only poll offline devices every 3rd round
+                    else:
+                        _offline_skip.pop(ip, None)
+                    _to_poll.append(ip)
 
-                        polled_wled.append((self.cards.get(ip, {}).get('name_label').value if self.cards.get(ip, {}).get('name_label') else ip))
-                        self._ping_device(ip)
-                    if polled_wled:
-                      self.dbg_unique('wled_poll_summary', '[WLED Poll] Polled: ' + ', '.join(polled_wled) + ' (' + str(len(polled_wled)) + ')')    
+                if _to_poll:
+                    _round_start = time.time()
+                    _ok, _fail = [], []
+
+                    with ThreadPoolExecutor(max_workers=len(_to_poll)) as _ex:
+                        _futures = {_ex.submit(self._ping_device, ip): ip for ip in _to_poll}
+                        try:
+                            for _fut in as_completed(_futures, timeout=POLL_WINDOW):
+                                ip = _futures[_fut]
+                                try:
+                                    result = _fut.result()
+                                    if result is False:
+                                        _fail.append(ip)
+                                    else:
+                                        _ok.append(ip)
+                                except Exception:
+                                    _fail.append(ip)
+                        except TimeoutError:
+                            # Some devices didn't reply within POLL_WINDOW — mark them as failed
+                            _done_ips = set(_ok + _fail)
+                            for ip in _to_poll:
+                                if ip not in _done_ips:
+                                    _fail.append(ip)
+
+                    _elapsed = time.time() - _round_start
+
+                    # Single summary log line
+                    _ok_names  = [
+                        (self.cards.get(ip, {}).get("name_label") or type("", (), {"value": ip})()).value
+                        for ip in _ok
+                    ]
+                    _fail_names = [
+                        (self.cards.get(ip, {}).get("name_label") or type("", (), {"value": ip})()).value
+                        for ip in _fail
+                    ]
+                    _summary = f"[Poll] {len(_ok)}/{len(_to_poll)} replied in {_elapsed:.1f}s"
+                    if _fail_names:
+                        _summary += f" — timeout: {', '.join(_fail_names)}"
+                    self.dbg_unique("wled_poll_summary", _summary)
                 else:
-                    
-                    # No WLED devices to poll, short sleep
                     time.sleep(1)
 
-            # Poll LedFx API if running and enough time has passed
+            # ── LedFx API poll ────────────────────────────────────────────────
             if self.ledfx_running and current_time - _ledfx_last_poll >= LEDFX_POLL_INTERVAL:
                 _ledfx_last_poll = current_time
                 _ledfx_poll_count += 1
@@ -3949,25 +3987,22 @@ class WLEDApp:
                                     self.log(f"[LedFx Poll] No IP for virtual '{vid}' (is_device={is_device})", color="orange400")
 
                         if device_ip:
-                            # streaming=True means LedFx is sending data even if active=False
                             if device_ip not in ledfx_active or active or streaming:
                                 ledfx_active[device_ip] = active or streaming
-                            # Debug log for LedFx device poll, similar to WLED ping
                             config = v.get("config", {})
                             bri = config.get("brightness", "N/A")
                             effect_name = config.get("effect", {}).get("name", "N/A") if config.get("effect") else "N/A"
                             self._dbg_ledfx_poll(device_ip, vid, active, streaming, bri, effect_name)
 
-
                     try:
-                      _names = []
-                      for _ip in ledfx_active.keys():
-                        _nl = self.cards.get(_ip, {}).get('name_label')
-                        _names.append(_nl.value if _nl else _ip)
-                      if _names:
-                        self.dbg_unique('ledfx_poll_summary', '[LedFx Poll] Polled: ' + ', '.join(_names) + ' (' + str(len(_names)) + ')')
+                        _names = []
+                        for _ip in ledfx_active.keys():
+                            _nl = self.cards.get(_ip, {}).get("name_label")
+                            _names.append(_nl.value if _nl else _ip)
+                        if _names:
+                            self.dbg_unique("ledfx_poll_summary", "[LedFx Poll] Polled: " + ", ".join(_names) + " (" + str(len(_names)) + ")")
                     except:
-                      pass
+                        pass
 
                     # Apply live state changes to cards
                     for ip, should_be_live in ledfx_active.items():
@@ -4005,7 +4040,7 @@ class WLEDApp:
           last = self._last_defer_log.get(ip, 0)
           if now - last > 1.0:
             self._last_defer_log[ip] = now
-            self.dbg(f"Status update deferred {ip} — user input in progress, avoiding mid-drag override", color="orange400")
+            self.dbg(f"Ignoring remote UI update in favor of user input for {ip}", color="orange400")
           return
         if ip in self.cards and not self._is_locked(ip):
             c = self.cards[ip]
@@ -4353,7 +4388,7 @@ class WLEDApp:
 
         self._pending_bri[ip] = int(self.individual_brightness.get(ip, 128))
 
-        self._lock_ui(ip, 3)
+        self._lock_ui(ip)
 
 
     def _on_bri_drag(self, ip, val):
@@ -4471,7 +4506,7 @@ class WLEDApp:
                 
         self.save_cache() # Save master slider change and all staged individual levels
 
-    def _lock_ui(self, ip, duration=3): self.locks[ip] = time.time() + duration
+    def _lock_ui(self, ip, duration=1.5): self.locks[ip] = time.time() + duration
     def _is_locked(self, ip): return ip in self.locks and time.time() < self.locks[ip]
     
     def _apply_cache(self, c):
@@ -4544,10 +4579,117 @@ class WLEDApp:
             except:
                 continue  # try next backup
 
-        # Nothing worked — start fresh
-        if self._cache_load_warning:
-            self._cache_load_warning += " — all backups failed, starting fresh"
-        self.cached_data = {}
+        # Nothing worked — attempt a salvage pass across ALL json files in the data folder
+        self._cache_load_warning = (self._cache_load_warning or "[Cache]") + " — all backups failed, attempting data salvage..."
+        salvaged = self._salvage_cache()
+        if salvaged:
+            self._apply_cache(salvaged)
+            self._cache_load_warning += f" Recovered: {', '.join(salvaged.get('_salvage_summary', []))}. Cache saved."
+            self._do_save_cache()  # persist the salvaged data immediately
+        else:
+            self._cache_load_warning += " — salvage found nothing, starting fresh"
+            self.cached_data = {}
+
+    def _salvage_cache(self):
+        """
+        Last-resort recovery: scan every JSON file in LOG_DIR and merge whatever
+        recognisable keys we find. Returns a merged dict ready for _apply_cache,
+        or None if nothing useful was found.
+        Keys harvested: devices, types, card_order, scenes, custom_names,
+        display_names, custom_devices, card_ids, device_macs, individual_bri,
+        master_bri, ledfx_path, ledfx_ver, win_w, win_h, win_max,
+        title_effect, title_speed, title_color, border_effect, border_speed,
+        border_color, debug_on_open, log_auto_open.
+        """
+        _SCALAR_KEYS = {
+            "master_bri", "ledfx_path", "ledfx_ver",
+            "win_w", "win_h", "win_max",
+            "title_effect", "title_speed", "title_color",
+            "border_effect", "border_speed", "border_color",
+            "debug_on_open", "log_auto_open",
+        }
+        _DICT_KEYS = {
+            "devices", "types", "custom_names", "display_names",
+            "custom_devices", "card_ids", "device_macs", "individual_bri",
+        }
+        _LIST_KEYS = {"card_order", "scenes"}
+
+        merged = {}
+        found_any = False
+
+        # Collect every .json in LOG_DIR, newest first
+        all_json = sorted(
+            glob.glob(os.path.join(LOG_DIR, "*.json")),
+            key=os.path.getmtime, reverse=True
+        )
+        # Also check the main cache file path even if it's corrupt
+        if CACHE_FILE not in all_json and os.path.exists(CACHE_FILE):
+            all_json.insert(0, CACHE_FILE)
+
+        for fpath in all_json:
+            try:
+                with open(fpath, "r") as f:
+                    raw = json.load(f)
+                if not isinstance(raw, dict):
+                    continue
+            except Exception:
+                # File is not valid JSON at the top level — try to extract
+                # partial data by reading it as text and parsing fragments
+                try:
+                    with open(fpath, "r", errors="replace") as f:
+                        text = f.read()
+                    # Attempt a loose loads — sometimes only the tail is corrupt
+                    raw = {}
+                    for attempt in [text, text[:text.rfind('}') + 1] if '}' in text else ""]:
+                        try:
+                            raw = json.loads(attempt)
+                            break
+                        except Exception:
+                            continue
+                    if not isinstance(raw, dict):
+                        continue
+                except Exception:
+                    continue
+
+            # Merge scalar keys — first file wins
+            for k in _SCALAR_KEYS:
+                if k not in merged and k in raw:
+                    merged[k] = raw[k]
+                    found_any = True
+
+            # Merge dict keys — union, first file's value wins per sub-key
+            for k in _DICT_KEYS:
+                if k in raw and isinstance(raw[k], dict):
+                    merged.setdefault(k, {})
+                    for sub_k, sub_v in raw[k].items():
+                        if sub_k not in merged[k]:
+                            merged[k][sub_k] = sub_v
+                            found_any = True
+
+            # List keys — first non-empty list wins
+            for k in _LIST_KEYS:
+                if k not in merged and k in raw and isinstance(raw[k], list) and any(x is not None for x in raw[k]):
+                    merged[k] = raw[k]
+                    found_any = True
+
+        if not found_any:
+            return None
+
+        # Build a human-readable summary of what was recovered
+        summary = []
+        if merged.get("devices"):
+            summary.append(f"{len(merged['devices'])} device(s)")
+        if merged.get("scenes") and any(s is not None for s in merged["scenes"]):
+            n = sum(1 for s in merged["scenes"] if s is not None)
+            summary.append(f"{n} scene(s)")
+        if merged.get("custom_devices"):
+            summary.append(f"{len(merged['custom_devices'])} custom card(s)")
+        if merged.get("custom_names"):
+            summary.append(f"{len(merged['custom_names'])} custom name(s)")
+        if not summary:
+            summary.append("partial settings")
+        merged["_salvage_summary"] = summary
+        return merged
 
     def save_cache(self):
         """Schedule a deferred cache write. Rapid calls are coalesced — only one

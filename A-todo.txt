@@ -1,8 +1,17 @@
 AI DON'T READ
 
-wait for ledfx to fully load before
-toggle scenes switch that starts scene download.
-set to 5 secs from 3
+
+update manual
+
+
+
+upgrading from older versions of this app results
+in losing saved json settings
+mainly the saved scenes
+is there a way to notice the failed json load
+and if no backup exists, pull out what data we can like
+device names, scenes etc and then create a new updated
+json merging old data with new
 
 wled native phone app updates instantly to changes,
 some other way to check status of wled devices
@@ -11,13 +20,14 @@ or just more frequent pings?
 
 drag drop of card should allow screen to scroll up/down if dragged to edge of border
 
-update buttons should show version text
-found that it wants to install
+update buttons should show version to download
 
 do mh report mode-7 color fade on ping?
+could show on effect picker
 
+make reboot and sanitize look like buttons
 
-
+nice update in gemini
 
 
 
@@ -37,8 +47,6 @@ do mh report mode-7 color fade on ping?
 4.5.5
 card effects in reverse
 remove not working
-json new file every write? and log
-can't remove a card that is offline?
 
 
 
@@ -117,6 +125,14 @@ then enters that path into card
 
 limit logs and json files, 
 atm its writing a new file after each change
+
+moved wled update button beside slider
+moved live badge button beside slider
+increased minimum brightness on borders and app name to 25%
+
+wait for ledfx to fully load before
+toggle scenes switch that starts scene download.
+set to 5 secs from 3
 
 
 
