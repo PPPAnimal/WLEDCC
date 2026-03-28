@@ -3241,8 +3241,9 @@ class WLEDApp:
         if is_wled:
             action_btn = ft.Container(
                 width=54, height=54, border_radius=10,
-                bgcolor="#1a1a2e",
-                border=ft.border.all(2, "#00f2ff44"),
+                bgcolor="#1e2133",
+                border=ft.border.only(top=ft.border.BorderSide(1, "white10")),
+                shadow=[ft.BoxShadow(blur_radius=10, color=ft.Colors.with_opacity(0.4, "black"))],
                 tooltip="Select preset",
                 ink=True,
                 on_click=lambda _, i=ip: self.show_preset_picker(i),
@@ -3255,8 +3256,9 @@ class WLEDApp:
             preset_label = ft.Text("MODES", size=7, color="#00f2ff", weight="bold")
             action_btn = ft.Container(
                 width=54, height=54, border_radius=10,
-                bgcolor="#1a1a2e",
-                border=ft.border.all(2, "#00f2ff44"),
+                bgcolor="#1e2133",
+                border=ft.border.only(top=ft.border.BorderSide(1, "white10")),
+                shadow=[ft.BoxShadow(blur_radius=10, color=ft.Colors.with_opacity(0.4, "black"))],
                 tooltip="Light modes",
                 ink=True,
                 on_click=lambda _, i=ip: self.show_mh_modes(i),
