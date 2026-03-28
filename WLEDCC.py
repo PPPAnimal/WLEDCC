@@ -1324,11 +1324,21 @@ class WLEDApp:
             ink=True, on_click=lambda _: self.show_anim_color_picker("title"),
         )
         _title_effect_btn = ft.Container(
-            width=28, height=28, border_radius=6,
-            bgcolor="#1a1a2e", border=ft.border.all(1, "#00f2ff44"),
-            tooltip="Title effect", ink=True,
+            width=28, 
+            height=28, 
+            border_radius=6,
+            bgcolor="#1e2133",
+            border=ft.border.only(top=ft.border.BorderSide(1, "white10")), 
+            shadow=[
+                ft.BoxShadow(
+                    blur_radius=10, 
+                    color=ft.Colors.with_opacity(0.4, "black")
+                )
+            ],
+            tooltip="Title effect", 
+            ink=True,
             on_click=lambda _: self.show_anim_effect_picker("title"),
-            content=ft.Icon(ft.Icons.AUTO_AWESOME, size=14, color="#00f2ff"),
+            content=ft.Icon(ft.Icons.AUTO_AWESOME, size=14, color="#00f2ff"), # Note: use ft.icons (lowercase 'i')
         )
 
         # ── Border animation controls (near SCAN) ─────────────────────────────
@@ -1346,14 +1356,25 @@ class WLEDApp:
             tooltip="Border color",
             ink=True, on_click=lambda _: self.show_anim_color_picker("border"),
         )
+        #ppp
         _border_effect_btn = ft.Container(
-            width=28, height=28, border_radius=6,
-            bgcolor="#1a1a2e", border=ft.border.all(1, "#00f2ff44"),
-            tooltip="Border effect", ink=True,
+            width=28, 
+            height=28, 
+            border_radius=6,
+            bgcolor="#1e2133",
+            border=ft.border.only(top=ft.border.BorderSide(1, "white10")), 
+            shadow=[
+                ft.BoxShadow(
+                    blur_radius=10, 
+                    color=ft.Colors.with_opacity(0.4, "black")
+                )
+            ],
+            tooltip="Border effect", 
+            ink=True,
             on_click=lambda _: self.show_anim_effect_picker("border"),
             content=ft.Icon(ft.Icons.AUTO_AWESOME, size=14, color="#00f2ff"),
         )
-
+#ppp
         self.header = ft.Row([
             ft.Row([
                 ft.Row(self._title_chars, spacing=0, tight=True),
@@ -2053,7 +2074,7 @@ class WLEDApp:
 
         # Match standard card layout exactly — 3 rows + drag handle
         card = ft.Container(
-            data=key, bgcolor="#16161e", border_radius=12,
+            data=key, bgcolor="#121420", border_radius=12,
             padding=ft.padding.only(left=12, right=12, top=10, bottom=10),
             content=ft.Column([
                 # ROW 1: favicon tag | name | ✏ | ✕ | spacer
@@ -2074,7 +2095,7 @@ class WLEDApp:
         )
 
         glow = ft.Container(content=card, border_radius=13,
-            border=ft.border.all(2, "#2b2b3b"), bgcolor="#16161e", padding=2)
+            border=ft.border.all(2, "#2b2b3b"), bgcolor="#121420", padding=2)
 
         # Drag handle — same as standard cards
         feedback = ft.Container(
@@ -3166,10 +3187,19 @@ class WLEDApp:
         name_label = ft.Text(display_name, weight="bold", size=16)
         edit_btn   = ft.IconButton(ft.Icons.EDIT, icon_size=13, icon_color="grey500",
                          tooltip="Rename", on_click=lambda _, i=ip: self.show_rename_dialog(i))
-        update_btn = ft.ElevatedButton("UPDATE", visible=False, bgcolor="yellow700", color="black",
-                         style=ft.ButtonStyle(shape=ft.RoundedRectangleBorder(radius=5),
-                         text_style=ft.TextStyle(size=10, weight=ft.FontWeight.BOLD)),
-                         on_click=lambda _, i=ip: threading.Thread(target=self.push_ota_update, args=(i,), daemon=True).start())
+        _update_ver_text = ft.Text("", size=9, weight=ft.FontWeight.BOLD, color="black", text_align="center")
+        update_btn = ft.Container(
+            visible=False, bgcolor="yellow700", border_radius=5,
+            padding=ft.padding.symmetric(horizontal=8, vertical=4),
+            alignment=ft.alignment.center,
+            ink=True,
+            tooltip="Flash latest firmware",
+            on_click=lambda _, i=ip: threading.Thread(target=self.push_ota_update, args=(i,), daemon=True).start(),
+            content=ft.Column([
+                ft.Text("UPDATE", size=9, weight=ft.FontWeight.BOLD, color="black", text_align="center"),
+                _update_ver_text,
+            ], spacing=0, tight=True, horizontal_alignment=ft.CrossAxisAlignment.CENTER),
+        )
         _live_icon = ft.Icon(ft.Icons.BOLT, size=11, color="#ff6600")
         _live_text = ft.Text("LIVE", size=9, weight="bold", color="#ff6600")
         live_badge = ft.Container(
@@ -3245,14 +3275,14 @@ class WLEDApp:
                 width=62, height=26,
                 border_radius=6,
                 tooltip="Reboot device",
-                bgcolor="#1a0808",
-                border=ft.border.all(1, "#4a1a1a"),
                 alignment=ft.alignment.center,
                 ink=True,
-                content=ft.Text(
-                    "REBOOT", size=9, weight="bold",
-                    color="#884444",
+                gradient=ft.LinearGradient(
+                    begin=ft.alignment.top_center,
+                    end=ft.alignment.bottom_center,
+                    colors=["#6b0000", "#380000"],
                 ),
+                content=ft.Text("REBOOT", size=9, weight="bold", color="white"),
             ),
         )
 
@@ -3264,14 +3294,15 @@ class WLEDApp:
                 width=62, height=26,
                 border_radius=6,
                 tooltip="Sanitize presets",
-                bgcolor="#141000",
-                border=ft.border.all(1, "#3a3000"),
                 alignment=ft.alignment.center,
                 ink=True,
-                content=ft.Text(
-                    "SANITIZE", size=9, weight="bold",
-                    color="#6b5e00",
+                gradient=ft.LinearGradient(
+                    begin=ft.alignment.top_center,
+                    end=ft.alignment.bottom_center,
+                    colors=["#887700", "#554400"],
                 ),
+                
+                content=ft.Text("SANITIZE", size=9, weight="bold", color="white"),
             ),
         )
 
@@ -3281,7 +3312,7 @@ class WLEDApp:
 
         # ── card layout ───────────────────────────────────────────────────────
         card = ft.Container(
-            data=ip, bgcolor="#16161e", border_radius=12,
+            data=ip, bgcolor="#121420", border_radius=12,
             padding=ft.padding.only(left=12, right=12, top=10, bottom=10),
             content=ft.Column([
 
@@ -3321,7 +3352,7 @@ class WLEDApp:
         )
 
         glow = ft.Container(content=card, border_radius=13,
-            border=ft.border.all(2, "#2b2b3b"), bgcolor="#16161e", padding=2)
+            border=ft.border.all(2, "#2b2b3b"), bgcolor="#121420", padding=2)
 
         # Only the drag handle is Draggable — not the whole card
         # This prevents sliders/switches from accidentally triggering drags
@@ -3373,7 +3404,7 @@ class WLEDApp:
             "fx_label": fx_label, "preset_label": preset_label,
             "name_label": name_label,
             "bri_slider": bri_slider, "bri_text": bri_text,
-            "info_text": info_text, "update_btn": update_btn,
+            "info_text": info_text, "update_btn": update_btn, "update_ver_text": _update_ver_text,
             "sanitize_btn": sanitize_btn, "reboot_btn": reboot_btn, "edit_btn": edit_btn,
             "color_btn": color_btn, "action_btn": action_btn,
             "live_badge": live_badge, "live_icon": _live_icon, "live_text": _live_text,
@@ -3526,7 +3557,8 @@ class WLEDApp:
 
         # Disable button and show progress during update
         c["update_btn"].disabled = True
-        c["update_btn"].text = "UPDATING..."
+        c["update_btn"].opacity = 0.5
+        c["update_ver_text"].value = "UPDATING..."
         try: c["update_btn"].update()
         except: pass
 
@@ -3624,7 +3656,8 @@ class WLEDApp:
         finally:
             # Only reached on error paths (success returns early above)
             c["update_btn"].disabled = False
-            c["update_btn"].text = "UPDATE"
+            c["update_btn"].opacity = 1.0
+            c["update_ver_text"].value = f"v{self.latest_release_ver}" if self.latest_release_ver else ""
             try: c["update_btn"].update()
             except: pass
 
@@ -3649,7 +3682,7 @@ class WLEDApp:
                     else:
                         self.log(f"[OTA] WARNING: {ip} reports v{ver}, expected v{expected_ver}.", color="orange400")
                         c["update_btn"].disabled = False
-                        c["update_btn"].text = "UPDATE"
+                        c["update_btn"].opacity = 1.0
                         try: c["update_btn"].update()
                         except: pass
                     return
@@ -3659,7 +3692,7 @@ class WLEDApp:
             time.sleep(4)
         self.log(f"[OTA] {ip} did not come back online after 60s. Check device manually.", color="red400")
         c["update_btn"].disabled = False
-        c["update_btn"].text = "UPDATE"
+        c["update_btn"].opacity = 1.0
         try: c["update_btn"].update()
         except: pass
 
@@ -4098,6 +4131,7 @@ class WLEDApp:
                     c["info_text"].value = f"{ver} | {arch}"
                     if self.latest_release_ver:
                         if ver != self.latest_release_ver:
+                            c["update_ver_text"].value = f"v{self.latest_release_ver}"
                             c["update_btn"].visible = True
                         else:
                             # Version matches — hide button even if it was shown before
@@ -4127,7 +4161,7 @@ class WLEDApp:
                         c["glow"].bgcolor = "#0a1a1a"
                         c["_glow_state"] = "on"
                     elif is_on is False:
-                        c["glow"].bgcolor = "#16161e"
+                        c["glow"].bgcolor = "#121420"
                         c["glow"].border = ft.border.all(2, "#2b2b3b")
                         c["_glow_state"] = "off"
             else:
@@ -5235,7 +5269,7 @@ class WLEDApp:
         c["status"].value = "CHECKING..."
         c["status"].color = "grey500"
         c["status"].visible = True
-        c["glow"].bgcolor = "#16161e"
+        c["glow"].bgcolor = "#121420"
         c["glow"].border = ft.border.all(2, "#2b2b3b")
         c["_glow_state"] = "off"
         try: c["card"].update(); c["glow"].update()
@@ -5652,7 +5686,7 @@ class WLEDApp:
                 c["_glow_state"] = "on"
             else:
                 # Dim border immediately — rainbow loop will stop animating
-                c["glow"].bgcolor = "#16161e"
+                c["glow"].bgcolor = "#121420"
                 c["glow"].border = ft.border.all(2, "#2b2b3b")
                 c["_glow_state"] = "off"
             c["card"].update()
