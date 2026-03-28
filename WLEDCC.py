@@ -108,6 +108,8 @@ class WLEDApp:
         self._strobe_title = True
         self._strobe_border = True
         self.brightness_debounce_timer = None
+        self._save_timer = None          # debounce timer for save_cache
+        self._session_backup_written = False  # write one backup per session only
         self.current_master_bri = 128
         self.prev_master_bri = 128
         self.individual_brightness = {}
@@ -4546,6 +4548,17 @@ class WLEDApp:
         self.cached_data = {}
 
     def save_cache(self):
+        """Schedule a deferred cache write. Rapid calls are coalesced — only one
+        write happens after a 2-second quiet period, preventing a new JSON backup
+        file from being created on every tiny state change."""
+        if self._save_timer is not None:
+            self._save_timer.cancel()
+        self._save_timer = threading.Timer(2.0, self._do_save_cache)
+        self._save_timer.daemon = True
+        self._save_timer.start()
+
+    def _do_save_cache(self):
+        self._save_timer = None
         sd, st, dn = {}, {}, {}
         for ip in self.cards:
             if ip in self.devices:
@@ -4595,15 +4608,17 @@ class WLEDApp:
             "log_auto_open": self.log_auto_open,
         }
         try:
-            # Write backup before overwriting main file
-            ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-            bak_path = os.path.join(LOG_DIR, f"wledcc_cache_backup_{ts}.json")
-            with open(bak_path, "w") as f:
-                json.dump(data, f)
-            # Rotate — keep only newest CACHE_BACKUP_MAX backups
-            existing = sorted(glob.glob(os.path.join(LOG_DIR, "wledcc_cache_backup_*.json")))
-            while len(existing) > CACHE_BACKUP_MAX:
-                os.remove(existing.pop(0))
+            # Write one backup per session (at first save only), then only update main file
+            if not self._session_backup_written:
+                ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+                bak_path = os.path.join(LOG_DIR, f"wledcc_cache_backup_{ts}.json")
+                with open(bak_path, "w") as f:
+                    json.dump(data, f)
+                self._session_backup_written = True
+                # Rotate — keep only newest CACHE_BACKUP_MAX backups
+                existing = sorted(glob.glob(os.path.join(LOG_DIR, "wledcc_cache_backup_*.json")))
+                while len(existing) > CACHE_BACKUP_MAX:
+                    os.remove(existing.pop(0))
             # Now write main file
             with open(CACHE_FILE, "w") as f:
                 json.dump(data, f)
@@ -5663,6 +5678,11 @@ class WLEDApp:
     def cleanup(self, e):
         self.running = False
         self.brightness_queue.put(None)
+        # Flush any pending debounced save before closing
+        if self._save_timer is not None:
+            self._save_timer.cancel()
+            self._save_timer = None
+            self._do_save_cache()
         if self._log_fh:
             try: self._log_fh.close()
             except: pass

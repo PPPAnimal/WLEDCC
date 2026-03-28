@@ -4,16 +4,12 @@ wait for ledfx to fully load before
 toggle scenes switch that starts scene download.
 set to 5 secs from 3
 
-
 wled native phone app updates instantly to changes,
 some other way to check status of wled devices
 stream status live from wled device?
 or just more frequent pings?
 
-add browse option when adding exe to a new card
-
 drag drop of card should allow screen to scroll up/down if dragged to edge of border
-
 
 update buttons should show version text
 found that it wants to install
@@ -113,7 +109,14 @@ not detected as offline
 got log, ceiling failed all 3 attempts
 still shows online
 
+when adding custom cards
+we have area to enter ip, path to exe, or url
+i want to add a way to browse to the EXE
+click a button and popup lets you find the exe
+then enters that path into card
 
+limit logs and json files, 
+atm its writing a new file after each change
 
 
 
