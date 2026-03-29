@@ -66,7 +66,7 @@ def raise_if_running(window_title):
 
 import sys as _sys
 _VERSION_DIR = os.path.dirname(_sys.executable if getattr(_sys, 'frozen', False) else os.path.abspath(__file__))
-_VERSION_FILE = os.path.join(_VERSION_DIR, "@version.txt")
+_VERSION_FILE = os.path.join(_VERSION_DIR, "version.txt")
 try:
     with open(_VERSION_FILE, "r") as _vf:
         APP_VERSION = _vf.read().strip()
@@ -915,6 +915,58 @@ class WLEDApp:
                     best = full
         return best
 
+    def _bring_window_to_front(self, title_hints, timeout_sec=10):
+        """Try to bring a newly launched installer window to the foreground (Windows)."""
+        hints = [h.lower() for h in (title_hints or []) if h]
+        if not hints:
+            return False
+
+        deadline = time.time() + max(1, int(timeout_sec))
+        while time.time() < deadline:
+            matches = []
+
+            def _enum_cb(hwnd, _):
+                try:
+                    if not win32gui.IsWindowVisible(hwnd):
+                        return True
+                    title = (win32gui.GetWindowText(hwnd) or "").strip()
+                    if not title:
+                        return True
+                    t = title.lower()
+                    if any(h in t for h in hints):
+                        matches.append(hwnd)
+                except:
+                    return True
+                return True
+
+            try:
+                win32gui.EnumWindows(_enum_cb, None)
+            except:
+                return False
+
+            if matches:
+                hwnd = matches[0]
+                try:
+                    if win32gui.IsIconic(hwnd):
+                        win32gui.ShowWindow(hwnd, win32con.SW_RESTORE)
+                    # Topmost toggle helps force z-order above this app.
+                    win32gui.SetWindowPos(
+                        hwnd, win32con.HWND_TOPMOST, 0, 0, 0, 0,
+                        win32con.SWP_NOMOVE | win32con.SWP_NOSIZE
+                    )
+                    win32gui.SetWindowPos(
+                        hwnd, win32con.HWND_NOTOPMOST, 0, 0, 0, 0,
+                        win32con.SWP_NOMOVE | win32con.SWP_NOSIZE
+                    )
+                    win32gui.SetForegroundWindow(hwnd)
+                    return True
+                except:
+                    pass
+
+            time.sleep(0.2)
+
+        return False
+
     def install_or_update_wledcc(self, e=None):
         if not self.wledcc_download_url:
             self.log("[WLEDCC] No installer asset found in latest release. Opening releases page.", color="orange400")
@@ -972,6 +1024,13 @@ class WLEDApp:
             self.log(f"[WLEDCC] Launching installer: {os.path.basename(target)}", color="yellow700")
             self.log("[WLEDCC] Close WLEDCC if prompted by the installer.", color="grey500")
             os.startfile(target)
+            installer_base = os.path.splitext(os.path.basename(target))[0]
+            brought_front = self._bring_window_to_front(
+                [installer_base, "wledcc", "setup", "installer"],
+                timeout_sec=8,
+            )
+            if not brought_front:
+                self.log("[WLEDCC] Installer launched, but could not force it to front.", color="orange400")
 
             self.wledcc_update_btn.text = "INSTALLER OPENED"
             self.wledcc_update_btn.bgcolor = "green700"
@@ -981,7 +1040,7 @@ class WLEDApp:
         except Exception as ex:
             self.log(f"[WLEDCC] Update failed: {ex}", color="red400")
             self.wledcc_update_btn.disabled = False
-            self.wledcc_update_btn.bgcolor = "cyan"
+            self.wledcc_update_btn.bgcolor = "yellow700"
             if self.wledcc_latest_ver:
                 self.wledcc_update_btn.text = f"UPDATE TO v{self.wledcc_latest_ver}"
             else:
@@ -1520,9 +1579,10 @@ class WLEDApp:
             "UPDATE APP",
             icon=ft.Icons.SYSTEM_UPDATE_ALT,
             color="black",
-            bgcolor="cyan",
+            bgcolor="yellow700",
             visible=False,
-            height=26,
+            height=20,
+            style=ft.ButtonStyle(padding=ft.padding.symmetric(horizontal=6, vertical=0)),
             on_click=self.install_or_update_wledcc,
         )
         self.ledfx_update_btn_wide   = ft.ElevatedButton("UPDATE LEDFX", icon=ft.Icons.DOWNLOAD_FOR_OFFLINE, color="black", bgcolor="yellow700", visible=False, on_click=self.install_or_update_ledfx)
@@ -1553,7 +1613,7 @@ class WLEDApp:
 
         # ── Title animation controls (near SullySigns) ───────────────────────
         self._title_speed_slider = ft.Slider(
-            min=2, max=20, value=self.title_speed, width=80,
+            min=2, max=20, value=self.title_speed, width=160,
             active_color="cyan",
             on_change=lambda e: (setattr(self, "title_speed", float(e.control.value)), self.save_cache()),
         )
@@ -1586,7 +1646,7 @@ class WLEDApp:
 
         # ── Border animation controls (near SCAN) ─────────────────────────────
         self._border_speed_slider = ft.Slider(
-            min=2, max=20, value=self.border_speed, width=80,
+            min=2, max=20, value=self.border_speed, width=160,
             active_color="cyan",
             on_change=lambda e: (setattr(self, "border_speed", float(e.control.value)), self.save_cache()),
         )
@@ -1618,34 +1678,55 @@ class WLEDApp:
             content=ft.Icon(ft.Icons.AUTO_AWESOME, size=14, color="#00f2ff"),
         )
 #ppp
-        self.header = ft.Row([
-            ft.Row([
-                ft.Row(self._title_chars, spacing=0, tight=True),
-                ft.Column([
-                    ft.Text(f"v{APP_VERSION}", size=10, color="grey600"),
-                    self.wledcc_update_btn,
+        self._title_meta_row = ft.Row([
+            ft.Row(self._title_chars, spacing=0, tight=True),
+            ft.Column([
+                ft.Text(f"v{APP_VERSION}", size=10, color="grey600"),
+                ft.Row([
                     ft.TextButton(
                         content=ft.Text("by SullySSignS.ca", size=10, color="grey600"),
                         on_click=lambda _: self.page.launch_url("https://www.sullyssigns.ca"),
                         tooltip="Visit sullyssigns.ca",
                         style=ft.ButtonStyle(padding=ft.padding.all(0)),
                     ),
-                ], spacing=0, tight=True),
-                ft.Row([
-                    self._title_speed_slider,
-                    _title_color_btn,
-                    _title_effect_btn,
-                ], spacing=4, vertical_alignment=ft.CrossAxisAlignment.CENTER),
-            ], vertical_alignment="end", spacing=6),
+                ], spacing=6, vertical_alignment=ft.CrossAxisAlignment.CENTER),
+            ], spacing=0, tight=True),
+        ], vertical_alignment="end", spacing=6)
+
+        self._title_anim_row = ft.Row([
+            self._title_speed_slider,
+            _title_color_btn,
+            _title_effect_btn,
+        ], spacing=4, vertical_alignment=ft.CrossAxisAlignment.CENTER)
+
+        self._title_combined_row = ft.Row([
+            self._title_meta_row,
+            self._title_anim_row,
+        ], vertical_alignment="end", spacing=6)
+        self._title_left_col = ft.Column([
+            self._title_combined_row,
+        ], spacing=0, tight=True, expand=True)
+        self._header_title_split = False
+
+        self._header_right_row = ft.Row([
             ft.Row([
-                ft.Row([
-                    self._border_speed_slider,
-                    _border_color_btn,
-                    _border_effect_btn,
-                ], spacing=4, vertical_alignment=ft.CrossAxisAlignment.CENTER),
-                self.refresh_btn,
-            ], spacing=10, vertical_alignment=ft.CrossAxisAlignment.CENTER),
-        ], alignment="spaceBetween")
+                self._border_speed_slider,
+                _border_color_btn,
+                _border_effect_btn,
+            ], spacing=4, vertical_alignment=ft.CrossAxisAlignment.CENTER),
+            self.refresh_btn,
+        ], spacing=10, vertical_alignment=ft.CrossAxisAlignment.END)
+
+        self.header = ft.Row([
+            self._title_left_col,
+            self._header_right_row,
+        ], alignment="start", vertical_alignment=ft.CrossAxisAlignment.END)
+
+        self.top_update_row = ft.Row(
+            [self.wledcc_update_btn],
+            alignment="start",
+            vertical_alignment=ft.CrossAxisAlignment.START,
+        )
         
         self.scene_btns = []
         self._rebuild_scene_row_controls()
@@ -1751,7 +1832,7 @@ class WLEDApp:
             expand=True,
         )
         self._main_col = ft.Column(
-            [self.log_row, self.header, self.master_bar,
+            [self.log_row, self.top_update_row, self.header, self.master_bar,
              ft.Divider(height=10, color="transparent"), self._device_scroll],
             scroll=None,
             expand=True,
@@ -1763,6 +1844,7 @@ class WLEDApp:
         except:
             w = getattr(self.page, 'window_width', 1200) or 1200
         self._apply_col_width(w)
+        self._apply_header_layout(w)
         self._apply_master_layout(w)
         
         # Add cards in saved visual order, then any new devices not yet in the order list
@@ -6061,6 +6143,31 @@ class WLEDApp:
         try: self.master_bar.update()
         except: pass
 
+    def _should_split_header_title(self, w):
+        """Return True when header title area should split before the first slider."""
+        return w < 1160
+
+    def _apply_header_layout(self, w):
+        """Switch title area between one-row and split-row layout."""
+        split = self._should_split_header_title(w)
+        if split == self._header_title_split:
+            return
+
+        if split:
+            # Detach controls from the combined row first, then stack rows.
+            self._title_combined_row.controls.clear()
+            self._title_left_col.controls = [self._title_meta_row, self._title_anim_row]
+            self._title_left_col.spacing = 4
+        else:
+            # Move controls back into a single row before restoring the wrapper.
+            self._title_left_col.controls = [self._title_combined_row]
+            self._title_combined_row.controls = [self._title_meta_row, self._title_anim_row]
+            self._title_left_col.spacing = 0
+
+        self._header_title_split = split
+        try: self.header.update()
+        except: pass
+
     def _apply_col_width(self, w):
         """Update col on every card cell to match current window width."""
         col_map = {1: 60, 2: 30, 3: 20, 4: 15, 5: 12}
@@ -6093,6 +6200,7 @@ class WLEDApp:
                 self._win_h = int(h)
             self.save_cache()
             self._apply_col_width(w)
+            self._apply_header_layout(w)
             self._apply_master_layout(w)
 
 
