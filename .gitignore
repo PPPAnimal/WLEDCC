@@ -2,6 +2,7 @@
 __pycache__/
 *.py[cod]
 *.py
+*.txt
 
 # Distribution / Build folders
 build/

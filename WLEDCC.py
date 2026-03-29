@@ -82,6 +82,8 @@ os.makedirs(LOG_DIR, exist_ok=True)  # create folder on first run if it doesn't 
 CACHE_FILE = os.path.join(LOG_DIR, "wledcc_cache.json")
 GITHUB_RELEASES_URL = "https://api.github.com/repos/Aircoookie/WLED/releases/latest"
 LEDFX_RELEASES_URL = "https://api.github.com/repos/LedFx/LedFx/releases/latest"
+WLEDCC_RELEASES_API_URL = "https://api.github.com/repos/PPPAnimal/WLEDCC/releases/latest"
+WLEDCC_RELEASES_PAGE_URL = "https://github.com/PPPAnimal/WLEDCC/releases/latest"
 MAGIC_HOME_PORT = 5577
 MAGIC_HOME_DISCOVERY_PORT = 48899
 
@@ -110,6 +112,9 @@ class WLEDApp:
         self._last_defer_log = {}
         self.is_refreshing = False
         self.latest_release_ver = None
+        self.wledcc_latest_ver = None
+        self.wledcc_download_url = None
+        self.wledcc_asset_name = None
         self.ledfx_latest_ver = None
         self.ledfx_current_ver = "2.0.0" 
         self.brightness_queue = Queue()
@@ -207,6 +212,7 @@ class WLEDApp:
         if getattr(self, "_cache_load_warning", None):
             self.log(self._cache_load_warning, color="red400")
         threading.Thread(target=self.fetch_latest_release, daemon=True).start()
+        threading.Thread(target=self.check_wledcc_updates, daemon=True).start()
         threading.Thread(target=self.check_ledfx_updates, daemon=True).start()
         threading.Thread(target=self.brightness_worker, daemon=True).start()
         threading.Thread(target=self.rainbow_loop, daemon=True).start()
@@ -809,6 +815,212 @@ class WLEDApp:
                     self.log(f"LedFx: v{self.ledfx_current_ver} (up to date)")
         except: pass
 
+    def _version_tuple(self, version_text):
+        """Convert version string to comparable integer tuple, e.g. v4.5.9 -> (4, 5, 9)."""
+        try:
+            cleaned = (version_text or "").strip().lower().lstrip("v")
+            nums = []
+            cur = ""
+            for ch in cleaned:
+                if ch.isdigit():
+                    cur += ch
+                elif ch == ".":
+                    if cur:
+                        nums.append(int(cur))
+                        cur = ""
+                else:
+                    if cur:
+                        nums.append(int(cur))
+                        cur = ""
+            if cur:
+                nums.append(int(cur))
+            if not nums:
+                return (0,)
+            return tuple(nums)
+        except:
+            return (0,)
+
+    def _is_newer_version(self, latest, current):
+        latest_t = self._version_tuple(latest)
+        current_t = self._version_tuple(current)
+        # Pad tuples to equal length before compare: 4.5.9 == 4.5.9.0
+        max_len = max(len(latest_t), len(current_t))
+        latest_t += (0,) * (max_len - len(latest_t))
+        current_t += (0,) * (max_len - len(current_t))
+        return latest_t > current_t
+
+    def _pick_wledcc_release_asset(self, assets):
+        """Pick best Windows installer-like asset from release assets."""
+        best = None
+        best_score = -1
+        for asset in assets or []:
+            name = asset.get("name", "")
+            url = asset.get("browser_download_url", "")
+            if not name or not url:
+                continue
+            n = name.lower()
+
+            # Skip clearly non-Windows/source artifacts.
+            if "source code" in n or n.endswith(".sig") or n.endswith(".sha256"):
+                continue
+            if any(tok in n for tok in ["linux", "mac", "darwin", "arm64", "aarch64"]):
+                continue
+            if not (n.endswith(".exe") or n.endswith(".msi") or n.endswith(".zip")):
+                continue
+
+            score = 0
+            if n.endswith(".exe"):
+                score += 60
+            elif n.endswith(".msi"):
+                score += 55
+            elif n.endswith(".zip"):
+                score += 35
+
+            if "setup" in n or "installer" in n:
+                score += 40
+            if "win" in n or "windows" in n:
+                score += 20
+            if "x64" in n or "amd64" in n:
+                score += 10
+            if "portable" in n:
+                score -= 10
+
+            if score > best_score:
+                best_score = score
+                best = asset
+
+        return best
+
+    def _find_installer_in_extracted_zip(self, extract_path):
+        """Find best installer candidate inside extracted zip folder."""
+        best = None
+        best_score = -1
+        for root, _, files in os.walk(extract_path):
+            for fname in files:
+                n = fname.lower()
+                if not (n.endswith(".exe") or n.endswith(".msi")):
+                    continue
+                full = os.path.join(root, fname)
+                score = 0
+                if n.endswith(".exe"):
+                    score += 50
+                elif n.endswith(".msi"):
+                    score += 45
+                if "setup" in n or "installer" in n:
+                    score += 40
+                if "wledcc" in n:
+                    score += 20
+                if score > best_score:
+                    best_score = score
+                    best = full
+        return best
+
+    def install_or_update_wledcc(self, e=None):
+        if not self.wledcc_download_url:
+            self.log("[WLEDCC] No installer asset found in latest release. Opening releases page.", color="orange400")
+            try:
+                self.page.launch_url(WLEDCC_RELEASES_PAGE_URL)
+            except:
+                pass
+            return
+        self.wledcc_update_btn.disabled = True
+        self.wledcc_update_btn.text = "DOWNLOADING..."
+        self.wledcc_update_btn.bgcolor = "orange700"
+        try: self.wledcc_update_btn.update()
+        except: pass
+        self._open_log()
+        threading.Thread(target=self._run_wledcc_install, daemon=True).start()
+
+    def _run_wledcc_install(self):
+        import shutil
+        asset_name = self.wledcc_asset_name or "wledcc_update.bin"
+        download_path = os.path.join(os.path.expanduser("~"), asset_name)
+        extract_path = os.path.join(os.path.expanduser("~"), "wledcc_update_tmp")
+        try:
+            self.log(f"[WLEDCC] Downloading {asset_name}...")
+            with requests.get(self.wledcc_download_url, stream=True, timeout=120) as r:
+                r.raise_for_status()
+                total = int(r.headers.get("content-length", 0))
+                downloaded = 0
+                last_pct = -1
+                with open(download_path, "wb") as f:
+                    for chunk in r.iter_content(chunk_size=512 * 1024):
+                        if not chunk:
+                            continue
+                        f.write(chunk)
+                        downloaded += len(chunk)
+                        if total > 0:
+                            pct = int((downloaded / total) * 100)
+                            if pct != last_pct and (pct % 5 == 0 or pct == 100):
+                                last_pct = pct
+                                self.wledcc_update_btn.text = f"DOWNLOADING {pct}%"
+                                try: self.wledcc_update_btn.update()
+                                except: pass
+
+            target = download_path
+            lower_name = asset_name.lower()
+            if lower_name.endswith(".zip"):
+                self.log("[WLEDCC] Extracting update package...")
+                if os.path.exists(extract_path):
+                    shutil.rmtree(extract_path)
+                with zipfile.ZipFile(download_path, "r") as zf:
+                    zf.extractall(extract_path)
+                target = self._find_installer_in_extracted_zip(extract_path)
+                if not target:
+                    raise RuntimeError("No installer executable found inside zip")
+
+            self.log(f"[WLEDCC] Launching installer: {os.path.basename(target)}", color="yellow700")
+            self.log("[WLEDCC] Close WLEDCC if prompted by the installer.", color="grey500")
+            os.startfile(target)
+
+            self.wledcc_update_btn.text = "INSTALLER OPENED"
+            self.wledcc_update_btn.bgcolor = "green700"
+            self.wledcc_update_btn.disabled = True
+            try: self.wledcc_update_btn.update()
+            except: pass
+        except Exception as ex:
+            self.log(f"[WLEDCC] Update failed: {ex}", color="red400")
+            self.wledcc_update_btn.disabled = False
+            self.wledcc_update_btn.bgcolor = "cyan"
+            if self.wledcc_latest_ver:
+                self.wledcc_update_btn.text = f"UPDATE TO v{self.wledcc_latest_ver}"
+            else:
+                self.wledcc_update_btn.text = "UPDATE APP"
+            try: self.wledcc_update_btn.update()
+            except: pass
+
+    def check_wledcc_updates(self):
+        try:
+            self.log(f"[WLEDCC] Checking for app updates... (current v{APP_VERSION})", color="cyan")
+            resp = requests.get(WLEDCC_RELEASES_API_URL, timeout=10)
+            if resp.status_code != 200:
+                self.log(f"[WLEDCC] Update check HTTP status: {resp.status_code}", color="orange400")
+                return
+            payload = resp.json()
+            latest_tag = payload.get("tag_name", "").strip()
+            latest_clean = latest_tag.lstrip("vV")
+            current_clean = (APP_VERSION or "").strip().lstrip("vV")
+            self.wledcc_latest_ver = latest_clean
+            picked = self._pick_wledcc_release_asset(payload.get("assets", []))
+            self.wledcc_download_url = picked.get("browser_download_url") if picked else None
+            self.wledcc_asset_name = picked.get("name") if picked else None
+
+            if self._is_newer_version(latest_clean, current_clean):
+                self.log(f"WLEDCC update available: v{current_clean} -> v{latest_clean}", color="yellow700")
+                if self.wledcc_asset_name:
+                    self.log(f"[WLEDCC] Using release asset: {self.wledcc_asset_name}", color="grey500")
+                else:
+                    self.log("[WLEDCC] No installable asset found; button will open releases page.", color="orange400")
+                self.wledcc_update_btn.visible = True
+                self.wledcc_update_btn.text = f"UPDATE TO v{latest_clean}"
+                self.wledcc_update_btn.tooltip = f"Download and install WLEDCC v{latest_clean}"
+                try: self.wledcc_update_btn.update()
+                except: pass
+            else:
+                self.log(f"WLEDCC: v{current_clean} (up to date)", color="grey500")
+        except Exception as ex:
+            self.log(f"WLEDCC update check failed: {ex}", color="orange400")
+
     def install_or_update_ledfx(self, e):
         """Button handler — routes to install engine on a background thread."""
         for _u in self._ledfx_update_btns:
@@ -1304,6 +1516,15 @@ class WLEDApp:
         self.ledfx_ui_btn_narrow = ft.ElevatedButton("LEDFX UI", icon=ft.Icons.OPEN_IN_BROWSER, color="white", bgcolor="purple900", visible=False, on_click=lambda _: self.page.launch_url("http://localhost:8888"))
         self.scene_toggle_btn_wide   = ft.ElevatedButton("LEDFX SCENES", icon=ft.Icons.SWAP_HORIZ, color="white", bgcolor="purple900", visible=False, on_click=self.toggle_scene_mode)
         self.scene_toggle_btn_narrow = ft.ElevatedButton("LEDFX SCENES", icon=ft.Icons.SWAP_HORIZ, color="white", bgcolor="purple900", visible=False, on_click=self.toggle_scene_mode)
+        self.wledcc_update_btn = ft.ElevatedButton(
+            "UPDATE APP",
+            icon=ft.Icons.SYSTEM_UPDATE_ALT,
+            color="black",
+            bgcolor="cyan",
+            visible=False,
+            height=26,
+            on_click=self.install_or_update_wledcc,
+        )
         self.ledfx_update_btn_wide   = ft.ElevatedButton("UPDATE LEDFX", icon=ft.Icons.DOWNLOAD_FOR_OFFLINE, color="black", bgcolor="yellow700", visible=False, on_click=self.install_or_update_ledfx)
         self.ledfx_update_btn_narrow = ft.ElevatedButton("UPDATE LEDFX", icon=ft.Icons.DOWNLOAD_FOR_OFFLINE, color="black", bgcolor="yellow700", visible=False, on_click=self.install_or_update_ledfx)
         self.update_progress_bar_wide   = ft.ProgressBar(value=0, width=150, color="yellow700", bgcolor="#2b2b3b")
@@ -1402,6 +1623,7 @@ class WLEDApp:
                 ft.Row(self._title_chars, spacing=0, tight=True),
                 ft.Column([
                     ft.Text(f"v{APP_VERSION}", size=10, color="grey600"),
+                    self.wledcc_update_btn,
                     ft.TextButton(
                         content=ft.Text("by SullySSignS.ca", size=10, color="grey600"),
                         on_click=lambda _: self.page.launch_url("https://www.sullyssigns.ca"),
@@ -5916,7 +6138,7 @@ class WLEDListener:
 if __name__ == "__main__":
     # Use the exact title from your app
     if raise_if_running("WLED Command Center+"):
-        sys.exit(0)
+        _sys.exit(0)
     
     def main(page: ft.Page): WLEDApp(page)
     if __name__ == "__main__":
