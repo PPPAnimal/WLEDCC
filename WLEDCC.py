@@ -155,6 +155,15 @@ class WLEDApp:
         self.debug_mode = False   # True = show verbose debug logs
         self.debug_on_open = False   # True = enable debug mode when log panel opens
         self.log_auto_open = False   # True = log panel opens automatically at startup
+        # Exit popup preferences
+        self.exit_auto_stop_ledfx = False
+        self.exit_auto_all_off = False
+        self._cleanup_started = False
+        self._exit_in_progress = False
+        self.exit_dialog = None
+        self.exit_status_text = None
+        self.exit_stop_ledfx_auto_cb = None
+        self.exit_all_off_auto_cb = None
         # --- Log de-dup + change tracking ---
         self._last_log_by_key = {}
         self._last_ping_state = {}
@@ -637,11 +646,6 @@ class WLEDApp:
             # silently skip after 3 failures — will retry if LedFx clears cache on stop
             return None
 
-    def _ledfx_virtual_to_ip(self, vid, virtuals):
-        """Legacy fallback — no longer used by main poll loop."""
-        """Legacy fallback — no longer used by main poll loop."""
-        return None
-
     async def _async_confirm_release(self, ip):
         """Called after WLED confirms live=False — unlock card. LedFx is stopped so hide badge."""
         name = self.cards.get(ip, {}).get("name_label")
@@ -667,13 +671,7 @@ class WLEDApp:
 
     def toggle_ledfx(self, e):
         if self.is_ledfx_running():
-            # Kill the running process
-            for proc in psutil.process_iter(['name']):
-                try:
-                    if proc.info['name'] and proc.info['name'].lower() == "ledfx.exe":
-                        proc.kill()
-                        self.log("[LedFx] Process terminated.")
-                except: pass
+            self._stop_ledfx_process(log_prefix="[LedFx]")
         else:
             if not self.ledfx_path or not os.path.exists(self.ledfx_path):
                 # Path is missing or broken — try to find it automatically
@@ -691,6 +689,139 @@ class WLEDApp:
             else:
                 # Path exists in JSON and is valid — just launch
                 self._launch_ledfx()
+
+    def _stop_ledfx_process(self, log_prefix="[LedFx]"):
+        """Stop LedFx only; never starts it."""
+        stopped = False
+        for proc in psutil.process_iter(['name']):
+            try:
+                if proc.info['name'] and proc.info['name'].lower() == "ledfx.exe":
+                    proc.kill()
+                    stopped = True
+            except:
+                pass
+        if stopped:
+            self.log(f"{log_prefix} Process terminated.", color="orange400")
+        else:
+            self.log(f"{log_prefix} Process not running.", color="grey500")
+        return stopped
+
+    def _on_exit_pref_change(self, e=None):
+        if self.exit_stop_ledfx_auto_cb is not None:
+            self.exit_auto_stop_ledfx = bool(self.exit_stop_ledfx_auto_cb.value)
+        if self.exit_all_off_auto_cb is not None:
+            self.exit_auto_all_off = bool(self.exit_all_off_auto_cb.value)
+        self.save_cache()
+
+    def _persist_exit_preferences(self, flush=False):
+        self._on_exit_pref_change()
+        if flush:
+            if self._save_timer is not None:
+                self._save_timer.cancel()
+                self._save_timer = None
+            self._do_save_cache()
+
+    def _run_exit_stop_ledfx(self, auto=False):
+        prefix = "[Exit Auto]" if auto else "[Exit]"
+        self._stop_ledfx_process(log_prefix=prefix)
+        if self.exit_status_text is not None:
+            self.exit_status_text.value = "LedFx stop command sent."
+            try: self.exit_status_text.update()
+            except: pass
+
+    def _run_exit_all_off(self, auto=False):
+        prefix = "[Exit Auto]" if auto else "[Exit]"
+        self.log(f"{prefix} Running ALL OFF for all devices...", color="cyan")
+        self.broadcast_power(False)
+        if self.exit_status_text is not None:
+            self.exit_status_text.value = "All Off command sent."
+            try: self.exit_status_text.update()
+            except: pass
+
+    def _close_exit_dialog(self, e=None):
+        if self.exit_dialog is not None:
+            self.exit_dialog.open = False
+            try: self.page.update()
+            except: pass
+
+    def _show_exit_dialog(self):
+        if self._exit_in_progress:
+            return
+
+        if self.exit_dialog is None:
+            self.exit_status_text = ft.Text("", size=11, color="grey400")
+            self.exit_stop_ledfx_auto_cb = ft.Checkbox(
+                label="Auto-run next exit",
+                value=self.exit_auto_stop_ledfx,
+                on_change=self._on_exit_pref_change,
+                scale=0.9,
+            )
+            self.exit_all_off_auto_cb = ft.Checkbox(
+                label="Auto-run next exit",
+                value=self.exit_auto_all_off,
+                on_change=self._on_exit_pref_change,
+                scale=0.9,
+            )
+
+            self.exit_dialog = ft.AlertDialog(
+                modal=True,
+                title=ft.Text("Before Closing App", color="orange400"),
+                content=ft.Column([
+                    ft.Text("Choose actions before exit:", size=12, color="grey300"),
+                    ft.Row([
+                        ft.ElevatedButton("Stop LedFx", on_click=lambda _: self._run_exit_stop_ledfx(auto=False), bgcolor="red900", color="white"),
+                        self.exit_stop_ledfx_auto_cb,
+                    ], spacing=10, vertical_alignment=ft.CrossAxisAlignment.CENTER),
+                    ft.Row([
+                        ft.ElevatedButton("All Off", on_click=lambda _: self._run_exit_all_off(auto=False), bgcolor="red900", color="white"),
+                        self.exit_all_off_auto_cb,
+                    ], spacing=10, vertical_alignment=ft.CrossAxisAlignment.CENTER),
+                    self.exit_status_text,
+                ], tight=True, spacing=10, width=450),
+                actions=[
+                    ft.TextButton("Cancel", on_click=self._close_exit_dialog),
+                    ft.ElevatedButton("Close App", bgcolor="orange400", color="black", on_click=self._confirm_app_close),
+                ],
+                actions_alignment=ft.MainAxisAlignment.END,
+            )
+            self.page.overlay.append(self.exit_dialog)
+
+        # Load current preferences into dialog controls each time it opens.
+        self.exit_stop_ledfx_auto_cb.value = self.exit_auto_stop_ledfx
+        self.exit_all_off_auto_cb.value = self.exit_auto_all_off
+        self.exit_status_text.value = ""
+
+        auto_actions = []
+        if self.exit_auto_stop_ledfx:
+            self._run_exit_stop_ledfx(auto=True)
+            auto_actions.append("Stop LedFx")
+        if self.exit_auto_all_off:
+            self._run_exit_all_off(auto=True)
+            auto_actions.append("All Off")
+        if auto_actions:
+            self.exit_status_text.value = f"Auto-ran: {', '.join(auto_actions)}"
+
+        self.exit_dialog.open = True
+        self.page.update()
+
+    def _confirm_app_close(self, e=None):
+        self._exit_in_progress = True
+        self._persist_exit_preferences(flush=True)
+        self._close_exit_dialog()
+        self._finalize_exit()
+
+    def _finalize_exit(self):
+        self.cleanup(None)
+        try:
+            win = self.page.window
+            win.destroy()
+            return
+        except:
+            pass
+        try:
+            self.page.window_destroy()
+        except:
+            pass
         
     def _find_ledfx_locally(self):
         """Search all internal fixed drives for ledfx.exe, ignoring USB/Removable."""
@@ -1022,7 +1153,7 @@ class WLEDApp:
                     raise RuntimeError("No installer executable found inside zip")
 
             self.log(f"[WLEDCC] Launching installer: {os.path.basename(target)}", color="yellow700")
-            self.log("[WLEDCC] Close WLEDCC if prompted by the installer.", color="grey500")
+            self.log("[WLEDCC] Close WLED COMMAND CENTER before Update / Install.", color="red400")
             os.startfile(target)
             installer_base = os.path.splitext(os.path.basename(target))[0]
             brought_front = self._bring_window_to_front(
@@ -1272,6 +1403,17 @@ class WLEDApp:
             else:
                 self.page.window_maximized = True
         self.page.on_resized = self._on_window_resize
+        # Intercept window close so we can show exit options first.
+        try:
+            win = self.page.window
+            win.prevent_close = True
+            win.on_event = self.handle_window_event
+        except AttributeError:
+            try:
+                self.page.window_prevent_close = True
+                self.page.on_window_event = self.handle_window_event
+            except:
+                pass
         
         def _section(title, color, *lines):
             return [
@@ -1296,156 +1438,168 @@ class WLEDApp:
                 ft.Divider(),
 
                 *_section("WHAT IS THIS PROGRAM?", "#00f2ff",
-                    "WLED Command Center+ lets you control all your WLED, MagicHome, and",
-                    "custom devices from one place. Devices are auto-discovered on startup",
-                    "and kept in sync via background polling. All settings, names, scenes,",
-                    "and card order are saved and restored between sessions.",
+                    "WLED Command Center+ lets you control all your WLED, LEDFX, MagicHome, and",
+                    "custom devices from one place. Devices are auto-discovered on startup.",
+                    "It checks for new firmware for all your Devices and provides one click ",
+                    "automatic installs.  All settings, names, scenes and card order are saved",
+					"and restored between sessions.  Reboot slow devices, Sanitize Presets,",
+					"record/play presets/scenes for WLED and LEDFX.  Access WLED and LEDFX",
+					"WED UI's right from inside this program.  Make custom Cards for your",
+					"favorite WEB SITES, Program EXE's, etc and all from one screen.",
+					"Truely a ALL-IN-ONE Control Center.",
                 ),
+				
+				*_section("APP NAME BAR", "cyan",
+                    "SLIDERS - Use to control SPEED or BRIGHTNESS for APP NAME and CARDS.",
+					"	LEFT controls - APP NAME, RIGHT controls - Device CARDS.",
+					"COLOR PICKERS - changes color for solid or breathing effects",
+					"EFFECT PICKERS - changes effects - rainbow, solid, wave, etc.",
+					"SCAN — Refreshes device status and looks for newly found devices.",
+                    "	Use this after a router reboot or when a device changes IP.",
+				),	
 
                 *_section("TOP BAR — GLOBAL CONTROLS", "cyan",
-                    "ALL OFF / ALL ON — Instantly powers every device off or on.",
-                    "OPEN LOG — Shows the debug console. Drag the bottom edge to resize it.",
-                    "  COPY LOG copies all text. CLEAR LOG wipes it. DEBUG toggles verbose",
-                    "  logging. CLOSE LOG hides the panel.",
-                    "  Session logs are also saved automatically to the app folder —",
-                    "  up to 10 previous sessions are kept for review.",
-                    "MANUAL — Opens this guide.",
-                    "MERGE — Enables merge mode so you can drag one card onto another",
-                    "  to combine them. Useful when a device reappeared with a new IP",
-                    "  and created a duplicate card. Active when button turns orange.",
-                    "  Click again to cancel. See DEVICE DISCOVERY for more details.",
-                    "SCAN — Polls all devices for fresh status AND rescans the",
-                    "  network for new devices. Use this after a router reboot or when",
-                    "  a device changes IP.",
-                    "MASTER BRIGHTNESS — Slides all device brightness together while",
-                    "  preserving relative levels between devices.",
-                    "SCENES — Row of scene buttons. See SCENES section below.",
-                    "LEDFX UI — Appears beside STOP LEDFX while LedFx is running.",
-                    "  Opens the LedFx web interface at localhost:8888 in your browser.",
-                    "START/STOP LEDFX — See AUDIO SYNC section below.",
+                    "ALL OFF / ALL ON — One-click control to toggle every light in the house.",
+                    "OPEN LOG — Opens a message panel at the TOP of the app.",
+					"	AUTO-SCROLL ON/OFF keeps window focused on recent messages.",
+                    "	COPY LOG copies the text.",
+					"	CLEAR LOG clears the messages.",
+					"		only clears the screen, logs still saved to file.",
+					"	OPEN FOLDER opens to saved logs and config folder.",
+                    "	DEBUG ON/OFF shows extra troubleshooting details.",
+					"	DBG / AUTO OPEN check boxs to have log auto open in DEBUG mode.",
+					"	CLOSE LOG hides this window.",
+					"	While window is open, use grab bar botton center to size it.",
+					"MANUAL — Opens this guide.",
+                    "MERGE — attempts to fix duplicate cards.  Use this if device appears twice.",
+					"	keeps ID so device is linked to scenes/presets still.  (WIP).",
+                    "	click MERGE, then drag the new card onto the old one.",
+                    "	Click MERGE again to cancel.",
+                    "MASTER BRIGHTNESS — Dim or brighten all lights at once while keeping",
+					"  	their brightness levels relative to each other. (WIP)",
+                    "SCENES — Your saved scene buttons live here. See SCENES below.",
+                    "START LEDFX / STOP LEDFX — Starts or stops LedFx service.",
+					"	Prompts for INSTALL/UPDATE/BROWSE for path if not found.",
+                    "LEDFX UI — Opens the LedFx web UI when LedFx is running.",
                 ),
 
                 *_section("DEVICE CARDS", "cyan",
-                    "Each device gets its own card showing name, type badge, IP,",
-                    "firmware version, chip type, WiFi signal, and current effect.",
-                    "WLED cards show a cyan WLED badge. MagicHome cards show a green MH",
-                    "badge. Custom/launcher cards show the site favicon.",
-                    "Cards glow rainbow when on, dim when off, dark red when offline.",
+                    "	Each device gets its own card showing name, type badge, IP,",
+                    "	firmware version, chip type, WiFi signal, current effect and more.",
+                    "	Cards glow rainbow when on, dim when off, red when offline.",
+                    "WLED cards show a cyan WLED badge. Click it to open WLED's WEB UI.",
+					"MagicHome cards show a green MH",
                     "DRAG HANDLE (⠿) — Left edge of card. Drag to reorder.",
-                    "  In MERGE mode, dropping onto another card offers Reorder or Merge.",
+                    "  	In MERGE mode, dropping onto another card offers Reorder or Merge.",
                     "✏ RENAME — Pencil icon. Give the device a friendly name.",
                     "✕ REMOVE — Red X removes a dead or unwanted card. If the device",
-                    "  is still on the network it will reappear automatically on next scan.",
+                    "  	is still on the network it will reappear automatically on next scan.",
                     "POWER SWITCH — Toggles device on or off.",
                     "BRIGHTNESS SLIDER — Adjusts brightness in color mode, or controls",
-                    "  effect speed in MagicHome effect mode. Label shows % or SPD.",
+                    "  	effect speed in MagicHome effect mode.",
                     "🎨 COLOR — Rainbow button opens a color picker.",
-                    "✨ PRESET / MODES — Opens saved presets (WLED) or built-in effects",
-                    "  (MagicHome). For WLED, the app verifies the effect changed and",
-                    "  retries automatically. For MagicHome, use the brightness slider",
-                    "  to adjust speed after selecting an effect.",
+                    "✨ PRESET / MODES — Opens saved presets (WLED) or built-in effects (MH)",
                 ),
 
                 *_section("WLED-ONLY CONTROLS", "#00f2ff",
                     "OPEN WEB UI — Click the WLED badge to open the full WLED web UI.",
                     "SANITIZE — Strips brightness from saved presets so switching presets",
-                    "  no longer changes your brightness unexpectedly. Device reboots",
-                    "  automatically. Close the WLED web UI before running.",
-                    "UPDATE — Appears when newer firmware is available. Downloads and",
-                    "  flashes the correct build silently. Device reboots when done.",
-                    "LIVE BADGE — Appears on all WLED cards whenever LedFx is running.",
-                    "  ORANGE badge — LedFx currently has control of this device.",
-                    "    Color and preset controls are locked. Power and brightness still work.",
-                    "    Card border glows rainbow just like a powered-on device.",
-                    "    Click to release this device back to WLED control — badge goes grey.",
-                    "  GREY badge — LedFx is running but not controlling this device.",
-                    "    All controls are fully available.",
-                    "    Click to hand control of this device to LedFx — badge goes orange.",
-                    "  Badges hide automatically when LedFx is stopped.",
+                    "  	no longer changes your brightness unexpectedly.",
+                    "  	Close the WLED web UI before running to avoid corrupt presets.",
+                    "UPDATE — Appears when newer firmware is available. One click, downloads,",
+                    "  	UnZips, and flashes the correct stable build for your device.",
+                    "LIVE BADGES — Appear on all WLED cards whenever LedFx is running.",
+                    "  	PURPLE badge — LedFx currently has control of this device.",
+					"	GREY badge, WLED has control.",
+					"		click badges to toggle LEDFX/WLED control.",
+					"	Color and preset controls are locked during LEDFX control.",
+					"	Power/brightness still work.",
+					"	off devices that LEDFX takes control of, keep power switch off, ",
+					"	so once LEDFX releases control, device returns to off automatically.",
+					"	Cards that were ON before LEDFX took control, stay on after.",
+                    "  	Badges hide automatically when LedFx service is stopped.",
                 ),
 
                 *_section("MAGICHOME NOTES", "#00ff88",
-                    "MagicHome devices support color and built-in effects only.",
-                    "No Sanitize or firmware update — those are WLED features.",
-                    "Brightness works in static color mode. In effect mode, slider = speed.",
-                    "Color changes switch back to static mode automatically.",
-                    "Effects are selected from the MODES popup — 21 built-in patterns.",
-                    "BRIGHTNESS SLIDER — Commands are only sent when you release the slider,",
-                    "  not while dragging. This prevents flooding the device with rapid",
-                    "  commands which can cause it to crash or reboot.",
-                    "RATE LIMITING — A 1 second gap is enforced between all commands to",
-                    "  the same MagicHome device. Rapid clicks are queued and spaced out",
-                    "  automatically — the device will always receive the final state.",
+                    "	MagicHome devices support color and built-in effects only.",
+                    "	No Sanitize or firmware update — those are WLED features.",
+                    "COLOR PICKER changes switch back to static mode automatically.",
+                    "EFFECTS PICKER lets you select from 21 built-in patterns.",
+                    "BRIGHTNESS SLIDER — works in static color mode. In effect mode, slider = speed.",
                     "POWER ON VIA SLIDER — If the device is off and you move the brightness",
-                    "  slider, the device powers on automatically then sets the brightness",
-                    "  after a 1 second delay to ensure the device is ready.",
+                    "  	slider or pic a color, the device powers on automatically.",
                 ),
 
-                *_section("SCENES", "#00f2ff",
-                    "Scene buttons sit in the master bar. You always see your saved scenes",
-                    "plus one ADD button. There is no limit — record as many as you need.",
-                    "Each scene stores the full state of every device — on/off, brightness,",
-                    "color, effect, and active WLED preset. Scenes use a stable internal ID",
-                    "so they survive device IP changes and renames.",
+                *_section("SCENES", "cyan",
+                    "	Scene buttons sit in the master bar. You always see your saved scenes",
+                    "	plus one ADD button. There is no limit — record as many as you need.",
+                    "	Each scene stores the full state of every device — on/off, brightness,",
+                    "	color, effect, and active WLED preset. Scenes use a stable internal ID",
+                    "	so they survive device IP changes and renames.",
                     "ADD SCENE (+) — Click empty slot to snapshot all devices now.",
-                    "  Name the scene and press Enter or Save.",
-                    "ACTIVATE — Click the scene name to restore all devices instantly.",
-                    "  Offline devices are skipped with a note in the log.",
+                    "  	Name the scene and press Enter or Save.",
+					"EDIT — Right hamburger icon opens the scene editor.",
+                    "  	Check a box to include a device. Uncheck it to ignore that device.",
+                    "  	Use the refresh button beside a device to re-save only that device's",
+                    "  	current state without recording the whole scene again.",					
+                    "ACTIVATE — Click the scene name to play this scene.",
                     "✏ RENAME — Left pencil icon on scene button to change its name.",
                     "✕ CLEAR — X icon deletes the scene slot.",
-                    "EDIT — Right icon opens the scene editor popup:",
-                    "  • Checkbox per device — check to include, uncheck to exclude.",
-                    "  • Refresh button per device — updates just that device's saved",
-                    "    state to its current state without re-recording everything.",
-                    "  • Newly checked devices are snapshotted at the moment you save.",
                     "Scenes are saved to disk and survive restarts.",
                 ),
 
-                *_section("AUDIO SYNC (LedFx)", "purple",
-                    "START LEDFX — Launches LedFx and shows a countdown. Button stays",
-                    "  on STARTING until LedFx web UI responds (up to 30s).",
-                    "STOP LEDFX — Shuts down LedFx. Cards unlock after a short cooldown.",
+                *_section("LEDFX AUDIO SYNC", "purple",
+					"Turn your lights into a visualizer that react to your computer's audio.",
+					"	If path not found, clicking start prompts you to install",
+					"	or  browse to path where you have it installed.",
+					"	Install downloads and installs automatically when clicked.",
+                    "START LEDFX — Launches LedFx service. adds Purple LIVE badge to Card.",
+                    "STOP LEDFX — Shuts down LedFx. Unlocks WLED controls.  Removes badge.",
                     "LEDFX UI — Opens the LedFx web interface in your browser. Only",
-                    "  visible while LedFx is running, beside the STOP LEDFX button.",
-                    "INSTALL / UPDATE LEDFX — Downloads and installs the latest version.",
-                    "  After install, click START LEDFX and browse to ledfx.exe.",
+                    "  	visible while LedFx is running, beside the STOP LEDFX button.",
                     "LIVE MODE — While LedFx runs, all WLED cards show a LIVE badge.",
-                    "  The app polls LedFx every 3 seconds to track which devices are active.",
-                    "  ORANGE badge — LedFx is actively controlling this device.",
+                    "  	This lets you see which lights LedFx is controlling right now.",
+                    "PURPLE LIVE badge — LedFx is actively controlling this device.",
                     "    Click to release it back to WLED. Badge turns grey.",
-                    "  GREY badge — LedFx is running but not controlling this device.",
-                    "    Click to hand it to LedFx. Badge turns orange.",
-                    "  If you enable or disable a device inside the LedFx app directly,",
-                    "  the badge updates automatically on the next poll (within 3 seconds).",
-                    "  All badges hide when LedFx is stopped.",
+                    "GREY LIVE badge — LedFx is running but not controlling this device.",
+                    "    Click it to have LedFx control it. Badge turns purple.",
+                    "All badges hide when LedFx is stopped.",
                 ),
 
-                *_section("ADDING CUSTOM DEVICES", "grey400",
-                    "The + ADD DEVICE card is always last in the grid.",
-                    "Click it and enter an IP address, local hostname, or website URL.",
-                    "  IP address — app probes for WLED, then TCP on port 80.",
-                    "    If WLED found: adds a full WLED card automatically.",
-                    "    If HTTP found: asks for a name and creates a launcher card.",
-                    "  Hostname (e.g. house.local) — creates a launcher card.",
-                    "  URL (e.g. sullyssigns.ca) — creates a launcher card with favicon.",
-                    "Launcher cards show online/offline status (local devices),",
-                    "  an OPEN button, editable name, and drag handle for reordering.",
-                    "Custom cards are saved and restored between sessions.",
+             *_section("ADDING CUSTOM DEVICES", "cyan",
+					"	This allows you to add custom cards to launch almost anything."
+                    "ADD DEVICE card is always last in the grid.",
+                    "		Click it and enter IP address, web URL or path to program files.",
+                    "  	IP address — app probes for WLED, then TCP on port 80.",
+                    "   	If WLED found: adds a full WLED card automatically.",
+                    "  	Hostname (e.g. house.local) — creates a launcher card.",
+                    "  	URL (e.g. spotify.com) — launches URL in browser.",
+                    "	EXE - browse to your favorite program exe and it adds a launch button.",
+                ),
+				
+                *_section("CLOSING THE APP", "cyan",
+                    "	When you click the X to close the app, a closing popup appears first.",
+                    "STOP LEDFX — Stops LedFx before you leave the app.",
+                    "ALL OFF — Turns all lights off before you leave the app.",
+                    "CLOSE App — Exits the app.",
+                    "CANCEL — Closes the popup and returns to the app.",
+                    "Auto-run next exit checkbox — Repeats action on next exit.",
+                    "	Remember settings — Saves which Auto-run boxes you selected.",
+                    "  	The popup still appears each time, so you can review and",
+                    " 	change settings or click Close App when you are ready.",
                 ),
 
-                *_section("DEVICE DISCOVERY & IP CHANGES", "grey400",
-                    "WLED: discovered via mDNS. MagicHome: via broadcast on port 48899.",
-                    "On startup, a 10-second scan runs automatically after 5 seconds.",
-                    "If a device changes IP (e.g. after router reboot), click REFRESH.",
-                    "  The app matches devices by MAC address — if a new IP is found for",
-                    "  a known MAC, the cache is updated and a full restart applies it.",
-                    "  MAC addresses are learned from WLED's /json API on first poll,",
-                    "  so devices with friendly mDNS names (Ceiling.local etc) are",
-                    "  matched correctly after the first session.",
-                    "If a duplicate card appears, use MERGE mode: click MERGE in the",
-                    "  top bar (turns orange), drag the new card onto the old card,",
-                    "  and confirm. Old card keeps its name and scenes, new card removed.",
-                ),
+                
+				*_section("TROUBLESHOOTING & NETWORK", "cyan",
+					"	The app automatically scans for devices on first starts up.",
+					"	Run it again anytime by clicking SCAN button, top right of screen.",
+					"MOVED DEVICES — If a light stops responding because your router gave it",
+					"	a new address, click SCAN. The app will usually find it and update",
+					"	your existing card automatically.",
+					"DUPLICATE CARDS — If a device appears twice, click MERGE and drag",
+					"  the 'new' card onto your 'old' card. This keeps your custom names",
+					"  and scenes intact while updating the connection info. (WIP)",
+				),
 
 
 
@@ -4903,6 +5057,9 @@ class WLEDApp:
         self.border_color  = c.get("border_color",  "#ff0000")
         self.debug_on_open = c.get("debug_on_open", False)
         self.log_auto_open = c.get("log_auto_open", False)
+        self.exit_remember_actions = c.get("exit_remember_actions", False)
+        self.exit_auto_stop_ledfx = c.get("exit_auto_stop_ledfx", False)
+        self.exit_auto_all_off = c.get("exit_auto_all_off", False)
 
         # Initialize unified polling device sets — only add actual WLED/MH devices, not custom launcher cards
         self.wled_devices = set()
@@ -4961,7 +5118,8 @@ class WLEDApp:
         display_names, custom_devices, card_ids, device_macs, individual_bri,
         master_bri, ledfx_path, ledfx_ver, win_w, win_h, win_max,
         title_effect, title_speed, title_color, border_effect, border_speed,
-        border_color, debug_on_open, log_auto_open.
+        border_color, debug_on_open, log_auto_open,
+        exit_remember_actions, exit_auto_stop_ledfx, exit_auto_all_off.
         """
         _SCALAR_KEYS = {
             "master_bri", "ledfx_path", "ledfx_ver",
@@ -4969,6 +5127,7 @@ class WLEDApp:
             "title_effect", "title_speed", "title_color",
             "border_effect", "border_speed", "border_color",
             "debug_on_open", "log_auto_open",
+            "exit_remember_actions", "exit_auto_stop_ledfx", "exit_auto_all_off",
         }
         _DICT_KEYS = {
             "devices", "types", "custom_names", "display_names",
@@ -5112,6 +5271,9 @@ class WLEDApp:
             "border_color":  self.border_color,
             "debug_on_open": self.debug_on_open,
             "log_auto_open": self.log_auto_open,
+            "exit_remember_actions": self.exit_remember_actions,
+            "exit_auto_stop_ledfx": self.exit_auto_stop_ledfx,
+            "exit_auto_all_off": self.exit_auto_all_off,
         }
         try:
             # Write one backup per session (at first save only), then only update main file
@@ -6205,9 +6367,17 @@ class WLEDApp:
 
 
     def handle_window_event(self, e):
-        if e.data in ["blur", "minimize"]: self.is_focused = False
-        elif e.data in ["focus", "restore"]: self.is_focused = True
+        if e.data in ["blur", "minimize"]:
+            self.is_focused = False
+        elif e.data in ["focus", "restore"]:
+            self.is_focused = True
+        elif e.data == "close":
+            self._show_exit_dialog()
+
     def cleanup(self, e):
+        if self._cleanup_started:
+            return
+        self._cleanup_started = True
         self.running = False
         self.brightness_queue.put(None)
         # Flush any pending debounced save before closing
