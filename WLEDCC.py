@@ -91,6 +91,7 @@ CACHE_FILE = os.path.join(LOG_DIR, "wledcc_cache.json")
 GITHUB_RELEASES_URL = "https://api.github.com/repos/Aircoookie/WLED/releases/latest"
 LEDFX_RELEASES_URL = "https://api.github.com/repos/LedFx/LedFx/releases/latest"
 WLEDCC_RELEASES_API_URL = "https://api.github.com/repos/PPPAnimal/WLEDCC/releases/latest"
+WLEDCC_RELEASES_LIST_URL = "https://api.github.com/repos/PPPAnimal/WLEDCC/releases?per_page=20"
 WLEDCC_RELEASES_PAGE_URL = "https://github.com/PPPAnimal/WLEDCC/releases/latest"
 WINAMP_DOWNLOADS_PAGE_URL = "https://winamp.com/player"
 WINAMP_LEGACY_INSTALLER_URL = "https://download.winamp.com/winamp/winamp_latest_full.exe"
@@ -1723,6 +1724,30 @@ class WLEDApp:
 
         return best
 
+    def _pick_latest_wledcc_release_payload(self, releases):
+        """Pick highest-version non-draft, non-prerelease release payload from GitHub list."""
+        try:
+            best = None
+            best_ver = (0,)
+            best_pub = ""
+            for rel in releases or []:
+                if not isinstance(rel, dict):
+                    continue
+                if rel.get("draft") or rel.get("prerelease"):
+                    continue
+                tag = (rel.get("tag_name") or "").strip()
+                if not tag:
+                    continue
+                ver = self._version_tuple(tag)
+                pub = (rel.get("published_at") or "").strip()
+                if (ver > best_ver) or (ver == best_ver and pub > best_pub):
+                    best = rel
+                    best_ver = ver
+                    best_pub = pub
+            return best
+        except:
+            return None
+
     def _find_installer_in_extracted_zip(self, extract_path):
         """Find best installer candidate inside extracted zip folder."""
         best = None
@@ -1884,11 +1909,28 @@ class WLEDApp:
     def check_wledcc_updates(self):
         try:
             self.log(f"[WLEDCC] Checking for app updates... (current v{APP_VERSION})", color="cyan")
-            resp = requests.get(WLEDCC_RELEASES_API_URL, timeout=10)
-            if resp.status_code != 200:
-                self.log(f"[WLEDCC] Update check HTTP status: {resp.status_code}", color="orange400")
-                return
-            payload = resp.json()
+            payload = None
+
+            # Prefer releases list and pick highest version ourselves.
+            # GitHub /releases/latest can occasionally lag behind newly published releases.
+            try:
+                list_resp = requests.get(WLEDCC_RELEASES_LIST_URL, timeout=10)
+                if list_resp.status_code == 200:
+                    rels = list_resp.json()
+                    if isinstance(rels, list):
+                        payload = self._pick_latest_wledcc_release_payload(rels)
+                else:
+                    self.log(f"[WLEDCC] Releases list HTTP status: {list_resp.status_code}", color="orange400")
+            except Exception as ex:
+                self.log(f"[WLEDCC] Releases list fetch failed: {ex}", color="orange400")
+
+            if not payload:
+                resp = requests.get(WLEDCC_RELEASES_API_URL, timeout=10)
+                if resp.status_code != 200:
+                    self.log(f"[WLEDCC] Update check HTTP status: {resp.status_code}", color="orange400")
+                    return
+                payload = resp.json()
+
             latest_tag = payload.get("tag_name", "").strip()
             latest_clean = latest_tag.lstrip("vV")
             current_clean = (APP_VERSION or "").strip().lstrip("vV")
