@@ -1,3 +1,88 @@
+WLED Command Center+
+
+NEW FEATURES Added in V4.6.7
+
+SPECTRUM ANALYZER (PC AUDIO)
+    The header includes a live spectrum analyzer that reacts to your PC audio.
+    Click the spectrum display or MIC icon to open Spectrum Settings.
+    idle modes arcade pack: Pac-Man, Tetris, Space Invaders, Snake and more.
+
+SPECTRUM SETTINGS (MODES + TUNING)
+    SENSITIVITY — Global analyzer gain.
+    REACTIVITY — How fast bars rise on transients.
+    BAR DECAY — How fast bars fall.
+    PEAK DECAY — How fast peak markers fall.
+    MODE — Classic, VU (L/R), Random (1 min), Random (Per Song).
+    IDLE EFFECTS — Runs ambient visuals after silence timeout.
+    IDLE EFFECT OPTIONS — Random, Aurora, Pulse, Text, Rainbow,
+        Pac-Man, Tetris, Invaders, Snake.
+
+SPECTRUM VISUAL EQ (UI ONLY)
+    10-band visual EQ is available in Spectrum Settings.
+    Presets: Flat, Bass+, Smile, Vocal.
+    Important: This EQ only changes the analyzer visualization in WLEDCC.
+    It does not change Windows audio output or device audio tone.
+
+LEDFX SCENES MODE
+    Scene bar can switch between WLED scenes and LedFx scenes.
+    Use the scene mode toggle button in the scene bar.
+    When LedFx mode is selected, WLEDCC fetches current scenes from LedFx.
+    If no scenes are returned, the row shows "No LedFx scenes".
+
+EXIT POPUP AUTOMATION (BEFORE CLOSING APP)
+    Auto-run on exit options let you save one-click shutdown behavior:
+    - Stop LedFx automatically on exit.
+    - Run All Lights Off automatically on exit.
+    Startup automation options are also saved here:
+    - Auto-start LedFx on app launch.
+    - Auto-load last WLED scene.
+    - Auto-load last LedFx scene.
+
+CUSTOM CARD AUTOMATION
+    Custom cards now include per-card automation checkboxes:
+    - AUTO START: launches this card target when WLEDCC starts.
+    - AUTO CLOSE / STOP ON EXIT: closes target when WLEDCC exits.
+
+SPOTIFY WEB CARD CONTROLS
+    Spotify web cards show controls for:
+    - Previous
+    - Play/Pause
+    - Next
+    - Show Spotify Web UI
+    Status line can show now-playing style feedback when available.
+
+WINAMP CARD CONTROLS + SETUP
+    Winamp cards include controls for:
+    - Previous, Play, Pause, Stop, Next
+    If winamp.exe path is missing, WLEDCC offers:
+    - Install WINAMP (legacy installer)
+    - Browse to existing winamp.exe
+    - Open Winamp downloads page
+
+DEFAULT QUICK CARDS
+    On first run, WLEDCC will add default custom cards:
+    - WINAMP
+    - SPOTIFY.COM
+    
+EDIT DEVICE IP
+    Device IP can be edited directly from the card IP field.
+    WLEDCC rebinds the device live to the new IP.
+    Note: some controls may require app restart for full re-bind.
+
+LOG OPTIONS EXPANDED
+    OPEN LOG now includes additional options:
+    - DBG on open (turn debug on when log opens)
+    - Auto-open (open log panel at app startup)
+    - Save to disk (write current session logs to file)
+    - BG updates (continue log/UI updates when app is not focused)
+
+BUG FIXES 
+    - Brightness sliders were not showing numberical value.
+    - Devices now remember last color\brightness between sessions
+    - Reduced logs to one per session, 10 Max
+    - Last used scene button border now glows
+
+
 WHAT IS THIS PROGRAM?
 WLED Command Center+ lets you control all your WLED, LEDFX, MagicHome, and 
 custom devices from one place. Devices are auto-discovered on startup. 
@@ -135,10 +220,12 @@ STOP LEDFX — Stops LedFx before you leave the app.
 ALL OFF — Turns all lights off before you leave the app.
 CLOSE App — Exits the app.
 CANCEL — Closes the popup and returns to the app.
-Auto-run next exit checkbox — Repeats action on next exit.
-    Remember settings — Saves which Auto-run boxes you selected.
-    The popup still appears each time, so you can review and
-    change settings or click Close App when you are ready.
+Check boxes — auto start your favorite music app
+    and automatically start playing music while it auto starts your 
+    last used lighting scene, then on shutdown, auto closes everything
+    you opened and shuts your lights down.  Check boxes on closing screen 
+    and Custom Cards allow you to select what parts of this automation 
+    you want to enable.
 
 TROUBLESHOOTING & NETWORK
     The app automatically scans for devices on first starts up.
@@ -149,3 +236,6 @@ MOVED DEVICES — If a light stops responding because your router gave it
 DUPLICATE CARDS — If a device appears twice, click MERGE and drag
   the 'new' card onto your 'old' card. This keeps your custom names
   and scenes intact while updating the connection info. (WIP)
+
+
+        
