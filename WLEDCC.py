@@ -96,6 +96,8 @@ WLEDCC_RELEASES_PAGE_URL = "https://github.com/PPPAnimal/WLEDCC/releases/latest"
 WINAMP_DOWNLOADS_PAGE_URL = "https://winamp.com/player"
 WINAMP_LEGACY_INSTALLER_URL = "https://download.winamp.com/winamp/winamp_latest_full.exe"
 DEFAULT_WINAMP_CARD_KEY = "__default_winamp__"
+SPOTIFY_DOWNLOADS_PAGE_URL = "https://www.spotify.com/download/windows/"
+SPOTIFY_SETUP_EXE_URL = "https://download.scdn.co/SpotifySetup.exe"
 DEFAULT_SPOTIFY_CARD_KEY = "__default_spotify__"
 MAGIC_HOME_PORT = 5577
 MAGIC_HOME_DISCOVERY_PORT = 48899
@@ -176,13 +178,15 @@ class WLEDApp:
         self._strobe_border = True
         # Winamp-style spectrum analyzer state (header visualizer)
         self._spec_bands = 30
+        self._spec_analysis_bands = 30
         self._spec_levels = 16
-        self._spec_bars = [0.0] * self._spec_bands
-        self._spec_peaks = [0.0] * self._spec_bands
-        self._spec_peak_hold = [0] * self._spec_bands
-        self._spec_band_avg = [0.0] * self._spec_bands  # per-band adaptive floor for dynamics
+        self._spec_bars = [0.0] * self._spec_analysis_bands
+        self._spec_peaks = [0.0] * self._spec_analysis_bands
+        self._spec_peak_hold = [0] * self._spec_analysis_bands
+        self._spec_band_avg = [0.0] * self._spec_analysis_bands  # per-band adaptive floor for dynamics
         self._spec_segments = []
         self._spec_gain = 1.0
+        self._spec_target_fps = 25
         self._spec_sensitivity = 0.85  # 0.1-1.5 user preamp scale, default 85%
         self._spec_reactivity = 3.0  # rise speed multiplier
         self._spec_bar_decay = 2.0   # bar fall speed multiplier
@@ -193,20 +197,9 @@ class WLEDApp:
         self._spec_mode_random_next_ts = time.monotonic() + self._spec_mode_random_cycle_seconds
         self._spec_mode_song_silence_seconds = 1.0
         self._spec_mode_song_switch_armed = True
-        self._spec_beat_last_ts = 0.0
-        self._spec_beat_prev_bass = 0.0
-        self._spec_beat_bass_avg = 0.0
-        self._spec_beat_hold_seconds = 0.16
-        self._spec_beat_min_gap_seconds = 0.22
-        self._spec_rhythm_intervals = []
-        self._spec_rhythm_locked = False
-        self._spec_rhythm_period = 0.5
-        self._spec_rhythm_phase_anchor = 0.0
-        self._spec_rhythm_min_samples = 4
-        self._spec_rhythm_flash_window = 0.11
-        self._spec_rhythm_timeout_seconds = 2.0
-        self._spec_rhythm_flash_enabled = False
         self._spec_capture_channels = 2  # prefer stereo; fallback to mono if device does not support it
+        self._spec_sample_rate = 48000  # lower values reduce analyzer CPU usage
+        self._spec_sampling_enabled = True  # quick toggle: when off, skip audio capture (idle-only mode)
         self._spec_vu_gain = 0.18
         self._spec_vu_left = 0.0
         self._spec_vu_right = 0.0
@@ -214,7 +207,8 @@ class WLEDApp:
         self._spec_vu_peak_right = 0.0
         self._spec_idle_enabled = True
         self._spec_idle_timeout = 2.0
-        self._spec_idle_effect = "random"  # random | aurora | pulse | text | rainbow | pacman | tetris | invaders | snake
+        self._spec_idle_effect = "random"  # random | aurora | pulse | text | rainbow | pacman | tetris | invaders | snake | starwars
+        self._spec_idle_cycle_effects = ["aurora", "pulse", "text", "rainbow", "pacman", "tetris", "invaders", "snake", "starwars"]
         self._spec_idle_speed = 2.0  # ambient idle animation speed multiplier
         self._spec_idle_random_current = "aurora"
         self._spec_idle_random_cycle_seconds = 10.0
@@ -237,6 +231,17 @@ class WLEDApp:
         self._spec_preview_snapshot = None  # baseline state to restore on Close/Refresh
         self._spec_source_changed = False  # flag to signal audio loop to switch source
         self._spec_disabled = False  # True if audio capture failed and is disabled
+        self._spec_render_mode = "grid"  # grid | graphics
+        self._spec_box_grid_size = (296, 62)
+        self._spec_box_graphics_size = self._spec_box_grid_size
+        self._spec_grid_content = None
+        self._spec_graphics_host = None
+        self._spec_graphics_layer = None
+        self._spec_graphics_ready = False
+        self._spec_graphics_stars = []
+        self._spec_graphics_lines = []
+        self._spec_graphics_view_size = (0, 0)
+        self._spec_display_cleared = False
         self._spec_np_patch_applied = False
         self.brightness_debounce_timer = None
         self._save_timer = None          # debounce timer for save_cache
@@ -1373,6 +1378,193 @@ class WLEDApp:
                 return _p
         return None
     
+    def _find_spotify_exe_locally(self):
+        """Find Spotify.exe from running process or common install paths."""
+        try:
+            for _proc in psutil.process_iter(["name", "exe", "cmdline"]):
+                _name = (_proc.info.get("name") or "").lower()
+                if _name != "spotify.exe":
+                    continue
+                _exe = _proc.info.get("exe")
+                if _exe and os.path.exists(_exe):
+                    return _exe
+                _cmd = _proc.info.get("cmdline") or []
+                if _cmd and os.path.exists(_cmd[0]) and os.path.basename(_cmd[0]).lower() == "spotify.exe":
+                    return _cmd[0]
+        except Exception:
+            pass
+
+        _candidate_paths = []
+        _la = os.environ.get("LOCALAPPDATA", "")
+        _ap = os.environ.get("APPDATA", "")
+        if _la:
+            _candidate_paths.append(os.path.join(_la, "Spotify", "Spotify.exe"))
+            _candidate_paths.append(os.path.join(_la, "Microsoft", "WindowsApps", "Spotify.exe"))
+        if _ap:
+            _candidate_paths.append(os.path.join(_ap, "Spotify", "Spotify.exe"))
+        for _base in [
+            os.environ.get("PROGRAMFILES", ""),
+            os.environ.get("PROGRAMFILES(X86)", ""),
+        ]:
+            if _base:
+                _candidate_paths.append(os.path.join(_base, "Spotify", "Spotify.exe"))
+
+        _seen = set()
+        for _p in _candidate_paths:
+            if not _p:
+                continue
+            _norm = self._normalize_path(_p)
+            if _norm in _seen:
+                continue
+            _seen.add(_norm)
+            if os.path.exists(_p):
+                return _p
+        return None
+
+    def _set_spotify_exe_path_from_picker(self, key, path):
+        """Persist selected Spotify.exe path for an existing Spotify exe card."""
+        if not path:
+            return
+        info = self.custom_devices.get(key)
+        if not isinstance(info, dict):
+            return
+        info["url"] = path
+        info["is_exe"] = True
+        self.custom_devices[key] = info
+        c = self.cards.get(key)
+        if c:
+            c["_url"] = path
+            c["_is_exe"] = True
+        self.save_cache()
+        _nm = c.get("name_label").value if c and c.get("name_label") else key
+        self.log(f"[Spotify] Path set for '{_nm}': {path}", color="green400")
+
+    def _show_spotify_exe_setup_dialog(self, key):
+        """Show Spotify exe setup dialog when card path is missing or invalid."""
+        c = self.cards.get(key, {})
+        _nm = c.get("name_label").value if c.get("name_label") else key
+
+        def _close(_=None):
+            dlg.open = False
+            try:
+                self.page.update()
+            except Exception:
+                pass
+
+        def _browse(_):
+            _close()
+            def _set_path(path):
+                self._set_spotify_exe_path_from_picker(key, path)
+            self._exe_pick_callback = _set_path
+            self.exe_picker.pick_files(
+                dialog_title="Select Spotify.exe",
+                allowed_extensions=["exe"],
+            )
+
+        def _install_spotify(_):
+            _close()
+            threading.Thread(target=self._run_spotify_exe_install, args=(key,), daemon=True).start()
+
+        def _open_downloads(_):
+            _close()
+            try:
+                self.page.launch_url(SPOTIFY_DOWNLOADS_PAGE_URL)
+            except Exception:
+                pass
+
+        dlg = ft.AlertDialog(
+            title=ft.Text("Spotify Path Not Found"),
+            content=ft.Column([
+                ft.Text(f"Card '{_nm}' needs a valid Spotify.exe path.", size=12),
+                ft.Text("Browse to your existing Spotify.exe, or open the download page.", size=12, color="grey500"),
+            ], tight=True, spacing=8, width=420),
+            actions=[
+                ft.ElevatedButton("Install Spotify", icon=ft.Icons.DOWNLOAD_FOR_OFFLINE, bgcolor="green700", color="white", on_click=_install_spotify),
+                ft.TextButton("Browse EXE", on_click=_browse),
+                ft.TextButton("Open Download Page", on_click=_open_downloads),
+                ft.TextButton("Cancel", on_click=_close),
+            ],
+        )
+        self.page.overlay.append(dlg)
+        dlg.open = True
+        self.page.update()
+
+    def _run_spotify_exe_install(self, key):
+        """Download and launch Spotify setup exe, then auto-detect Spotify.exe path when available."""
+        c = self.cards.get(key, {})
+        _nm = c.get("name_label").value if c.get("name_label") else key
+        installer_path = os.path.join(os.path.expanduser("~"), "SpotifySetup.exe")
+        try:
+            self.log(f"[Spotify] Downloading installer for '{_nm}'...", color="grey500")
+
+            for _r, _pb, _pt in zip(self._progress_rows, self._progress_bars, self._percent_texts):
+                _r.visible = True
+                _pb.value = 0
+                _pt.value = "0%"
+                try:
+                    _r.update()
+                except Exception:
+                    pass
+            try:
+                self.page.update()
+            except Exception:
+                pass
+
+            with requests.get(SPOTIFY_SETUP_EXE_URL, stream=True, timeout=120) as r:
+                r.raise_for_status()
+                total = int(r.headers.get("content-length", 0))
+                downloaded = 0
+                last_pct = -1
+                with open(installer_path, "wb") as f:
+                    for chunk in r.iter_content(chunk_size=512 * 1024):
+                        if not chunk:
+                            continue
+                        f.write(chunk)
+                        downloaded += len(chunk)
+                        if total > 0:
+                            pct = int((downloaded / total) * 100)
+                            if pct != last_pct and (pct % 5 == 0 or pct == 100):
+                                last_pct = pct
+                                _ratio = downloaded / total
+                                for _r, _pb, _pt in zip(self._progress_rows, self._progress_bars, self._percent_texts):
+                                    _pb.value = _ratio
+                                    _pt.value = f"{pct}%"
+                                    try:
+                                        _r.update()
+                                    except Exception:
+                                        pass
+                                try:
+                                    self.page.update()
+                                except Exception:
+                                    pass
+
+            self.log(f"[Spotify] Installer downloaded: {installer_path}", color="green400")
+            os.startfile(installer_path)
+            self.log("[Spotify] Installer launched. Auto-detecting Spotify.exe path...", color="orange400")
+
+            _end = time.monotonic() + 90.0
+            while self.running and (time.monotonic() < _end):
+                _found = self._find_spotify_exe_locally()
+                if _found and os.path.exists(_found):
+                    self._set_spotify_exe_path_from_picker(key, _found)
+                    self.log(f"[Spotify] Auto-detected install path for '{_nm}'", color="green400")
+                    break
+                time.sleep(1.0)
+        except Exception as ex:
+            self.log(f"[Spotify] Installer flow failed for '{_nm}': {ex}", color="red400")
+        finally:
+            for _r in self._progress_rows:
+                _r.visible = False
+                try:
+                    _r.update()
+                except Exception:
+                    pass
+            try:
+                self.page.update()
+            except Exception:
+                pass
+            self._schedule_installer_cleanup([installer_path], label="Spotify")
+
     def _show_ledfx_setup_dialog(self):
         """Show dialog offering Fresh Install or Browse to existing exe."""
         def close(_):
@@ -2759,32 +2951,77 @@ class WLEDApp:
             )
 
         self._spec_palette = _spec_palette
+        self._spec_grid_content = ft.Row(_band_controls, spacing=2, vertical_alignment=ft.CrossAxisAlignment.END)
+        self._spec_graphics_layer = ft.Stack([], expand=True)
+        self._spec_graphics_host = ft.Container(
+            expand=True,
+            bgcolor="#05050c",
+            content=self._spec_graphics_layer,
+            padding=ft.padding.only(left=8, right=8, top=6, bottom=6),
+        )
         self._spectrum_box = ft.Container(
             bgcolor="#060606",
             border=ft.border.all(1, "#2b2b2b"),
             border_radius=4,
-            padding=ft.padding.symmetric(horizontal=6, vertical=4),
-            width=296,
-            height=62,
-            content=ft.Row(_band_controls, spacing=2, vertical_alignment=ft.CrossAxisAlignment.END),
+            padding=ft.padding.only(left=6, right=6, top=4, bottom=0),
+            width=self._spec_box_grid_size[0],
+            height=self._spec_box_grid_size[1],
+            content=self._spec_grid_content,
             tooltip="PC Audio Spectrum",
             ink=True,
             on_click=self._open_spectrum_source_selector,
         )
         
         # Spectrum audio source selector button
-        self._spec_settings_btn = ft.IconButton(
-            icon=ft.Icons.MIC,
-            icon_size=16,
+        self._spec_idle_settings_btn = ft.IconButton(
+            icon=ft.Icons.TUNE,
+            icon_size=12,
             icon_color="#ff9800",
-            tooltip="Spectrum audio source",
+            tooltip="Idle effects settings",
             style=ft.ButtonStyle(
                 bgcolor="transparent",
                 shape=ft.RoundedRectangleBorder(radius=6),
-                padding=ft.padding.all(4),
+                padding=ft.padding.all(1),
+            ),
+            on_click=self._open_spectrum_idle_settings,
+        )
+
+        self._spec_settings_btn = ft.IconButton(
+            icon=ft.Icons.MENU,
+            icon_size=12,
+            icon_color="#ff9800",
+            tooltip="Spectrum settings",
+            style=ft.ButtonStyle(
+                bgcolor="transparent",
+                shape=ft.RoundedRectangleBorder(radius=6),
+                padding=ft.padding.all(1),
             ),
             on_click=self._open_spectrum_source_selector,
         )
+
+        self._spec_sampling_btn = ft.IconButton(
+            icon=ft.Icons.MIC,
+            icon_size=12,
+            tooltip="Sampling ON",
+            style=ft.ButtonStyle(
+                bgcolor="transparent",
+                shape=ft.RoundedRectangleBorder(radius=5),
+                padding=ft.padding.all(1),
+            ),
+            on_click=self._toggle_spec_sampling,
+        )
+        self._spec_idle_quick_btn = ft.IconButton(
+            icon=ft.Icons.AUTO_AWESOME,
+            icon_size=12,
+            tooltip="Idle effects ON",
+            style=ft.ButtonStyle(
+                bgcolor="transparent",
+                shape=ft.RoundedRectangleBorder(radius=5),
+                padding=ft.padding.all(1),
+            ),
+            on_click=self._toggle_spec_idle_quick,
+        )
+        self._sync_spec_quick_buttons()
 
         self._title_combined_row = ft.Row([
             self._title_meta_row,
@@ -2811,7 +3048,11 @@ class WLEDApp:
 
         self.header = ft.Row([
             self._title_left_wrap,
-            ft.Row([self._spectrum_box, self._spec_settings_btn], spacing=4, vertical_alignment=ft.CrossAxisAlignment.CENTER),
+            ft.Row([
+                ft.Column([self._spec_sampling_btn, self._spec_settings_btn], spacing=0, tight=True),
+                self._spectrum_box,
+                ft.Column([self._spec_idle_quick_btn, self._spec_idle_settings_btn], spacing=0, tight=True),
+            ], spacing=2, vertical_alignment=ft.CrossAxisAlignment.END),
             self._header_right_row,
         ], alignment="start", vertical_alignment=ft.CrossAxisAlignment.END)
 
@@ -2936,6 +3177,7 @@ class WLEDApp:
         self._main_col = ft.Column(
             [self.log_row, self.update_progress_row, self.top_update_row, self.header, self.master_bar,
              ft.Divider(height=10, color="transparent"), self._device_scroll],
+            spacing=2,
             scroll=None,
             expand=True,
         )
@@ -3565,6 +3807,14 @@ class WLEDApp:
             else:
                 self.log("[Add] 'SPOTIFY.COM' card already exists", color="orange400")
 
+        def _quick_add_spotify_app(_):
+            _key = "__default_spotify_app__"
+            _ensure_quick_custom_card(_key, "SPOTIFY APP", "Spotify.exe", _is_exe=True)
+            dlg.open = False
+            self.page.update()
+            self.log("[Add] Spotify app quick action selected", color="cyan")
+            self._show_spotify_exe_setup_dialog(_key)
+
         def _probe(_):
             val = field.value.strip()
             # Don't lowercase exe paths — Windows paths are case-sensitive for display
@@ -3727,6 +3977,14 @@ class WLEDApp:
                         on_click=_quick_add_spotify,
                         style=ft.ButtonStyle(side=ft.BorderSide(1, "cyan")),
                     ),
+                    ft.ElevatedButton(
+                        "Spotify App",
+                        icon=ft.Icons.ALBUM,
+                        bgcolor="#1e1e2e",
+                        color="cyan",
+                        on_click=_quick_add_spotify_app,
+                        style=ft.ButtonStyle(side=ft.BorderSide(1, "cyan")),
+                    ),
                 ], spacing=8),
                 status_text,
             ], tight=True, spacing=10, width=480),
@@ -3749,6 +4007,11 @@ class WLEDApp:
         target = self._normalize_path(exe_path)
         if not target:
             return None
+        _is_spotify_exe = False
+        try:
+            _is_spotify_exe = os.path.basename(target).lower() == "spotify.exe"
+        except Exception:
+            _is_spotify_exe = False
         for proc in psutil.process_iter(["pid", "exe", "cmdline"]):
             try:
                 pexe = proc.info.get("exe")
@@ -3757,6 +4020,14 @@ class WLEDApp:
                 cmd = proc.info.get("cmdline") or []
                 if cmd and self._normalize_path(cmd[0]) == target:
                     return proc.info.get("pid")
+                if _is_spotify_exe:
+                    _name = ""
+                    try:
+                        _name = (proc.name() or "").lower()
+                    except Exception:
+                        _name = ""
+                    if _name == "spotify.exe":
+                        return proc.info.get("pid")
             except:
                 continue
         return None
@@ -3784,13 +4055,12 @@ class WLEDApp:
 
     def _find_running_url_pid(self, key, url):
         # URL cards use normal browser mode (no managed profile / PID tracking).
-        # For Spotify, treat card as running while either playback is active
-        # or the Spotify web UI window is still open.
+        # For Spotify web cards, treat as running only while web UI is open.
+        # Desktop-app playback should not mark spotify.com card as active.
         try:
             if self._is_spotify_url_target(url):
                 _web_open = self._is_spotify_web_window_open_now()
-                _playing = bool(self._spotify_play_state.get(key, False))
-                return 1 if (_web_open or _playing) else None
+                return 1 if _web_open else None
         except Exception:
             return None
         return None
@@ -3814,7 +4084,7 @@ class WLEDApp:
     def _default_custom_info_value(self, key):
         c = self.cards.get(key, {})
         target = c.get("_url") or self.custom_devices.get(key, {}).get("url", "")
-        if self._is_winamp_target(target) or self._is_spotify_url_target(target):
+        if self._is_winamp_target(target) or self._is_spotify_url_target(target) or self._is_spotify_exe_target(target):
             return "Now Playing: --"
         return target or ""
 
@@ -3900,6 +4170,250 @@ class WLEDApp:
             self.log(f"[Winamp] {action_label} — '{name}'", color="cyan")
         except Exception as ex:
             self.log(f"[Winamp] {action_label} failed for '{name}': {ex}", color="red400")
+
+    def _focus_winamp_window(self):
+        """Best-effort focus of the main Winamp window."""
+        try:
+            hwnd = win32gui.FindWindow("Winamp v1.x", None)
+            if not hwnd:
+                return False
+            if win32gui.IsIconic(hwnd):
+                win32gui.ShowWindow(hwnd, win32con.SW_RESTORE)
+            else:
+                win32gui.ShowWindow(hwnd, win32con.SW_SHOW)
+            win32gui.SetWindowPos(
+                hwnd, win32con.HWND_TOPMOST, 0, 0, 0, 0,
+                win32con.SWP_NOMOVE | win32con.SWP_NOSIZE
+            )
+            win32gui.SetWindowPos(
+                hwnd, win32con.HWND_NOTOPMOST, 0, 0, 0, 0,
+                win32con.SWP_NOMOVE | win32con.SWP_NOSIZE
+            )
+            win32gui.BringWindowToTop(hwnd)
+            win32gui.SetForegroundWindow(hwnd)
+            return True
+        except Exception:
+            return False
+
+    def _show_winamp_ui(self, key):
+        """Bring Winamp to the foreground for manual interaction."""
+        c = self.cards.get(key, {})
+        target = c.get("_url") or self.custom_devices.get(key, {}).get("url")
+        if not self._is_winamp_target(target):
+            return
+        _name = c.get("name_label").value if c.get("name_label") else key
+
+        if self._focus_winamp_window():
+            self.log(f"[Winamp] UI shown for '{_name}'", color="cyan")
+            return
+
+        self._launch_custom_target(key, auto=False)
+        _end = time.monotonic() + 4.0
+        _seen_window = False
+        while self.running and (time.monotonic() < _end):
+            try:
+                _seen_window = bool(win32gui.FindWindow("Winamp v1.x", None))
+            except Exception:
+                _seen_window = False
+            if _seen_window:
+                break
+            time.sleep(0.2)
+
+        if _seen_window and self._focus_winamp_window():
+            self.log(f"[Winamp] UI shown for '{_name}'", color="cyan")
+            return
+
+        self.log(f"[Winamp] Could not focus UI for '{_name}'", color="orange400")
+
+    def _is_spotify_exe_target(self, path):
+        """Return True if path points to the Spotify desktop app executable."""
+        try:
+            return os.path.basename((path or "").strip()).lower() == "spotify.exe"
+        except Exception:
+            return False
+
+    def _get_spotify_desktop_hwnd(self):
+        """Find the main Spotify desktop window handle via process scan."""
+        try:
+            _spotify_pids = set()
+            for _proc in psutil.process_iter(["pid", "name"]):
+                if (_proc.info.get("name") or "").lower() == "spotify.exe":
+                    _spotify_pids.add(_proc.info["pid"])
+            if not _spotify_pids:
+                return None
+            _found = []
+            def _enum(hwnd, _):
+                try:
+                    if not win32gui.IsWindowVisible(hwnd):
+                        return True
+                    _title = (win32gui.GetWindowText(hwnd) or "").strip()
+                    if not _title:
+                        return True
+                    _pid_out = ctypes.c_ulong(0)
+                    ctypes.windll.user32.GetWindowThreadProcessId(hwnd, ctypes.byref(_pid_out))
+                    if _pid_out.value in _spotify_pids:
+                        _found.append(hwnd)
+                except Exception:
+                    pass
+                return True
+            win32gui.EnumWindows(_enum, None)
+            if not _found:
+                return None
+            # Prefer the largest window (main player window)
+            def _area(h):
+                try:
+                    r = win32gui.GetWindowRect(h)
+                    return (r[2] - r[0]) * (r[3] - r[1])
+                except Exception:
+                    return 0
+            return max(_found, key=_area)
+        except Exception:
+            return None
+
+    def _focus_spotify_desktop_window(self):
+        """Best-effort focus of the Spotify desktop app window."""
+        try:
+            hwnd = self._get_spotify_desktop_hwnd()
+            if not hwnd:
+                return False
+            if win32gui.IsIconic(hwnd):
+                win32gui.ShowWindow(hwnd, win32con.SW_RESTORE)
+            else:
+                win32gui.ShowWindow(hwnd, win32con.SW_SHOW)
+            win32gui.SetWindowPos(
+                hwnd, win32con.HWND_TOPMOST, 0, 0, 0, 0,
+                win32con.SWP_NOMOVE | win32con.SWP_NOSIZE
+            )
+            win32gui.SetWindowPos(
+                hwnd, win32con.HWND_NOTOPMOST, 0, 0, 0, 0,
+                win32con.SWP_NOMOVE | win32con.SWP_NOSIZE
+            )
+            win32gui.BringWindowToTop(hwnd)
+            win32gui.SetForegroundWindow(hwnd)
+            return True
+        except Exception:
+            return False
+
+    def _show_spotify_desktop_ui(self, key):
+        """Bring Spotify desktop app to the foreground."""
+        c = self.cards.get(key, {})
+        target = c.get("_url") or self.custom_devices.get(key, {}).get("url")
+        if not self._is_spotify_exe_target(target):
+            return
+        _name = c.get("name_label").value if c.get("name_label") else key
+
+        if self._focus_spotify_desktop_window():
+            self.log(f"[Spotify] Desktop UI shown for '{_name}'", color="cyan")
+            return
+
+        # Not running yet — launch then focus once the window appears
+        self._launch_custom_target(key, auto=False)
+        _end = time.monotonic() + 4.0
+        _seen = False
+        while self.running and (time.monotonic() < _end):
+            try:
+                _seen = self._get_spotify_desktop_hwnd() is not None
+            except Exception:
+                _seen = False
+            if _seen:
+                break
+            time.sleep(0.2)
+
+        if _seen and self._focus_spotify_desktop_window():
+            self.log(f"[Spotify] Desktop UI shown for '{_name}'", color="cyan")
+        else:
+            self.log(f"[Spotify] Could not focus desktop UI for '{_name}'", color="orange400")
+
+    def _send_spotify_desktop_command(self, key, action, log_action=True):
+        """Send a global media key command for the Spotify desktop app."""
+        c = self.cards.get(key, {})
+        target = c.get("_url") or self.custom_devices.get(key, {}).get("url")
+        if not self._is_spotify_exe_target(target):
+            return
+        name = c.get("name_label").value if c.get("name_label") else key
+        _vk_map = {
+            "PREV":       0xB1,  # VK_MEDIA_PREV_TRACK
+            "PLAY_PAUSE": 0xB3,  # VK_MEDIA_PLAY_PAUSE
+            "NEXT":       0xB0,  # VK_MEDIA_NEXT_TRACK
+        }
+        _vk = _vk_map.get(action.upper())
+        if _vk is None:
+            return
+        try:
+            ctypes.windll.user32.keybd_event(_vk, 0, 0, 0)
+            ctypes.windll.user32.keybd_event(_vk, 0, 0x0002, 0)
+            if log_action:
+                self.log(f"[Spotify] {action.replace('_', '/')} — '{name}'", color="cyan")
+        except Exception as ex:
+            self.log(f"[Spotify] {action} failed for '{name}': {ex}", color="red400")
+
+    def _queue_spotify_desktop_play(self, key):
+        """After launching Spotify desktop, attempt a single autoplay trigger."""
+        def _worker():
+            _name = self.cards.get(key, {}).get("name_label")
+            _name_val = _name.value if _name else key
+
+            # Wait for desktop window to appear first.
+            _end = time.monotonic() + 8.0
+            _seen = False
+            while self.running and (time.monotonic() < _end):
+                try:
+                    _seen = self._get_spotify_desktop_hwnd() is not None
+                except Exception:
+                    _seen = False
+                if _seen:
+                    break
+                time.sleep(0.25)
+
+            if not _seen:
+                self.log(f"[Spotify] Autoplay skipped (window not ready) — '{_name_val}'", color="orange400")
+                return
+
+            if not self.running:
+                return
+            if bool(self._spotify_media_last_state):
+                self.log(f"[Spotify] Autoplay confirmed — '{_name_val}'", color="grey500")
+                return
+
+            # Gentle focus assist once, then one play/pause trigger.
+            try:
+                self._focus_spotify_desktop_window()
+            except Exception:
+                pass
+            time.sleep(0.12)
+
+            self._send_spotify_desktop_command(key, "PLAY_PAUSE", log_action=False)
+
+            _probe_end = time.monotonic() + 2.0
+            while self.running and (time.monotonic() < _probe_end):
+                if bool(self._spotify_media_last_state):
+                    self.log(f"[Spotify] Autoplay started — '{_name_val}'", color="grey500")
+                    return
+                time.sleep(0.2)
+
+            self.log(f"[Spotify] Autoplay pending manual play — '{_name_val}'", color="orange400")
+        threading.Thread(target=_worker, daemon=True).start()
+
+    def _get_spotify_desktop_now_playing_text(self):
+        """Best-effort now-playing text from Spotify desktop window title."""
+        try:
+            hwnd = self._get_spotify_desktop_hwnd()
+            if not hwnd:
+                return None
+            _title = (win32gui.GetWindowText(hwnd) or "").strip()
+            if not _title:
+                return None
+            _low = _title.lower()
+            if _low in ("spotify", "spotify free", "spotify premium"):
+                return None
+            if _low.endswith(" - spotify"):
+                _title = _title[:-10].strip()
+            _low2 = _title.lower()
+            if _low2 in ("spotify", "spotify free", "spotify premium"):
+                return None
+            return _title or None
+        except Exception:
+            return None
 
     def _is_spotify_url_target(self, url):
         try:
@@ -4030,6 +4544,11 @@ class WLEDApp:
         _targets = []
         _titles = []
         _has_spotify_card = self._has_spotify_card()
+        _browser_proc_names = {
+            "chrome.exe", "msedge.exe", "firefox.exe", "brave.exe",
+            "opera.exe", "opera_gx.exe", "vivaldi.exe", "arc.exe",
+            "iexplore.exe",
+        }
 
         def _enum(hwnd, _):
             try:
@@ -4039,6 +4558,14 @@ class WLEDApp:
                 if not _title:
                     return True
                 _cls = (win32gui.GetClassName(hwnd) or "").strip().lower()
+                _proc_name = ""
+                try:
+                    _pid_out = ctypes.c_ulong(0)
+                    ctypes.windll.user32.GetWindowThreadProcessId(hwnd, ctypes.byref(_pid_out))
+                    if int(_pid_out.value) > 0:
+                        _proc_name = (psutil.Process(int(_pid_out.value)).name() or "").lower()
+                except Exception:
+                    _proc_name = ""
                 _bullet_music_hint = (" • " in _title)
                 _spotify_hit = ("spotify" in _title) or ("open.spotify.com" in _title) or (_has_spotify_card and _bullet_music_hint)
                 _browser_hint = any(b in _title for b in ["chrome", "edge", "firefox", "brave", "opera", "vivaldi", "arc", "browser", "web player"])
@@ -4051,7 +4578,8 @@ class WLEDApp:
                     "applicationframewindow",
                     "windows.ui.core.corewindow",
                 )
-                if _spotify_hit and (_browser_hint or _class_hint or (" - spotify" in _title) or ("| spotify" in _title)):
+                _is_browser_proc = bool(_proc_name and (_proc_name in _browser_proc_names))
+                if _spotify_hit and _is_browser_proc and (_browser_hint or _class_hint or (" - spotify" in _title) or ("| spotify" in _title)):
                     _targets.append(hwnd)
                     _titles.append(_title)
                     self._spotify_window_seen_until = max(float(getattr(self, "_spotify_window_seen_until", 0.0)), time.monotonic() + 45.0)
@@ -4159,7 +4687,7 @@ class WLEDApp:
             if not _c.get("_is_custom"):
                 continue
             _url = _c.get("_url") or self.custom_devices.get(_key, {}).get("url", "")
-            if self._is_spotify_url_target(_url):
+            if self._is_spotify_url_target(_url) or self._is_spotify_exe_target(_url):
                 self._set_custom_card_media_text(_key, _track)
 
         if _track:
@@ -4168,9 +4696,8 @@ class WLEDApp:
     def _has_spotify_card(self):
         try:
             for _key, _info in list(self.custom_devices.items()):
-                if bool(_info.get("is_exe", False)):
-                    continue
-                if self._is_spotify_url_target(_info.get("url", "")):
+                _url = _info.get("url", "")
+                if self._is_spotify_url_target(_url) or self._is_spotify_exe_target(_url):
                     return True
         except Exception:
             pass
@@ -4182,7 +4709,7 @@ class WLEDApp:
                 if not _c.get("_is_custom"):
                     continue
                 _url = _c.get("_url") or self.custom_devices.get(_key, {}).get("url", "")
-                if self._is_spotify_url_target(_url) and bool(_c.get("_is_active")):
+                if (self._is_spotify_url_target(_url) or self._is_spotify_exe_target(_url)) and bool(_c.get("_is_active")):
                     return True
         except Exception:
             pass
@@ -4389,7 +4916,7 @@ class WLEDApp:
         self._spotify_media_listener_active = False
 
     def _sync_spotify_card_glow(self, key):
-        """Apply Spotify glow while playback is active or web UI is open."""
+        """Apply Spotify glow while Spotify web UI is open."""
         c = self.cards.get(key)
         if not c:
             return
@@ -4399,8 +4926,7 @@ class WLEDApp:
             return
 
         _web_open = self._is_spotify_web_window_open_now()
-        _playing = bool(self._spotify_play_state.get(key, False))
-        _engaged = bool(_playing or _web_open)
+        _engaged = bool(_web_open)
         c["_glow_state"] = "on" if _engaged else "off"
         if not _engaged:
             c["glow"].border = ft.border.all(2, "#2b2b3b")
@@ -4692,17 +5218,37 @@ class WLEDApp:
         _targets = []
         _titles = []
         _has_spotify_card = self._has_spotify_card()
+        _browser_proc_names = {
+            "chrome.exe", "msedge.exe", "firefox.exe", "brave.exe",
+            "opera.exe", "opera_gx.exe", "vivaldi.exe", "arc.exe",
+            "iexplore.exe",
+        }
 
         def _enum(hwnd, _):
             try:
                 _title = (win32gui.GetWindowText(hwnd) or "").strip().lower()
                 if not _title:
                     return True
+                _pid = None
+                _proc_name = ""
+                try:
+                    _pid_out = ctypes.c_ulong(0)
+                    ctypes.windll.user32.GetWindowThreadProcessId(hwnd, ctypes.byref(_pid_out))
+                    _pid = int(_pid_out.value)
+                    if _pid > 0:
+                        _proc_name = (psutil.Process(_pid).name() or "").lower()
+                except Exception:
+                    _pid = None
+                    _proc_name = ""
                 # Title-based browser matching misses PWA/standalone windows.
                 # Prefer class-based detection with title fallback.
                 _browser_hit = self._is_known_browser_hwnd(hwnd) or any(
                     b in _title for b in ["chrome", "edge", "firefox", "brave", "opera", "vivaldi", "arc", "browser"]
                 )
+                # Prevent Spotify desktop windows (also Chromium class) from being
+                # treated as browser tabs for spotify.com card state.
+                if _browser_hit and _proc_name and (_proc_name not in _browser_proc_names):
+                    _browser_hit = False
                 _spotify_hit = ("spotify" in _title) or ("open.spotify.com" in _title) or (_has_spotify_card and (" • " in _title))
                 if _browser_hit and _spotify_hit:
                     _targets.append(hwnd)
@@ -4872,10 +5418,10 @@ class WLEDApp:
         c = self.cards.get(key)
         if not c:
             return
-        # Keep Spotify button/glow state synced with web-open OR playback-active.
+        # Keep spotify.com card state synced to actual web UI visibility.
         _target_url = c.get("_url") or self.custom_devices.get(key, {}).get("url")
         if self._is_spotify_url_target(_target_url):
-            active = bool(self._spotify_play_state.get(key, False)) or self._is_spotify_web_window_open_now()
+            active = self._is_spotify_web_window_open_now()
 
         btn_text = c.get("launch_btn_text")
         btn_icon = c.get("launch_btn_icon")
@@ -4903,7 +5449,7 @@ class WLEDApp:
             if spotify_show_ui_btn is not None:
                 spotify_show_ui_btn.disabled = _disabled
         self._set_custom_card_active(key, active)
-        # Spotify URL cards should glow only while tracked playback is active.
+        # Spotify URL cards glow only while Spotify web UI is open.
         if self._is_spotify_url_target(c.get("_url") or self.custom_devices.get(key, {}).get("url")):
             self._sync_spotify_card_glow(key)
         try:
@@ -4960,6 +5506,18 @@ class WLEDApp:
                         self.log(f"[Winamp] Path still unknown for '{name}' — opening setup options", color="orange400")
                         self._show_winamp_setup_dialog(key)
                         return
+            if self._is_spotify_exe_target(target):
+                if (not target) or (not os.path.exists(target)):
+                    self.log(f"[Spotify] Path missing for '{name}' — searching likely install paths...", color="orange400")
+                    _found = self._find_spotify_exe_locally()
+                    if _found and os.path.exists(_found):
+                        self._set_spotify_exe_path_from_picker(key, _found)
+                        target = _found
+                        self.log(f"[Spotify] Auto-detected path for '{name}'", color="green400")
+                    else:
+                        self.log(f"[Spotify] Path still unknown for '{name}' — opening setup options", color="orange400")
+                        self._show_spotify_exe_setup_dialog(key)
+                        return
             running_pid = self._find_running_exe_pid(target)
             if running_pid:
                 self.custom_launch_state[key] = {
@@ -4974,7 +5532,10 @@ class WLEDApp:
                     "kind": "exe", "pid": proc.pid, "managed": True, "path": target
                 }
                 self._update_custom_card_launch_ui(key, True)
-                self._queue_winamp_play(target)
+                if self._is_winamp_target(target):
+                    self._queue_winamp_play(target)
+                elif self._is_spotify_exe_target(target):
+                    self._queue_spotify_desktop_play(key)
                 prefix = "[Auto Start]" if auto else "[App]"
                 self.log(f"{prefix} Launched '{name}' (PID {proc.pid})", color="green400")
             except Exception as ex:
@@ -5019,11 +5580,20 @@ class WLEDApp:
 
         if is_exe:
             target_norm = self._normalize_path(target)
+            _spotify_exe_target = self._is_spotify_exe_target(target)
             for proc in psutil.process_iter(["pid", "exe", "cmdline"]):
                 try:
                     pexe = proc.info.get("exe")
                     cmd = proc.info.get("cmdline") or []
                     matches = (pexe and self._normalize_path(pexe) == target_norm) or (cmd and self._normalize_path(cmd[0]) == target_norm)
+                    if (not matches) and _spotify_exe_target:
+                        _pname = ""
+                        try:
+                            _pname = (proc.name() or "").lower()
+                        except Exception:
+                            _pname = ""
+                        if _pname == "spotify.exe":
+                            matches = True
                     if not matches:
                         continue
                     proc.terminate()
@@ -5141,6 +5711,11 @@ class WLEDApp:
 
                 if self._is_winamp_target(target):
                     self._set_custom_card_media_text(key, _winamp_track)
+                elif self._is_spotify_exe_target(target):
+                    _track = (self._spotify_media_last_track or "").strip()
+                    if not _track:
+                        _track = (self._get_spotify_desktop_now_playing_text() or "").strip()
+                    self._set_custom_card_media_text(key, _track)
                 elif self._is_spotify_url_target(target):
                     _fresh_spot_track = (self._get_spotify_window_track_text() or "").strip()
                     if _fresh_spot_track:
@@ -5230,11 +5805,23 @@ class WLEDApp:
         display_name = self.custom_names.get(key, name)
         is_winamp = bool(is_exe and self._is_winamp_target(url))
         is_spotify_web = bool((not is_exe) and self._is_spotify_url_target(url))
+        is_spotify_exe = bool(is_exe and self._is_spotify_exe_target(url))
         name_label = ft.Text(display_name, weight="bold", size=16)
         status = ft.Text("CHECKING..." if is_local else "", size=12, color="grey500", weight="bold")
         status.visible = True
-        info_text_val = "Now Playing: --" if (is_winamp or is_spotify_web) else url
-        info_text = ft.Text(info_text_val, size=10, color="grey500")
+        info_text_val = "Now Playing: --" if (is_winamp or is_spotify_web or is_spotify_exe) else url
+        info_text = ft.Text(
+            info_text_val,
+            size=10,
+            color="grey500",
+            max_lines=2,
+            overflow=ft.TextOverflow.ELLIPSIS,
+        )
+        info_slot = ft.Container(
+            content=info_text,
+            height=26,
+            alignment=ft.alignment.top_left,
+        )
 
         edit_btn = ft.IconButton(ft.Icons.EDIT, icon_size=13, icon_color="grey500",
             tooltip="Rename", on_click=lambda _, k=key: self.show_rename_dialog(k))
@@ -5291,37 +5878,52 @@ class WLEDApp:
             on_change=lambda e, k=key: self._set_custom_card_option(k, "auto_close_exit", e.control.value),
         )
 
+        compact_icon_btn_style = ft.ButtonStyle(
+            padding=ft.padding.symmetric(horizontal=1, vertical=0),
+        )
+        compact_combo_btn_style = ft.ButtonStyle(
+            padding=ft.padding.symmetric(horizontal=2, vertical=0),
+        )
+
         winamp_controls = ft.Container(
             visible=is_winamp,
             content=ft.Row([
                 ft.IconButton(ft.Icons.SKIP_PREVIOUS, icon_size=16, icon_color="cyan",
                               tooltip="Previous track",
-                              on_click=lambda _, k=key: self._send_winamp_command(k, 40044, "PREV")),
+                              on_click=lambda _, k=key: self._send_winamp_command(k, 40044, "PREV"),
+                              style=compact_icon_btn_style),
                 ft.IconButton(ft.Icons.PLAY_ARROW, icon_size=16, icon_color="cyan",
                               tooltip="Play",
-                              on_click=lambda _, k=key: self._send_winamp_command(k, 40045, "PLAY")),
+                              on_click=lambda _, k=key: self._send_winamp_command(k, 40045, "PLAY"),
+                              style=compact_icon_btn_style),
                 ft.IconButton(ft.Icons.PAUSE, icon_size=16, icon_color="cyan",
                               tooltip="Pause",
-                              on_click=lambda _, k=key: self._send_winamp_command(k, 40046, "PAUSE")),
+                              on_click=lambda _, k=key: self._send_winamp_command(k, 40046, "PAUSE"),
+                              style=compact_icon_btn_style),
                 ft.IconButton(ft.Icons.STOP, icon_size=16, icon_color="cyan",
                               tooltip="Stop",
-                              on_click=lambda _, k=key: self._send_winamp_command(k, 40047, "STOP")),
+                              on_click=lambda _, k=key: self._send_winamp_command(k, 40047, "STOP"),
+                              style=compact_icon_btn_style),
                 ft.IconButton(ft.Icons.SKIP_NEXT, icon_size=16, icon_color="cyan",
                               tooltip="Next track",
-                              on_click=lambda _, k=key: self._send_winamp_command(k, 40048, "NEXT")),
-            ], spacing=2, vertical_alignment=ft.CrossAxisAlignment.CENTER),
+                              on_click=lambda _, k=key: self._send_winamp_command(k, 40048, "NEXT"),
+                              style=compact_icon_btn_style),
+                ft.IconButton(ft.Icons.OPEN_IN_NEW, icon_size=16, icon_color="cyan",
+                              tooltip="Show Winamp UI",
+                              on_click=lambda _, k=key: self._show_winamp_ui(k),
+                              style=compact_icon_btn_style),
+            ], spacing=0, vertical_alignment=ft.CrossAxisAlignment.CENTER),
         )
 
         spotify_prev_btn = ft.IconButton(ft.Icons.SKIP_PREVIOUS, icon_size=16, icon_color="cyan",
             tooltip="Previous track",
             on_click=lambda _, k=key: self._send_spotify_command(k, "PREV"),
+            style=compact_icon_btn_style,
             disabled=True)
         spotify_playpause_btn = ft.TextButton(
             tooltip="Play/Pause",
             on_click=lambda _, k=key: self._send_spotify_command(k, "PLAY_PAUSE"),
-            style=ft.ButtonStyle(
-                padding=ft.padding.symmetric(horizontal=4, vertical=0),
-            ),
+            style=compact_combo_btn_style,
             content=ft.Row([
                 ft.Icon(ft.Icons.PLAY_ARROW, size=14, color="cyan"),
                 ft.Text("/", size=11, color="cyan"),
@@ -5332,10 +5934,12 @@ class WLEDApp:
         spotify_next_btn = ft.IconButton(ft.Icons.SKIP_NEXT, icon_size=16, icon_color="cyan",
             tooltip="Next track",
             on_click=lambda _, k=key: self._send_spotify_command(k, "NEXT"),
+            style=compact_icon_btn_style,
             disabled=True)
         spotify_show_ui_btn = ft.IconButton(ft.Icons.OPEN_IN_NEW, icon_size=16, icon_color="cyan",
             tooltip="Show Spotify web UI",
             on_click=lambda _, k=key: self._show_spotify_web_ui(k, maximize=True),
+            style=compact_icon_btn_style,
             disabled=True)
         spotify_controls = ft.Container(
             visible=is_spotify_web,
@@ -5344,36 +5948,68 @@ class WLEDApp:
                 spotify_playpause_btn,
                 spotify_next_btn,
                 spotify_show_ui_btn,
-            ], spacing=2, vertical_alignment=ft.CrossAxisAlignment.CENTER),
+            ], spacing=0, vertical_alignment=ft.CrossAxisAlignment.CENTER),
+        )
+
+        spotify_desktop_show_ui_btn = ft.IconButton(
+            ft.Icons.OPEN_IN_NEW, icon_size=16, icon_color="cyan",
+            tooltip="Show Spotify app",
+            on_click=lambda _, k=key: self._show_spotify_desktop_ui(k),
+            style=compact_icon_btn_style)
+        spotify_desktop_playpause_btn = ft.TextButton(
+            tooltip="Play/Pause",
+            on_click=lambda _, k=key: self._send_spotify_desktop_command(k, "PLAY_PAUSE"),
+            style=compact_combo_btn_style,
+            content=ft.Row([
+                ft.Icon(ft.Icons.PLAY_ARROW, size=14, color="cyan"),
+                ft.Text("/", size=11, color="cyan"),
+                ft.Icon(ft.Icons.PAUSE, size=14, color="cyan"),
+            ], spacing=2, tight=True),
+        )
+        spotify_desktop_controls = ft.Container(
+            visible=is_spotify_exe,
+            content=ft.Row([
+                ft.IconButton(ft.Icons.SKIP_PREVIOUS, icon_size=16, icon_color="cyan",
+                              tooltip="Previous track",
+                              on_click=lambda _, k=key: self._send_spotify_desktop_command(k, "PREV"),
+                              style=compact_icon_btn_style),
+                spotify_desktop_playpause_btn,
+                ft.IconButton(ft.Icons.SKIP_NEXT, icon_size=16, icon_color="cyan",
+                              tooltip="Next track",
+                              on_click=lambda _, k=key: self._send_spotify_desktop_command(k, "NEXT"),
+                              style=compact_icon_btn_style),
+                spotify_desktop_show_ui_btn,
+            ], spacing=0, vertical_alignment=ft.CrossAxisAlignment.CENTER),
         )
 
         # Match standard card layout exactly — 3 rows + drag handle
         card = ft.Container(
             data=key, bgcolor="#121420", border_radius=12,
-            padding=ft.padding.only(left=12, right=12, top=10, bottom=10),
+            padding=ft.padding.only(left=10, right=10, top=7, bottom=7),
             content=ft.Column([
-                # ROW 1: favicon tag | name | ✏ | ✕ | spacer
+                # ROW 1: favicon tag | name | ✏ | ✕ | spacer | OPEN/CLOSE
                 ft.Row([
                     type_tag, name_label, edit_btn,
                     ft.IconButton(ft.Icons.CLOSE, icon_size=13, icon_color="red400",
                         tooltip="Remove", on_click=lambda _, k=key: self._remove_custom_card(k)),
                     ft.Container(expand=True),
-                ], vertical_alignment="center", spacing=4),
-                # ROW 2: info + status on left, OPEN button on right
-                ft.Row([
-                    ft.Column([info_text, status], spacing=2, expand=True),
                     action_btn,
-                ], vertical_alignment="center", spacing=6),
-                # ROW 3: transport controls (Winamp EXE or Spotify URL cards)
+                ], vertical_alignment="center", spacing=3),
+                # ROW 2: info + status (full-width line under header)
+                ft.Row([
+                    ft.Column([info_slot, status], spacing=1, expand=True),
+                ], vertical_alignment="center", spacing=2),
+                # ROW 3: transport controls (Winamp EXE, Spotify EXE, or Spotify URL cards)
                 winamp_controls,
+                spotify_desktop_controls,
                 spotify_controls,
                 # ROW 4: card options
                 ft.Row(
                     [auto_launch_cb, auto_close_cb] if (is_exe or is_spotify_web) else [auto_launch_cb],
-                    spacing=8,
+                    spacing=6,
                     vertical_alignment=ft.CrossAxisAlignment.CENTER,
                 ),
-            ], spacing=6),
+            ], spacing=4),
         )
 
         glow = ft.Container(content=card, border_radius=13,
@@ -5425,6 +6061,8 @@ class WLEDApp:
             "launch_btn_text": launch_btn_text,
             "launch_btn_icon": launch_btn_icon,
             "winamp_controls": winamp_controls,
+            "spotify_desktop_controls": spotify_desktop_controls,
+            "spotify_desktop_show_ui_btn": spotify_desktop_show_ui_btn,
             "spotify_controls": spotify_controls,
             "spotify_prev_btn": spotify_prev_btn,
             "spotify_playpause_btn": spotify_playpause_btn,
@@ -7370,23 +8008,13 @@ class WLEDApp:
                     except:
                         pass
 
-            # Spectrum box border follows app border color and briefly pulses on detected beat.
+            # Spectrum box border follows app border color while audio is active.
             try:
                 _now = time.monotonic()
                 _spec_c = border_color if border_color else self._hue_to_hex(_border_hue)
                 _audio_recent = (_now - float(getattr(self, "_spec_last_audio_ts", 0.0))) <= 1.0
-                _rhythm_locked = bool(getattr(self, "_spec_rhythm_locked", False))
-                _phase_pulse = False
-                if _rhythm_locked:
-                    _period = max(0.22, float(getattr(self, "_spec_rhythm_period", 0.5)))
-                    _anchor = float(getattr(self, "_spec_rhythm_phase_anchor", 0.0))
-                    _phase = (_now - _anchor) % _period
-                    _dist = min(_phase, _period - _phase)
-                    _phase_pulse = _dist <= float(getattr(self, "_spec_rhythm_flash_window", 0.11))
-
-                # No flash before rhythm lock, and no flash on silence/idle.
-                _can_pulse = bool(getattr(self, "_spec_rhythm_flash_enabled", False)) and _rhythm_locked and _phase_pulse and _audio_recent and (not bool(getattr(self, "_spec_idle_active", False)))
-                if _can_pulse:
+                _active_audio = _audio_recent and (not bool(getattr(self, "_spec_idle_active", False)))
+                if _active_audio:
                     self._spectrum_box.border = ft.border.all(2, _spec_c)
                 else:
                     self._spectrum_box.border = ft.border.all(1, self._dim_hex(_spec_c, 0.55))
@@ -7434,6 +8062,194 @@ class WLEDApp:
                 except: pass
             time.sleep(0.1)
 
+    def _set_spectrum_render_mode(self, mode):
+        """Switch analyzer surface between pixel-grid mode and regular graphics mode."""
+        _target = "graphics" if str(mode).lower() == "graphics" else "grid"
+        if self._spec_render_mode == _target:
+            return
+
+        if _target == "graphics":
+            self._spectrum_box.padding = ft.padding.all(0)
+            self._spectrum_box.width = self._spec_box_graphics_size[0]
+            self._spectrum_box.height = self._spec_box_graphics_size[1]
+            self._spectrum_box.content = self._spec_graphics_host
+            self._spec_graphics_ready = False
+            self._spec_graphics_view_size = (0, 0)
+        else:
+            self._spectrum_box.padding = ft.padding.symmetric(horizontal=6, vertical=4)
+            self._spectrum_box.width = self._spec_box_grid_size[0]
+            self._spectrum_box.height = self._spec_box_grid_size[1]
+            self._spectrum_box.content = self._spec_grid_content
+
+        self._spec_render_mode = _target
+        try:
+            self._spectrum_box.update()
+        except Exception:
+            pass
+
+    def _sync_spec_quick_buttons(self):
+        try:
+            _on = "#ff9800"
+            _off = "grey500"
+            self._spec_settings_btn.icon_color = _on
+            self._spec_settings_btn.tooltip = "Spectrum settings"
+
+            if getattr(self, "_spec_sampling_enabled", True):
+                self._spec_sampling_btn.icon = ft.Icons.MIC
+                self._spec_sampling_btn.icon_color = _on
+                self._spec_sampling_btn.tooltip = "Sampling ON"
+                self._spec_sampling_btn.style = ft.ButtonStyle(
+                    bgcolor="transparent",
+                    shape=ft.RoundedRectangleBorder(radius=5),
+                    padding=ft.padding.all(1),
+                )
+            else:
+                self._spec_sampling_btn.icon = ft.Icons.MIC
+                self._spec_sampling_btn.icon_color = _off
+                self._spec_sampling_btn.tooltip = "Sampling OFF"
+                self._spec_sampling_btn.style = ft.ButtonStyle(
+                    bgcolor="transparent",
+                    shape=ft.RoundedRectangleBorder(radius=5),
+                    padding=ft.padding.all(1),
+                )
+
+            if getattr(self, "_spec_idle_enabled", True):
+                self._spec_idle_quick_btn.icon = ft.Icons.AUTO_AWESOME
+                self._spec_idle_quick_btn.icon_color = _on
+                self._spec_idle_quick_btn.tooltip = "Idle effects ON"
+                self._spec_idle_quick_btn.style = ft.ButtonStyle(
+                    bgcolor="transparent",
+                    shape=ft.RoundedRectangleBorder(radius=5),
+                    padding=ft.padding.all(1),
+                )
+            else:
+                self._spec_idle_quick_btn.icon = ft.Icons.AUTO_AWESOME
+                self._spec_idle_quick_btn.icon_color = _off
+                self._spec_idle_quick_btn.tooltip = "Idle effects OFF"
+                self._spec_idle_quick_btn.style = ft.ButtonStyle(
+                    bgcolor="transparent",
+                    shape=ft.RoundedRectangleBorder(radius=5),
+                    padding=ft.padding.all(1),
+                )
+
+            self._spec_sampling_btn.update()
+            self._spec_idle_quick_btn.update()
+            self._spec_settings_btn.update()
+        except Exception:
+            pass
+
+    def _clear_spectrum_display(self):
+        """Leave the analyzer visible but static (no active bars/animation)."""
+        try:
+            self._set_spectrum_render_mode("grid")
+            for _segs in self._spec_segments:
+                for _seg in _segs:
+                    _seg.bgcolor = "#101010"
+            self._spectrum_box.update()
+        except Exception:
+            pass
+
+    def _get_spec_render_interval(self):
+        try:
+            _fps = int(round(float(getattr(self, "_spec_target_fps", 25) or 25)))
+        except Exception:
+            _fps = 25
+        _fps = max(8, min(30, _fps))
+        return 1.0 / float(_fps)
+
+    def _reset_spec_analysis_state(self):
+        _count = max(6, min(int(self._spec_bands), int(getattr(self, "_spec_analysis_bands", self._spec_bands) or self._spec_bands)))
+        self._spec_bars = [0.0] * _count
+        self._spec_peaks = [0.0] * _count
+        self._spec_peak_hold = [0] * _count
+        self._spec_band_avg = [0.0] * _count
+
+    def _set_spec_analysis_bands(self, bands, restart_audio=True, reset_now=False):
+        try:
+            _new = int(round(float(bands)))
+        except Exception:
+            _new = int(self._spec_bands)
+        _new = max(6, min(int(self._spec_bands), _new))
+        _old = int(getattr(self, "_spec_analysis_bands", self._spec_bands) or self._spec_bands)
+        self._spec_analysis_bands = _new
+        if reset_now:
+            self._reset_spec_analysis_state()
+        if restart_audio and (_new != _old):
+            self._spec_source_changed = True
+            if self._spec_disabled:
+                self._spec_disabled = False
+                threading.Thread(target=self._audio_analyzer_loop, daemon=True).start()
+        return _new != _old
+
+    def _toggle_spec_sampling(self, _=None):
+        self._spec_sampling_enabled = not bool(getattr(self, "_spec_sampling_enabled", True))
+        self._spec_source_changed = True
+        if self._spec_disabled:
+            self._spec_disabled = False
+            threading.Thread(target=self._audio_analyzer_loop, daemon=True).start()
+        self._sync_spec_quick_buttons()
+        self.log(f"[Spectrum] Sampling {'ON' if self._spec_sampling_enabled else 'OFF'}", color="grey500")
+
+    def _toggle_spec_idle_quick(self, _=None):
+        self._spec_idle_enabled = not bool(getattr(self, "_spec_idle_enabled", True))
+        self._spec_idle_active = False
+        self._sync_spec_quick_buttons()
+        if (not self._spec_sampling_enabled) and (not self._spec_idle_enabled):
+            self._clear_spectrum_display()
+            self._spec_display_cleared = True
+        self.log(f"[Spectrum] Idle effects {'ON' if self._spec_idle_enabled else 'OFF'}", color="grey500")
+
+    def _ensure_spectrum_graphics_controls(self, width, height):
+        """Create/update reusable controls for non-grid spectrum graphics effects."""
+        _w = max(120, int(width))
+        _h = max(80, int(height))
+        _size = (_w, _h)
+        if self._spec_graphics_ready and self._spec_graphics_view_size == _size:
+            return
+
+        self._spec_graphics_layer.controls.clear()
+        self._spec_graphics_stars = []
+        self._spec_graphics_lines = []
+
+        _rng = random.Random(0x51A7)
+        _star_count = max(24, min(96, int((_w * _h) / 2200)))
+        for _ in range(_star_count):
+            _dot = ft.Container(
+                left=_rng.randint(0, max(0, _w - 3)),
+                top=_rng.randint(0, max(0, _h - 3)),
+                width=2,
+                height=2,
+                border_radius=1,
+                bgcolor="#6a6a6a",
+                opacity=0.45,
+            )
+            self._spec_graphics_stars.append(_dot)
+            self._spec_graphics_layer.controls.append(_dot)
+
+        for _ in range(18):
+            _txt = ft.Text(
+                "",
+                size=12,
+                color="#ffd76a",
+                text_align=ft.TextAlign.CENTER,
+                no_wrap=True,
+                weight=ft.FontWeight.W_600,
+            )
+            _slot = ft.Container(
+                content=_txt,
+                left=0,
+                top=0,
+                width=1,
+                height=1,
+                alignment=ft.alignment.center,
+                visible=False,
+            )
+            self._spec_graphics_lines.append((_slot, _txt))
+            self._spec_graphics_layer.controls.append(_slot)
+
+        self._spec_graphics_ready = True
+        self._spec_graphics_view_size = _size
+
     def _render_spectrum(self):
         if not self._spec_segments:
             return
@@ -7443,12 +8259,21 @@ class WLEDApp:
             if _idle_fx == "random":
                 _now = time.monotonic()
                 if _now >= float(self._spec_idle_random_next_ts):
-                    _choices = ["aurora", "pulse", "text", "rainbow", "pacman", "tetris", "invaders", "snake"]
+                    _choices = list(getattr(self, "_spec_idle_cycle_effects", []))
+                    if not _choices:
+                        _choices = ["aurora", "pulse", "text", "rainbow", "pacman", "tetris", "invaders", "snake", "starwars"]
                     if self._spec_idle_random_current in _choices and len(_choices) > 1:
                         _choices = [x for x in _choices if x != self._spec_idle_random_current]
                     self._spec_idle_random_current = random.choice(_choices)
                     self._spec_idle_random_next_ts = _now + max(0.1, float(self._spec_idle_random_cycle_seconds))
                 _idle_fx = self._spec_idle_random_current
+
+            if _idle_fx == "starwars":
+                self._set_spectrum_render_mode("graphics")
+                self._render_spectrum_idle_starwars()
+                return
+
+            self._set_spectrum_render_mode("grid")
             if _idle_fx == "text":
                 self._render_spectrum_idle_text()
             elif _idle_fx == "pulse":
@@ -7466,6 +8291,8 @@ class WLEDApp:
             else:
                 self._render_spectrum_idle_aurora()
             return
+
+        self._set_spectrum_render_mode("grid")
 
         _mode = str(self._spec_mode or "classic").lower()
         if _mode == "random":
@@ -7500,9 +8327,11 @@ class WLEDApp:
 
     def _render_spectrum_classic(self):
         """Classic mode: vertical bars from bottom-up, left to right."""
+        _analysis_count = max(1, len(self._spec_bars))
         for bi, segs in enumerate(self._spec_segments):
-            fill = int(max(0.0, min(1.0, self._spec_bars[bi])) * self._spec_levels)
-            peak = int(max(0.0, min(1.0, self._spec_peaks[bi])) * (self._spec_levels - 1))
+            _src_i = min(_analysis_count - 1, int((bi * _analysis_count) / max(1, self._spec_bands)))
+            fill = int(max(0.0, min(1.0, self._spec_bars[_src_i])) * self._spec_levels)
+            peak = int(max(0.0, min(1.0, self._spec_peaks[_src_i])) * (self._spec_levels - 1))
 
             for top_idx, seg in enumerate(segs):
                 lvl_from_bottom = self._spec_levels - 1 - top_idx
@@ -7626,6 +8455,16 @@ class WLEDApp:
             "U": ["10001", "10001", "10001", "10001", "10001", "10001", "01110"],
             "Y": ["10001", "10001", "01010", "00100", "00100", "00100", "00100"],
             "Z": ["11111", "00001", "00010", "00100", "01000", "10000", "11111"],
+            "D": ["11100", "10010", "10001", "10001", "10001", "10010", "11100"],
+            "F": ["11111", "10000", "10000", "11110", "10000", "10000", "10000"],
+            "G": ["01110", "10001", "10000", "10111", "10001", "10001", "01110"],
+            "H": ["10001", "10001", "10001", "11111", "10001", "10001", "10001"],
+            "I": ["11111", "00100", "00100", "00100", "00100", "00100", "11111"],
+            "O": ["01110", "10001", "10001", "10001", "10001", "10001", "01110"],
+            "W": ["10001", "10001", "10001", "10101", "10101", "11011", "10001"],
+            "X": ["10001", "10001", "01010", "00100", "01010", "10001", "10001"],
+            "+": ["00000", "00100", "00100", "11111", "00100", "00100", "00000"],
+            ".": ["00000", "00000", "00000", "00000", "00000", "00110", "00110"],
         }
         _rows = [""] * 7
         for _ch in str(text).upper():
@@ -8095,6 +8934,162 @@ class WLEDApp:
         except Exception:
             pass
 
+    def _build_starwars_tape(self, bands, levels):
+        """Build vertical bitmap tape for Star Wars crawl.
+        Returns (tape, tape_title), each a list[vrows] of list[bands] booleans.
+        """
+        _line_h = 9
+        _font_h = 7
+        _crawl = [
+            ("", False),
+            ("", False),
+            ("STAR", True),
+            ("WARS", True),
+            ("", False),
+            ("A LONG", False),
+            ("TIME AGO", False),
+            ("IN A", False),
+            ("GALAXY", False),
+            ("FAR FAR", False),
+            ("AWAY...", False),
+            ("", False),
+            ("WLED", False),
+            ("COMMAND", False),
+            ("CENTER+", False),
+            ("", False),
+            ("A NEW", False),
+            ("HOPE FOR", False),
+            ("YOUR", False),
+            ("SMART", False),
+            ("LIGHTS", False),
+            ("", False),
+            ("", False),
+            ("", False),
+            ("", False),
+            ("", False),
+        ]
+
+        _prefix = levels
+        _total_vrows = _prefix + len(_crawl) * _line_h
+        _tape = [[False] * bands for _ in range(_total_vrows)]
+        _tape_title = [[False] * bands for _ in range(_total_vrows)]
+        _vr_base = _prefix
+
+        for _text, _is_title in _crawl:
+            _text = _text.strip()
+            if _text:
+                _cols = self._build_spec_text_columns(_text)
+                _tw = len(_cols)
+                _x0 = max(0, (bands - _tw) // 2)
+                for _cx, _cbits in enumerate(_cols):
+                    _vx = _x0 + _cx
+                    if _vx >= bands:
+                        break
+                    for _fy in range(min(_font_h, len(_cbits))):
+                        if _cbits[_fy]:
+                            _vr = _vr_base + _fy
+                            if 0 <= _vr < _total_vrows:
+                                _tape[_vr][_vx] = True
+                                if _is_title:
+                                    _tape_title[_vr][_vx] = True
+            _vr_base += _line_h
+
+        return _tape, _tape_title
+
+    def _render_spectrum_idle_starwars(self):
+        """Star Wars crawl using regular graphics controls (not the SA grid)."""
+        _w = int(self._spectrum_box.width or self._spec_box_graphics_size[0])
+        _h = int(self._spectrum_box.height or self._spec_box_graphics_size[1])
+        _w = max(120, _w)
+        _h = max(80, _h)
+
+        self._ensure_spectrum_graphics_controls(_w, _h)
+
+        _spd = max(0.25, min(3.0, float(self._spec_idle_speed)))
+        _lines = [
+            ("STAR WARS", True),
+            ("IN A LAND FAR AWAY...", False),
+            ("WLED COMMAND CENTER+", False),
+            ("A NEW HOPE", False),
+            ("FOR SMART LIGHT CONTROL", False),
+            ("MAY YOUR LIGHTS", False),
+            ("BE WITH YOU", False),
+        ]
+
+        _line_gap = 16
+        _start_y = _h - 28
+        _line_count = max(1, len(_lines))
+        # Restart immediately after the last line exits the top cutoff (-80).
+        _cycle_px = _start_y + ((_line_count - 1) * _line_gap) + 80
+        self._spec_idle_phase = (self._spec_idle_phase + (0.30 * _spd)) % float(max(1, _cycle_px))
+        _base_y = _start_y - self._spec_idle_phase
+
+        _now = time.monotonic()
+        for _i, _dot in enumerate(self._spec_graphics_stars):
+            _tw = int(_now * 3.4 + (_i * 1.23)) % 8
+            _alpha = (0.22, 0.35, 0.5, 0.7, 0.45, 0.3, 0.18, 0.08)[_tw]
+            _v = (120, 145, 180, 220, 160, 140, 115, 90)[_tw]
+            _dot.bgcolor = f"#{_v:02x}{_v:02x}{_v:02x}"
+            _dot.opacity = _alpha
+
+        for _idx, (_slot, _txt) in enumerate(self._spec_graphics_lines):
+            if _idx >= len(_lines):
+                _slot.visible = False
+                continue
+
+            _text, _is_title = _lines[_idx]
+            _y = _base_y + (_idx * _line_gap)
+            if (not _text) or _y < -80 or _y > (_h + 60):
+                _slot.visible = False
+                continue
+
+            _depth = max(0.0, min(1.0, _y / max(1.0, float(_h))))
+            _scale = 0.18 + ((_depth ** 1.18) * 1.30)
+            _base_fs = 30 if _is_title else 22
+            _font_size = max(8, int(_base_fs * _scale))
+
+            # Weighted width estimate prevents clipping on wide glyphs (W, M, etc.).
+            _char_units = 0.0
+            for _ch in _text:
+                if _ch == " ":
+                    _char_units += 0.42
+                elif _ch in "WM@#%&":
+                    _char_units += 1.0
+                elif _ch in "I|.,:;!'":
+                    _char_units += 0.40
+                else:
+                    _char_units += 0.72
+
+            _side_pad = max(14, int(_font_size * 0.95))
+            _est_w = max(30, int((_char_units * _font_size) + (_side_pad * 2)))
+            _est_h = max(14, int(_font_size * 1.75))
+
+            _slot.left = int((_w - _est_w) / 2)
+            _slot.top = int(_y)
+            _slot.width = _est_w
+            _slot.height = _est_h
+            _slot.visible = True
+
+            if _is_title:
+                _r = 255
+                _g = 140
+                _b = 20
+                _txt.weight = ft.FontWeight.BOLD
+            else:
+                _r = 255
+                _g = 214
+                _b = 80
+                _txt.weight = ft.FontWeight.W_600
+
+            _txt.value = _text
+            _txt.size = _font_size
+            _txt.color = f"#{_r:02x}{_g:02x}{_b:02x}"
+
+        try:
+            self._spectrum_box.update()
+        except Exception:
+            pass
+
     def _refresh_spectrum_sources(self):
         """Refresh available spectrum audio sources immediately."""
         try:
@@ -8105,7 +9100,6 @@ class WLEDApp:
             _rank = {n: i for i, n in enumerate(self._spec_source_order)}
             self._spec_audio_sources = sorted(_raw_sources, key=lambda it: (_rank.get(it[0], 10**9), it[1]))
 
-            # Rebuild persisted ordering using currently available sources.
             _new_order = []
             for _name, _ in self._spec_audio_sources:
                 if _name not in _new_order:
@@ -8203,6 +9197,181 @@ class WLEDApp:
         except Exception as ex:
             self.log(f"[Spectrum] Source selector failed: {ex}", color="orange400")
 
+    def _open_spectrum_idle_settings(self, _=None):
+        try:
+            self._show_spectrum_idle_settings()
+        except Exception as ex:
+            self.log(f"[Spectrum] Idle settings failed: {ex}", color="orange400")
+
+    def _show_spectrum_idle_settings(self):
+        """Show idle-effects + source controls in a dedicated dialog."""
+        self.log("[Spectrum] Idle settings opened", color="grey500")
+        self._refresh_spectrum_sources()
+
+        _idle_timeout_txt = ft.Text(f"{int(self._spec_idle_timeout)}s", size=12, color="#ff9800")
+        _idle_speed_txt = ft.Text(f"{self._spec_idle_speed:.2f}x", size=12, color="#ff9800")
+
+        _idle_options = [
+            ("aurora", "Ambient Wave"),
+            ("pulse", "Pulse Field"),
+            ("text", "Marquee Text"),
+            ("rainbow", "Rainbow Wave"),
+            ("pacman", "Pac-Man Chase"),
+            ("tetris", "Tetris Stack"),
+            ("invaders", "Space Invaders"),
+            ("snake", "Snake Crawl"),
+            ("starwars", "Star Wars Crawl"),
+        ]
+
+        def _ensure_idle_cycle_default():
+            if not isinstance(self._spec_idle_cycle_effects, list):
+                self._spec_idle_cycle_effects = [k for k, _ in _idle_options]
+            self._spec_idle_cycle_effects = [k for k in self._spec_idle_cycle_effects if any(k == o[0] for o in _idle_options)]
+            if not self._spec_idle_cycle_effects:
+                self._spec_idle_cycle_effects = [k for k, _ in _idle_options]
+
+        _ensure_idle_cycle_default()
+
+        def on_idle_timeout_change(e):
+            self._spec_idle_timeout = round(float(e.control.value), 1)
+            _idle_timeout_txt.value = f"{int(round(self._spec_idle_timeout))}s"
+            _idle_timeout_txt.update()
+
+        def on_idle_effect_change(e):
+            _fx = str(e.control.value or "random").lower()
+            self._spec_idle_effect = _fx if _fx in ("random", "aurora", "pulse", "text", "rainbow", "pacman", "tetris", "invaders", "snake", "starwars") else "random"
+
+        def on_idle_speed_change(e):
+            self._spec_idle_speed = round(float(e.control.value), 2)
+            _idle_speed_txt.value = f"{self._spec_idle_speed:.2f}x"
+            _idle_speed_txt.update()
+
+        def on_cycle_fx_toggle(fx_key, enabled):
+            _ensure_idle_cycle_default()
+            if enabled:
+                if fx_key not in self._spec_idle_cycle_effects:
+                    self._spec_idle_cycle_effects.append(fx_key)
+            else:
+                self._spec_idle_cycle_effects = [x for x in self._spec_idle_cycle_effects if x != fx_key]
+                if not self._spec_idle_cycle_effects:
+                    # Keep at least one effect active.
+                    self._spec_idle_cycle_effects = [fx_key]
+
+        source_list = None
+
+        def on_source_selected(source_name):
+            self._save_spec_profile()
+            self._spec_selected_source = source_name if source_name != "Default" else None
+            if self._spec_selected_source:
+                self._spec_source_order = [self._spec_selected_source] + [n for n in self._spec_source_order if n != self._spec_selected_source]
+            self._load_spec_profile(self._spec_selected_source)
+            self._spec_source_changed = True
+            if self._spec_disabled:
+                self._spec_disabled = False
+                threading.Thread(target=self._audio_analyzer_loop, daemon=True).start()
+            self._refresh_spectrum_sources()
+            if source_list is not None:
+                source_list.controls = _build_source_buttons()
+                source_list.update()
+
+        def _build_source_buttons():
+            if self._spec_audio_sources:
+                _source_buttons = []
+                if self._spec_selected_source:
+                    _source_buttons.append(ft.TextButton(self._spec_selected_source, on_click=lambda _, n=self._spec_selected_source: on_source_selected(n), style=ft.ButtonStyle(color="#ff9800")))
+                    _source_buttons.append(ft.TextButton("Default", on_click=lambda _: on_source_selected("Default"), style=ft.ButtonStyle(color="grey500")))
+                    for name, _idx in self._spec_audio_sources:
+                        if name == self._spec_selected_source:
+                            continue
+                        _source_buttons.append(ft.TextButton(name, on_click=lambda _, n=name: on_source_selected(n), style=ft.ButtonStyle(color="grey500")))
+                else:
+                    _source_buttons.append(ft.TextButton("Default", on_click=lambda _: on_source_selected("Default"), style=ft.ButtonStyle(color="#ff9800")))
+                    for name, _idx in self._spec_audio_sources:
+                        _source_buttons.append(ft.TextButton(name, on_click=lambda _, n=name: on_source_selected(n), style=ft.ButtonStyle(color="grey500")))
+                return _source_buttons
+            return [
+                ft.Text("No compatible sources detected.", size=12, color="orange400"),
+                ft.Text("Tip: Enable Stereo Mix or play audio, then reopen this panel.", size=11, color="grey500"),
+            ]
+
+        _idle_effect_dd = ft.Dropdown(
+            width=180,
+            value=self._spec_idle_effect,
+            options=[
+                ft.dropdown.Option("random", "Random Cycle"),
+                ft.dropdown.Option("aurora", "Ambient Wave"),
+                ft.dropdown.Option("pulse", "Pulse Field"),
+                ft.dropdown.Option("text", "Marquee Text"),
+                ft.dropdown.Option("rainbow", "Rainbow Wave"),
+                ft.dropdown.Option("pacman", "Pac-Man Chase"),
+                ft.dropdown.Option("tetris", "Tetris Stack"),
+                ft.dropdown.Option("invaders", "Space Invaders"),
+                ft.dropdown.Option("snake", "Snake Crawl"),
+                ft.dropdown.Option("starwars", "Star Wars Crawl"),
+            ],
+            on_change=on_idle_effect_change,
+            text_size=12,
+            dense=True,
+        )
+
+        _cycle_checks = []
+        for _fx_key, _fx_label in _idle_options:
+            _cycle_checks.append(
+                ft.Checkbox(
+                    label=_fx_label,
+                    value=(_fx_key in self._spec_idle_cycle_effects),
+                    on_change=lambda e, k=_fx_key: on_cycle_fx_toggle(k, bool(e.control.value)),
+                    active_color="#ff9800",
+                )
+            )
+
+        _left_col_checks = [c for i, c in enumerate(_cycle_checks) if (i % 2) == 0]
+        _right_col_checks = [c for i, c in enumerate(_cycle_checks) if (i % 2) == 1]
+
+        _cycle_grid = ft.Row([
+            ft.Column(_left_col_checks, spacing=0, tight=True, expand=True),
+            ft.Column(_right_col_checks, spacing=0, tight=True, expand=True),
+        ], spacing=10, expand=True)
+
+        dlg = ft.AlertDialog(
+            title=ft.Text("Idle Effects Settings"),
+            content=ft.Column(
+                [
+                    ft.Row([
+                        ft.Container(content=_cycle_grid, expand=True),
+                        ft.Container(content=_idle_effect_dd, width=190, alignment=ft.alignment.top_right),
+                    ], spacing=8, vertical_alignment=ft.CrossAxisAlignment.START),
+                    ft.Row([
+                        ft.Text("Timeout:", size=12, color="grey400", width=62),
+                        _idle_timeout_txt,
+                        ft.Slider(min=2.0, max=30.0, value=self._spec_idle_timeout, divisions=28, active_color="#ff9800", on_change=on_idle_timeout_change, expand=True),
+                    ], spacing=8, vertical_alignment=ft.CrossAxisAlignment.CENTER),
+                    ft.Row([
+                        ft.Text("Idle Speed:", size=12, color="grey400", width=62),
+                        _idle_speed_txt,
+                        ft.Slider(min=0.25, max=3.0, value=self._spec_idle_speed, divisions=55, active_color="#ff9800", on_change=on_idle_speed_change, expand=True),
+                    ], spacing=8, vertical_alignment=ft.CrossAxisAlignment.CENTER),
+                    ft.Divider(height=1, color="grey800"),
+                    ft.Text("Sound Sources:", size=12, color="grey400"),
+                    (source_list := ft.Column(_build_source_buttons(), scroll="auto", tight=True, height=120)),
+                ],
+                tight=True,
+                scroll=ft.ScrollMode.AUTO,
+                width=430,
+                height=500,
+            ),
+            actions=[
+                ft.TextButton("Close", on_click=lambda _: self.page.close(dlg)),
+                ft.ElevatedButton("Save", on_click=lambda _: (self.save_cache(), self.page.close(dlg)), bgcolor="#1a1a2e", color="white"),
+            ],
+        )
+        try:
+            self.page.open(dlg)
+        except Exception:
+            self.page.dialog = dlg
+            dlg.open = True
+            self.page.update()
+
     def _show_spectrum_source_selector(self):
         """Show a dialog to select the audio source and sensitivity for spectrum analyzer."""
         self.log("[Spectrum] Source selector opened", color="grey500")
@@ -8216,15 +9385,20 @@ class WLEDApp:
                 "selected_source": self._spec_selected_source,
                 "source_order": list(self._spec_source_order),
                 "profiles": json.loads(json.dumps(self._spec_profiles if isinstance(self._spec_profiles, dict) else {})),
+                "target_fps": int(self._spec_target_fps),
+                "analysis_bands": int(self._spec_analysis_bands),
                 "sensitivity": float(self._spec_sensitivity),
                 "reactivity": float(self._spec_reactivity),
                 "bar_decay": float(self._spec_bar_decay),
                 "peak_decay": float(self._spec_peak_decay),
+                "sample_rate": int(self._spec_sample_rate),
+                "sampling_enabled": bool(self._spec_sampling_enabled),
                 "mode": str(self._spec_mode),
                 "idle_enabled": bool(self._spec_idle_enabled),
                 "idle_timeout": float(self._spec_idle_timeout),
                 "idle_effect": str(self._spec_idle_effect),
                 "idle_speed": float(self._spec_idle_speed),
+                "idle_cycle_effects": list(self._spec_idle_cycle_effects),
                 "eq_gains": [float(v) for v in self._spec_eq_gains],
             }
             self._spec_preview_pending = True
@@ -8237,10 +9411,24 @@ class WLEDApp:
             self._spec_selected_source = _snap.get("selected_source", None)
             self._spec_source_order = list(_snap.get("source_order", []))
             self._spec_profiles = json.loads(json.dumps(_snap.get("profiles", {})))
+            _prev_analysis_bands = int(getattr(self, "_spec_analysis_bands", self._spec_bands) or self._spec_bands)
+            try:
+                self._spec_target_fps = max(8, min(30, int(round(float(_snap.get("target_fps", 25))))))
+            except Exception:
+                self._spec_target_fps = 25
+            self._set_spec_analysis_bands(_snap.get("analysis_bands", self._spec_bands), restart_audio=False, reset_now=False)
             self._spec_sensitivity = float(_snap.get("sensitivity", 0.85))
             self._spec_reactivity = float(_snap.get("reactivity", 3.0))
             self._spec_bar_decay = float(_snap.get("bar_decay", 2.0))
             self._spec_peak_decay = float(_snap.get("peak_decay", 1.0))
+            _prev_sr = int(getattr(self, "_spec_sample_rate", 48000) or 48000)
+            _prev_sampling = bool(getattr(self, "_spec_sampling_enabled", True))
+            try:
+                _sr = int(_snap.get("sample_rate", 48000))
+            except Exception:
+                _sr = 48000
+            self._spec_sample_rate = _sr if _sr in (16000, 22050, 32000, 44100, 48000) else 48000
+            self._spec_sampling_enabled = bool(_snap.get("sampling_enabled", True))
             _mode = str(_snap.get("mode", "classic")).lower()
             self._spec_mode = _mode if _mode in ("classic", "vu", "random", "random_song") else "classic"
             if self._spec_mode in ("random", "random_song"):
@@ -8250,17 +9438,24 @@ class WLEDApp:
             self._spec_idle_enabled = bool(_snap.get("idle_enabled", True))
             self._spec_idle_timeout = float(_snap.get("idle_timeout", 2.0))
             _idle_fx = str(_snap.get("idle_effect", "random")).lower()
-            self._spec_idle_effect = _idle_fx if _idle_fx in ("random", "aurora", "pulse", "text", "rainbow", "pacman", "tetris", "invaders", "snake") else "random"
+            self._spec_idle_effect = _idle_fx if _idle_fx in ("random", "aurora", "pulse", "text", "rainbow", "pacman", "tetris", "invaders", "snake", "starwars") else "random"
             try:
                 self._spec_idle_speed = max(0.25, min(3.0, float(_snap.get("idle_speed", 3.0))))
             except Exception:
                 self._spec_idle_speed = 3.0
+            _idle_cycle = _snap.get("idle_cycle_effects", self._spec_idle_cycle_effects)
+            if isinstance(_idle_cycle, list):
+                _allowed = ["aurora", "pulse", "text", "rainbow", "pacman", "tetris", "invaders", "snake", "starwars"]
+                self._spec_idle_cycle_effects = [x for x in _idle_cycle if isinstance(x, str) and x in _allowed]
+                if not self._spec_idle_cycle_effects:
+                    self._spec_idle_cycle_effects = list(_allowed)
             self._spec_eq_gains = [float(v) for v in _snap.get("eq_gains", [1.0] * len(self._spec_eq_freqs))]
-            if _current_selected != self._spec_selected_source:
+            if (_current_selected != self._spec_selected_source) or (_prev_sr != self._spec_sample_rate) or (_prev_sampling != self._spec_sampling_enabled) or (_prev_analysis_bands != int(self._spec_analysis_bands)):
                 self._spec_source_changed = True
                 if self._spec_disabled:
                     self._spec_disabled = False
                     threading.Thread(target=self._audio_analyzer_loop, daemon=True).start()
+            self._sync_spec_quick_buttons()
 
         def _revert_preview_and_close(_=None):
             nonlocal _spec_saved
@@ -8412,11 +9607,24 @@ class WLEDApp:
             ]
 
         _sens_pct = ft.Text(f"{int(self._spec_sensitivity * 100)}%", size=12, color="#ff9800")
+        _fps_txt = ft.Text(f"{int(self._spec_target_fps)} FPS", size=12, color="#ff9800")
+        _bars_txt = ft.Text(f"{int(self._spec_analysis_bands)}", size=12, color="#ff9800")
         _react_pct = ft.Text(f"{self._spec_reactivity:.2f}x", size=12, color="#ff9800")
         _bar_decay_pct = ft.Text(f"{self._spec_bar_decay:.2f}x", size=12, color="#ff9800")
         _peak_decay_pct = ft.Text(f"{self._spec_peak_decay:.2f}x", size=12, color="#ff9800")
         _idle_timeout_txt = ft.Text(f"{int(self._spec_idle_timeout)}s", size=12, color="#ff9800")
         _idle_speed_txt = ft.Text(f"{self._spec_idle_speed:.2f}x", size=12, color="#ff9800")
+
+        def on_target_fps_change(e):
+            self._spec_target_fps = max(8, min(30, int(round(float(e.control.value)))))
+            _fps_txt.value = f"{int(self._spec_target_fps)} FPS"
+            _fps_txt.update()
+
+        def on_analysis_bars_change(e):
+            _new_bars = max(6, min(int(self._spec_bands), int(round(float(e.control.value)))))
+            _bars_txt.value = f"{_new_bars}"
+            _bars_txt.update()
+            self._set_spec_analysis_bands(_new_bars, restart_audio=True, reset_now=False)
 
         def on_sensitivity_change(e):
             self._spec_sensitivity = round(float(e.control.value), 2)
@@ -8452,6 +9660,7 @@ class WLEDApp:
 
         def on_idle_enabled_change(e):
             self._spec_idle_enabled = bool(e.control.value)
+            self._sync_spec_quick_buttons()
 
         def on_idle_timeout_change(e):
             self._spec_idle_timeout = round(float(e.control.value), 1)
@@ -8460,12 +9669,28 @@ class WLEDApp:
 
         def on_idle_effect_change(e):
             _fx = str(e.control.value or "random").lower()
-            self._spec_idle_effect = _fx if _fx in ("random", "aurora", "pulse", "text", "rainbow", "pacman", "tetris", "invaders", "snake") else "random"
+            self._spec_idle_effect = _fx if _fx in ("random", "aurora", "pulse", "text", "rainbow", "pacman", "tetris", "invaders", "snake", "starwars") else "random"
 
         def on_idle_speed_change(e):
             self._spec_idle_speed = round(float(e.control.value), 2)
             _idle_speed_txt.value = f"{self._spec_idle_speed:.2f}x"
             _idle_speed_txt.update()
+
+        def on_sample_rate_change(e):
+            _raw = str(e.control.value or "48000")
+            try:
+                _new_sr = int(_raw)
+            except Exception:
+                _new_sr = 48000
+            if _new_sr not in (16000, 22050, 32000, 44100, 48000):
+                _new_sr = 48000
+            if _new_sr != int(getattr(self, "_spec_sample_rate", 48000) or 48000):
+                self._spec_sample_rate = _new_sr
+                self._spec_source_changed = True
+                if self._spec_disabled:
+                    self._spec_disabled = False
+                    threading.Thread(target=self._audio_analyzer_loop, daemon=True).start()
+                self.log(f"[Spectrum] Sample rate set to {self._spec_sample_rate} Hz", color="grey500")
 
         _sens_slider = ft.Slider(
             min=0.1, max=1.5,
@@ -8475,16 +9700,42 @@ class WLEDApp:
             on_change=on_sensitivity_change,
         )
 
+        _mode_dd = ft.Dropdown(
+            width=170,
+            value=self._spec_mode,
+            options=[
+                ft.dropdown.Option("classic", "Classic"),
+                ft.dropdown.Option("vu", "VU (L/R)"),
+                ft.dropdown.Option("random", "Random (1 min)"),
+                ft.dropdown.Option("random_song", "Random (Per Song)"),
+            ],
+            on_change=on_mode_change,
+            text_size=12,
+            dense=True,
+        )
+
         sensitivity_section = ft.Column([
-            ft.Row([
-                ft.Text("Sensitivity:", size=12, color="grey400"),
-                _sens_pct,
-            ], spacing=8),
+            ft.Row([ft.Text("FPS:", size=12, color="grey400"), _fps_txt], spacing=8),
+            ft.Slider(
+                min=8, max=30,
+                value=float(self._spec_target_fps),
+                divisions=22,
+                active_color="#ff9800",
+                on_change=on_target_fps_change,
+            ),
+            ft.Row([ft.Text("Bars:", size=12, color="grey400"), _bars_txt], spacing=8),
+            ft.Slider(
+                min=6, max=float(self._spec_bands),
+                value=float(self._spec_analysis_bands),
+                divisions=max(1, int(self._spec_bands) - 6),
+                active_color="#ff9800",
+                on_change=on_analysis_bars_change,
+            ),
+            ft.Text("Visual width stays the same; fewer analysis bars are stretched across the same display.", size=10, color="grey500"),
+            ft.Divider(height=1, color="grey800"),
+            ft.Row([ft.Text("Sensitivity:", size=12, color="grey400"), _sens_pct], spacing=8),
             _sens_slider,
-            ft.Row([
-                ft.Text("Reactivity:", size=12, color="grey400"),
-                _react_pct,
-            ], spacing=8),
+            ft.Row([ft.Text("Reactivity:", size=12, color="grey400"), _react_pct], spacing=8),
             (_react_slider := ft.Slider(
                 min=0.25, max=3.0,
                 value=self._spec_reactivity,
@@ -8492,10 +9743,7 @@ class WLEDApp:
                 active_color="#ff9800",
                 on_change=on_reactivity_change,
             )),
-            ft.Row([
-                ft.Text("Bar Decay:", size=12, color="grey400"),
-                _bar_decay_pct,
-            ], spacing=8),
+            ft.Row([ft.Text("Bar Decay:", size=12, color="grey400"), _bar_decay_pct], spacing=8),
             (_bar_decay_slider := ft.Slider(
                 min=0.1, max=5.0,
                 value=self._spec_bar_decay,
@@ -8503,10 +9751,7 @@ class WLEDApp:
                 active_color="#ff9800",
                 on_change=on_bar_decay_change,
             )),
-            ft.Row([
-                ft.Text("Peak Decay:", size=12, color="grey400"),
-                _peak_decay_pct,
-            ], spacing=8),
+            ft.Row([ft.Text("Peak Decay:", size=12, color="grey400"), _peak_decay_pct], spacing=8),
             (_peak_decay_slider := ft.Slider(
                 min=0.1, max=5.0,
                 value=self._spec_peak_decay,
@@ -8516,65 +9761,8 @@ class WLEDApp:
             )),
             ft.Row([
                 ft.Text("Mode:", size=12, color="grey400"),
-                ft.Dropdown(
-                    width=170,
-                    value=self._spec_mode,
-                    options=[
-                        ft.dropdown.Option("classic", "Classic"),
-                        ft.dropdown.Option("vu", "VU (L/R)"),
-                        ft.dropdown.Option("random", "Random (1 min)"),
-                        ft.dropdown.Option("random_song", "Random (Per Song)"),
-                    ],
-                    on_change=on_mode_change,
-                    text_size=12,
-                    dense=True,
-                ),
+                ft.Container(content=_mode_dd, expand=True, alignment=ft.alignment.center_right),
             ], spacing=8, vertical_alignment=ft.CrossAxisAlignment.CENTER),
-            ft.Row([
-                ft.Text("Idle Effects:", size=12, color="grey400"),
-                ft.Switch(value=self._spec_idle_enabled, on_change=on_idle_enabled_change, scale=0.85),
-                ft.Text("Timeout:", size=12, color="grey400"),
-                _idle_timeout_txt,
-            ], spacing=8, vertical_alignment=ft.CrossAxisAlignment.CENTER),
-            ft.Slider(
-                min=2.0, max=30.0,
-                value=self._spec_idle_timeout,
-                divisions=28,
-                active_color="#ff9800",
-                on_change=on_idle_timeout_change,
-            ),
-            ft.Row([
-                ft.Text("Idle Effect:", size=12, color="grey400"),
-                ft.Dropdown(
-                    width=170,
-                    value=self._spec_idle_effect,
-                    options=[
-                        ft.dropdown.Option("random", "Random Cycle"),
-                        ft.dropdown.Option("aurora", "Ambient Wave"),
-                        ft.dropdown.Option("pulse", "Pulse Field"),
-                        ft.dropdown.Option("text", "Marquee Text"),
-                        ft.dropdown.Option("rainbow", "Rainbow Wave"),
-                        ft.dropdown.Option("pacman", "Pac-Man Chase"),
-                        ft.dropdown.Option("tetris", "Tetris Stack"),
-                        ft.dropdown.Option("invaders", "Space Invaders"),
-                        ft.dropdown.Option("snake", "Snake Crawl"),
-                    ],
-                    on_change=on_idle_effect_change,
-                    text_size=12,
-                    dense=True,
-                ),
-            ], spacing=8, vertical_alignment=ft.CrossAxisAlignment.CENTER),
-            ft.Row([
-                ft.Text("Idle Speed:", size=12, color="grey400"),
-                _idle_speed_txt,
-            ], spacing=8, vertical_alignment=ft.CrossAxisAlignment.CENTER),
-            ft.Slider(
-                min=0.25, max=3.0,
-                value=self._spec_idle_speed,
-                divisions=55,
-                active_color="#ff9800",
-                on_change=on_idle_speed_change,
-            ),
             ft.Divider(height=1, color="grey800"),
         ], spacing=0, tight=True)
 
@@ -8676,18 +9864,17 @@ class WLEDApp:
         ], spacing=2, tight=True)
 
         dlg = ft.AlertDialog(
-            title=ft.Text("Spectrum Settings"),
+            title=ft.Text("Spectrum Analyzer Settings"),
             on_dismiss=_dismiss_keep_preview,
             content=ft.Column(
                 [
                     sensitivity_section,
                     eq_section,
-                    (source_list := ft.Column(_build_source_buttons(), scroll="auto", tight=True, height=120)),
                 ],
                 tight=True,
                 scroll=ft.ScrollMode.AUTO,
                 width=430,
-                height=520,
+                height=460,
             ),
             actions=[
                 ft.TextButton("Undo", on_click=lambda _: (_revert_preview_and_close(), self._show_spectrum_source_selector())),
@@ -8706,8 +9893,27 @@ class WLEDApp:
         """Capture loopback audio and drive the header spectrum analyzer."""
         time.sleep(1.0)
         _current_device = None
-        
+        _last_idle_only_render = 0.0
+
         while self.running and not self._spec_disabled:
+            if not bool(getattr(self, "_spec_sampling_enabled", True)):
+                _now = time.monotonic()
+                _render_interval = self._get_spec_render_interval()
+                self._spec_idle_active = bool(getattr(self, "_spec_idle_enabled", True))
+                if self._spec_idle_active:
+                    if _now - _last_idle_only_render >= _render_interval:
+                        self._render_spectrum()
+                        _last_idle_only_render = _now
+                    self._spec_display_cleared = False
+                else:
+                    if not self._spec_display_cleared:
+                        self._clear_spectrum_display()
+                        self._spec_display_cleared = True
+                time.sleep(_render_interval)
+                continue
+            else:
+                self._spec_display_cleared = False
+
             try:
                 import importlib
                 _np = importlib.import_module("numpy")
@@ -8775,10 +9981,7 @@ class WLEDApp:
                     # Re-evaluate normalization per source switch/start; do not carry old gain state.
                     if _current_device is not None and (_source_switch or self._spec_gain != 1.0):
                         self._spec_gain = 0.05  # low start so attack fires immediately for quiet sources
-                        self._spec_bars = [0.0] * self._spec_bands
-                        self._spec_peaks = [0.0] * self._spec_bands
-                        self._spec_peak_hold = [0] * self._spec_bands
-                        self._spec_band_avg = [0.0] * self._spec_bands
+                        self._reset_spec_analysis_state()
                         self._spec_vu_gain = 0.18
                         self._spec_vu_left = 0.0
                         self._spec_vu_right = 0.0
@@ -8786,13 +9989,6 @@ class WLEDApp:
                         self._spec_vu_peak_right = 0.0
                         self._spec_idle_active = False
                         self._spec_last_audio_ts = time.monotonic()
-                        self._spec_beat_last_ts = 0.0
-                        self._spec_beat_prev_bass = 0.0
-                        self._spec_beat_bass_avg = 0.0
-                        self._spec_rhythm_intervals = []
-                        self._spec_rhythm_locked = False
-                        self._spec_rhythm_period = 0.5
-                        self._spec_rhythm_phase_anchor = 0.0
 
                 if _current_device is None:
                     if not self._spec_no_audio_warned:
@@ -8801,12 +9997,19 @@ class WLEDApp:
                     time.sleep(2.0)
                     continue
 
-                _sr = 48000
-                _n = 1024
+                _sr = int(getattr(self, "_spec_sample_rate", 48000) or 48000)
+                if _sr not in (16000, 22050, 32000, 44100, 48000):
+                    _sr = 48000
+
+                # Lower sample rates are intended for lower CPU machines.
+                # Keep FFT cost proportional to sample-rate tier.
+                _analysis_bands = max(6, min(int(self._spec_bands), int(getattr(self, "_spec_analysis_bands", self._spec_bands) or self._spec_bands)))
+                _n = 1024 if _sr >= 32000 else 512
+                _frame_n = max(_n, min(2048, int(_sr / 24)))
                 _freqs = _np.fft.rfftfreq(_n, d=1.0 / _sr)
-                _edges = _np.geomspace(40.0, 15000.0, self._spec_bands + 1)
+                _edges = _np.geomspace(40.0, 15000.0, _analysis_bands + 1)
                 _bins = []
-                for i in range(self._spec_bands):
+                for i in range(_analysis_bands):
                     lo = int(_np.searchsorted(_freqs, _edges[i], side="left"))
                     hi = int(_np.searchsorted(_freqs, _edges[i + 1], side="right"))
                     if hi <= lo:
@@ -8820,10 +10023,11 @@ class WLEDApp:
 
                 import warnings as _warnings
                 _warnings.filterwarnings("ignore", message="data discontinuity", category=Warning)
-                with _current_device.recorder(samplerate=_sr, channels=int(self._spec_capture_channels), blocksize=2048) as _rec:
+                with _current_device.recorder(samplerate=_sr, channels=int(self._spec_capture_channels), blocksize=_frame_n) as _rec:
                     _last_render = 0.0
                     while self.running and not self._spec_source_changed and not self._spec_disabled:
-                        _buf = _rec.record(numframes=2048)
+                        _render_interval = self._get_spec_render_interval()
+                        _buf = _rec.record(numframes=_frame_n)
                         _arr_raw = _np.asarray(_buf)
                         if _arr_raw.size < _n:
                             time.sleep(0.01)
@@ -8862,6 +10066,9 @@ class WLEDApp:
                         # Fast attack (0.06) so rising noise floors are tracked within ~0.4s;
                         # slow release (0.005) so transients/beats stay visible above the avg.
                         _avg_arr = _np.asarray(self._spec_band_avg, dtype=float)
+                        if _avg_arr.size != _vals.size:
+                            self._spec_source_changed = True
+                            continue
                         _rising = _vals > _avg_arr
                         self._spec_band_avg = list(_np.where(
                             _rising,
@@ -8899,55 +10106,10 @@ class WLEDApp:
                             self._spec_last_audio_ts = _now
                             self._spec_mode_song_switch_armed = True
 
-                        # Beat detector: low-band transient above adaptive bass floor.
-                        _bass_bins = max(1, min(3, len(_vals)))
-                        _bass = float(_np.mean(_vals[:_bass_bins])) if _bass_bins > 0 else 0.0
-                        _avg = float(self._spec_beat_bass_avg)
-                        if _bass >= _avg:
-                            _avg = _avg * 0.82 + _bass * 0.18
-                        else:
-                            _avg = _avg * 0.94 + _bass * 0.06
-                        self._spec_beat_bass_avg = _avg
-
-                        _enough_audio = _mx > (float(self._spec_idle_threshold) * 1.15)
-                        _rising = _bass > (float(self._spec_beat_prev_bass) * 1.08)
-                        _beat_floor = max(float(self._spec_idle_threshold) * 1.8, _avg * 1.45)
-                        _is_beat = _enough_audio and _rising and (_bass >= _beat_floor)
-                        if _is_beat and ((_now - float(self._spec_beat_last_ts)) >= float(self._spec_beat_min_gap_seconds)):
-                            _prev_beat = float(self._spec_beat_last_ts)
-                            self._spec_beat_last_ts = _now
-                            if _prev_beat > 0.0:
-                                _iv = _now - _prev_beat
-                                # Keep musically plausible beat intervals only.
-                                if 0.22 <= _iv <= 1.20:
-                                    _ivs = list(getattr(self, "_spec_rhythm_intervals", []))
-                                    _ivs.append(float(_iv))
-                                    if len(_ivs) > 8:
-                                        _ivs = _ivs[-8:]
-                                    self._spec_rhythm_intervals = _ivs
-
-                                    _min_n = int(max(3, int(getattr(self, "_spec_rhythm_min_samples", 4))))
-                                    if len(_ivs) >= _min_n:
-                                        _mean = sum(_ivs) / float(len(_ivs))
-                                        _mean = max(0.22, min(1.20, _mean))
-                                        _mad = sum(abs(x - _mean) for x in _ivs) / float(len(_ivs))
-                                        _jitter = _mad / max(1e-6, _mean)
-                                        if _jitter <= 0.22:
-                                            self._spec_rhythm_locked = True
-                                            # Smooth period estimate so lock remains stable.
-                                            self._spec_rhythm_period = (float(self._spec_rhythm_period) * 0.65) + (_mean * 0.35)
-                                            self._spec_rhythm_phase_anchor = _now
-                        self._spec_beat_prev_bass = _bass
-
-                        # Drop rhythm lock if no beat has landed for a while.
-                        if (_now - float(self._spec_beat_last_ts)) > float(self._spec_rhythm_timeout_seconds):
-                            self._spec_rhythm_locked = False
-                            self._spec_rhythm_intervals = []
-
                         _idle_on = bool(self._spec_idle_enabled) and ((_now - self._spec_last_audio_ts) >= float(self._spec_idle_timeout))
                         self._spec_idle_active = _idle_on
                         if _idle_on:
-                            if _now - _last_render >= 0.02:
+                            if _now - _last_render >= _render_interval:
                                 self._render_spectrum()
                                 _last_render = _now
                             continue
@@ -8960,7 +10122,7 @@ class WLEDApp:
                         _peak_hold_frames = max(2, int(round(8 / _react)))
                         _peak_drop = 0.02 * _peak_dec
 
-                        for i in range(self._spec_bands):
+                        for i in range(_analysis_bands):
                             tgt = float(max(0.0, min(1.0, _vals[i])))
                             cur = self._spec_bars[i]
                             if tgt >= cur:
@@ -9015,7 +10177,7 @@ class WLEDApp:
                             self._spec_vu_peak_right = max(0.0, self._spec_vu_peak_right - _peak_drop)
 
                         _now = time.monotonic()
-                        if _now - _last_render >= 0.02:
+                        if _now - _last_render >= _render_interval:
                             self._render_spectrum()
                             _last_render = _now
             except Exception as ex:
@@ -9880,6 +11042,11 @@ class WLEDApp:
         self._spec_reactivity = _clamp(c.get("spec_reactivity", 3.0), 0.25, 3.0, 3.0)
         self._spec_bar_decay = _clamp(c.get("spec_bar_decay", 2.0), 0.1, 5.0, 2.0)
         self._spec_peak_decay = _clamp(c.get("spec_peak_decay", 1.0), 0.1, 5.0, 1.0)
+        self._spec_target_fps = int(_clamp(c.get("spec_target_fps", 25), 8, 30, 25))
+        self._set_spec_analysis_bands(c.get("spec_analysis_bands", self._spec_bands), restart_audio=False, reset_now=True)
+        _sr = int(_clamp(c.get("spec_sample_rate", 48000), 8000, 96000, 48000))
+        self._spec_sample_rate = _sr if _sr in (16000, 22050, 32000, 44100, 48000) else 48000
+        self._spec_sampling_enabled = bool(c.get("spec_sampling_enabled", True))
         _mode = str(c.get("spec_mode", "classic")).lower()
         self._spec_mode = _mode if _mode in ("classic", "vu", "random", "random_song") else "classic"
         if self._spec_mode in ("random", "random_song"):
@@ -9889,8 +11056,14 @@ class WLEDApp:
         self._spec_idle_enabled = bool(c.get("spec_idle_enabled", True))
         self._spec_idle_timeout = _clamp(c.get("spec_idle_timeout", 2.0), 2.0, 30.0, 2.0)
         _idle_fx = str(c.get("spec_idle_effect", "random")).lower()
-        self._spec_idle_effect = _idle_fx if _idle_fx in ("random", "aurora", "pulse", "text", "rainbow", "pacman", "tetris", "invaders", "snake") else "random"
+        self._spec_idle_effect = _idle_fx if _idle_fx in ("random", "aurora", "pulse", "text", "rainbow", "pacman", "tetris", "invaders", "snake", "starwars") else "random"
         self._spec_idle_speed = _clamp(c.get("spec_idle_speed", 3.0), 0.25, 3.0, 3.0)
+        _idle_cycle_saved = c.get("spec_idle_cycle_effects", self._spec_idle_cycle_effects)
+        if isinstance(_idle_cycle_saved, list):
+            _allowed = ["aurora", "pulse", "text", "rainbow", "pacman", "tetris", "invaders", "snake", "starwars"]
+            self._spec_idle_cycle_effects = [x for x in _idle_cycle_saved if isinstance(x, str) and x in _allowed]
+            if not self._spec_idle_cycle_effects:
+                self._spec_idle_cycle_effects = list(_allowed)
         _eq_saved = c.get("spec_eq_gains", self._spec_eq_gains)
         if isinstance(_eq_saved, list) and len(_eq_saved) == len(self._spec_eq_freqs):
             try:
@@ -9922,6 +11095,7 @@ class WLEDApp:
 
         # Load active source profile after globals are initialized.
         self._load_spec_profile(self._spec_selected_source)
+        self._sync_spec_quick_buttons()
 
         # Initialize unified polling device sets — only add actual WLED/MH devices, not custom launcher cards.
         self.wled_devices = set()
@@ -10141,6 +11315,10 @@ class WLEDApp:
             "border_color":  self.border_color,
             "spec_audio_source": self._spec_selected_source,
             "spec_source_order": self._spec_source_order,
+            "spec_target_fps": int(self._spec_target_fps),
+            "spec_analysis_bands": int(self._spec_analysis_bands),
+            "spec_sample_rate": int(self._spec_sample_rate),
+            "spec_sampling_enabled": bool(self._spec_sampling_enabled),
             "spec_sensitivity": self._spec_sensitivity,
             "spec_reactivity": self._spec_reactivity,
             "spec_bar_decay": self._spec_bar_decay,
@@ -10150,6 +11328,7 @@ class WLEDApp:
             "spec_idle_timeout": self._spec_idle_timeout,
             "spec_idle_effect": self._spec_idle_effect,
             "spec_idle_speed": self._spec_idle_speed,
+            "spec_idle_cycle_effects": self._spec_idle_cycle_effects,
             "spec_eq_gains": self._spec_eq_gains,
             "spec_profiles": self._spec_profiles,
             "debug_on_open": self.debug_on_open,
