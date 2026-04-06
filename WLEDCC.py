@@ -1796,7 +1796,9 @@ class WLEDApp:
 
         def _start():
             self._ledfx_launching = True
-            subprocess.Popen([self.ledfx_path])
+            cmd = [self.ledfx_path, "--clear-effects"]
+            subprocess.Popen(cmd)
+            #subprocess.Popen([self.ledfx_path])
             # Poll until process is running (max 30s)
             for i in range(30):
                 time.sleep(1)
@@ -4141,12 +4143,18 @@ class WLEDApp:
                 try:
                     hwnd = win32gui.FindWindow("Winamp v1.x", None)
                     if hwnd:
+                        win32gui.SendMessage(hwnd, win32con.WM_COMMAND, 40048, 0)
+                        self.log("[App] Sent PLAY + NEXT to Winamp", color="cyan")
+                        time.sleep(0.08)
                         win32gui.SendMessage(hwnd, win32con.WM_COMMAND, 40045, 0)
+                        # Nudge once to avoid occasional first-track stickiness;
+                        # Winamp's own random mode picks the song after this.
+                        """  win32gui.SendMessage(hwnd, win32con.WM_COMMAND, 40045, 0)
                         # Nudge once to avoid occasional first-track stickiness;
                         # Winamp's own random mode picks the song after this.
                         time.sleep(0.08)
                         win32gui.SendMessage(hwnd, win32con.WM_COMMAND, 40048, 0)
-                        self.log("[App] Sent PLAY + NEXT to Winamp", color="cyan")
+                        self.log("[App] Sent PLAY + NEXT to Winamp", color="cyan") """
                         return
                 except:
                     pass
@@ -11890,6 +11898,7 @@ class WLEDApp:
                         try:
                             r = requests.put(f"http://localhost:8888/api/virtuals/{v}",
                                              json={"active": False}, timeout=3)
+                            self.log(f"[Status Code:] {r.status_code} {r.text}", color="orange400")
                             if r.status_code not in (200, 204):
                                 failed.append(v)
                         except Exception:
