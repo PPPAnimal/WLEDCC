@@ -1,6 +1,43 @@
 WLED Command Center+
 
+Click MANUAL in app for most recent instructions on usage and features.
+
+**********************
+4.7.0
+**********************
+Update Highlights:
+
+Added Music Reactive support for Magic Home Devices, not supported in LEDFX
+If Magic Home devices exist, and LEDFX running, WLEDCC automatically creates a MHBridge device registration in LEDFX.
+MHBridge is set to one pixel, and streams its effect data to WLEDCC.  
+WLEDCC then converts this to Magic Home codes and streams that to the controllers.
+Set this MHBridge Device to any LEDFX effect giving MagicHome devices music reactive effect support not found native in LEDFX.
+
+Full Debug logs are always written to file now, even if debug mode is turned off for console window.
+
+Added STAR WARS idle effect.
+
+**************
+4.6.9
+**************
+HOTFIX - --clear-effects / for sound issue crashing ledfx
+
+***********
+v4.6.8
+***********
+*support for Spotify app, installs and controls
+
+*UI work
+*split SA settings and Idle effects settings into 2 menus
+
+*Options for shutting off Specturm Anaylyzer and idle effects
+to improve proformance on older systems.
+reduce frame rate on SA display
+(setting App Name and Card Border effects to solid color helps too)
+
+****************************
 NEW FEATURES Added in V4.6.7
+****************************
 
 SPECTRUM ANALYZER (PC AUDIO)
     The header includes a live spectrum analyzer that reacts to your PC audio.
@@ -82,17 +119,119 @@ BUG FIXES
     - Reduced logs to one per session, 10 Max
     - Last used scene button border now glows
 
+********************
+V4.6.6
+********************
+when user closes app, i want a popup screen first
+add button to "stop ledfx", turn lights "all off", or just "close app"
+add a check box to "remember setting" for future app closures.
+if checked, on next exit this will auto run, stop ledfx, all off.
+popup will still remain, and user just clicks "close app" to exit.
+
+*update buttons should show version to download
+make reboot and sanitize look like buttons
+
+*upgrading from older versions of this app results
+in losing saved json settings
+mainly the saved scenes
+is there a way to notice the failed json load
+and if no backup exists, pull out what data we can like
+device names, scenes etc and then create a new updated
+json merging old data with new
+
+*JSON - missing, loads backup
+corrupted, fails with no error and starts fresh.
+fixed
+
+*wait for ledfx to fully load before
+toggle scenes switch that starts scene download.
+set to 5 secs from 3
+
+*moved wled update button beside slider
+moved live badge button beside slider
+increased minimum brightness on borders and app name to 25%
+
+limit logs and json files,
+atm its writing a new file after each change
+
+*when adding custom cards
+we have area to enter ip, path to exe, or url
+i want to add a way to browse to the EXE
+click a button and popup lets you find the exe
+then enters that path into card
+
+*ledfx_monitor_loop not detecting offline devices.
+unified loop should still be pinging all wled devices
+so why is it not detecting offline.
+i clicked adjusted brightness on offline device and still
+not detected as offline
+got log, ceiling failed all 3 attempts
+still shows online
+
+*on startup, if no ledfx path in json, look in program files, likely paths
+if found, save path to json and update button to not ask for
+install or show me path.
+
+*live badge should be purple, wled scenes toggle, same blue as wled badge
+5026 is orange code
+
+*need to detect if a copy of wledcc.exe is running
+and refuse to start second.
+maybe bring running exe to front/forground
+so its visable
+
+*does scan need 30 secs?
+most devices are picked up instantly,
+those missed come up next scan instantly.
+maybe do a couple 10 sec fast scans
+not one slow 30sec one?
+
+*MH scenes fail to set a device running preset effect to solid color request
+need to set effect solid, then color
+
+*minimum brightness for app name
+should be raised higher, still to dark at lowest setting.
+set constraint, min 25% brightness on cards and app name in top bar, device sliders should be unaffected by this change.
+
+*default slider position 50% for app name and border effects
+
+*on start ledfx, toggle to ledfx scene list for view
+can remove the auto load of scenes and just use the
+function that is on button activation which loads scene list also.
+line 506 - delayed scene fetch
+fetch ledfx scenes
+
+*change color on MH results in brightness changing to 100%.
+should send a brightness change after the color request that matches current
+slider position?
+
+*i made a fix recently for loading scenes
+they used to take forever to load
+the new system for scenes dispatches commands to all devices
+then loops back to ping them while and resend if needed
+and reconcile before reporting success or list of devices that failed
+to update
+i need this solution applied to the all on and all off buttons
+
+*master slider currently can show in row1 wide mode and row2 narrow mode
+i want to remove it from narrow mode and have it always show in row1
+remove master slider for row2, only show it in row1
+
+*check box to top of log screen beside debug off
+if checked debug mode on by default when log opens
+add check box beside close log
+log auto opens at program start on checked box
+
+*********************************
+*********************************
+*********************************
 
 WHAT IS THIS PROGRAM?
-WLED Command Center+ lets you control all your WLED, LEDFX, MagicHome, and 
-custom devices from one place. Devices are auto-discovered on startup. 
-It checks for new firmware for all your Devices and provides one click 
-automatic installs. All settings, names, scenes and card order are saved 
-and restored between sessions. Reboot slow devices, Sanitize Presets, 
-record/play presets/scenes for WLED and LEDFX. Access WLED and LEDFX 
-WED UI's right from inside this program. Make custom Cards for your 
-favorite WEB SITES, Program EXE's, etc and all from one screen. 
-Truely a ALL-IN-ONE Control Center.
+WLEDCC is an all-in-one desktop app to discover, control, and automate
+your WLED, MagicHome, and LedFx devices from a single, modern interface. 
+It features a live spectrum analyzer, scene/preset management, 
+device updates, automation, and custom cards for launching your 
+favorite apps or web pages (like Spotify or Winamp).
 
 APP NAME BAR
 SLIDERS - Use to control SPEED or BRIGHTNESS for APP NAME and CARDS.

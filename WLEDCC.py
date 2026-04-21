@@ -33,6 +33,10 @@
 #
 
 import flet as ft
+try:
+    import flet.canvas as cv  # Neon VU canvas drawing primitives
+except Exception:
+    cv = None  # canvas unavailable; neon_vu mode will gracefully no-op
 import requests
 from zeroconf import Zeroconf, ServiceBrowser
 import threading
@@ -59,6 +63,16 @@ try:
     import winreg
 except Exception:
     winreg = None
+
+# flux_led is required for MagicHome ↔ LedFx bridge (pip install flux_led)
+try:
+    from flux_led import WifiLedBulb as _WifiLedBulb
+    _FLUX_LED_AVAILABLE = True
+except ImportError:
+    _WifiLedBulb = None
+    _FLUX_LED_AVAILABLE = False
+
+MH_BRIDGE_PORT = 21324  # UDP port the LedFx bridge listens on
 
 def raise_if_running(window_title):
     """If window exists, bring to front and return True, else False."""
@@ -138,7 +152,36 @@ MH_MODE_NAME_BY_PATTERN = {pat: label for (label, _desc, pat) in MH_MODES if pat
 class WLEDApp:
     def __init__(self, page: ft.Page):
         self.page = page
-        self.devices = {}  
+        self.devices = {}
+
+        # Route unhandled exceptions on any thread to the in-app log so crashes
+        # are visible even when no console window is open.
+        import sys as _sys_eh, traceback as _tb_eh
+        _app = self
+        def _exc_hook(exc_type, exc_value, exc_tb):
+            msg = "".join(_tb_eh.format_exception(exc_type, exc_value, exc_tb))
+            try:
+                _app.log(f"[CRASH] Unhandled exception:\n{msg}", color="red400")
+            except Exception:
+                pass  # log itself failed — nothing we can do
+        _sys_eh.excepthook = _exc_hook
+
+        def _thread_exc_hook(args):
+            if args.exc_type is SystemExit:
+                return
+            
+            # Get the traceback from the exception value for compatibility with Python 3.11+
+            tb = args.exc_value.__traceback__
+            msg = "".join(_tb_eh.format_exception(args.exc_type, args.exc_value, tb))
+            
+            tname = getattr(args.thread, "name", "?")
+            try:
+                _app.log(f"[CRASH] Unhandled exception in thread '{tname}':\n{msg}", color="red400")
+            except Exception:
+                pass
+        import threading as _thr_eh
+        _thr_eh.excepthook = _thread_exc_hook
+  
         self.device_types = {} 
         self.effect_maps = {} 
         self.cards = {}    
@@ -177,8 +220,8 @@ class WLEDApp:
         self._strobe_title = True
         self._strobe_border = True
         # Winamp-style spectrum analyzer state (header visualizer)
-        self._spec_bands = 30
-        self._spec_analysis_bands = 30
+        self._spec_bands = 32
+        self._spec_analysis_bands = 32
         self._spec_levels = 16
         self._spec_bars = [0.0] * self._spec_analysis_bands
         self._spec_peaks = [0.0] * self._spec_analysis_bands
@@ -194,9 +237,15 @@ class WLEDApp:
         self._spec_mode = "classic"  # classic | vu | random | random_song
         self._spec_mode_random_current = "classic"
         self._spec_mode_random_cycle_seconds = 60.0
+        self._spec_mode_cycle_choices = ["classic", "vu", "cyber_city", "neon_drift", "retro_tech", "custom_vu"]
         self._spec_mode_random_next_ts = time.monotonic() + self._spec_mode_random_cycle_seconds
-        self._spec_mode_song_silence_seconds = 1.0
+        self._spec_mode_song_silence_seconds = 2.0  # Synced to default idle timeout
         self._spec_mode_song_switch_armed = True
+        self._spec_nvu_drift_bg = "nebula space.jpg"
+        self._spec_nvu_retro_bg = "brushed metal.jpg"
+        self._spec_nvu_custom_bg = "retro yellow.jpg"
+        self._spec_nvu_bg_force_reload = False
+        self._spec_mode_song_debounce = 0  # frames of consecutive audio to trigger song start
         self._spec_capture_channels = 2  # prefer stereo; fallback to mono if device does not support it
         self._spec_sample_rate = 48000  # lower values reduce analyzer CPU usage
         self._spec_sampling_enabled = True  # quick toggle: when off, skip audio capture (idle-only mode)
@@ -205,12 +254,22 @@ class WLEDApp:
         self._spec_vu_right = 0.0
         self._spec_vu_peak_left = 0.0
         self._spec_vu_peak_right = 0.0
+        # ── Neon VU Meter (canvas-based) ─────────────────────────────────
+        # Smooth needle positions (ballistic physics — weighted average)
+        self._neon_vu_left_smooth  = 0.0
+        self._neon_vu_right_smooth = 0.0
+        # Visual theme: "neon_drift" (cyan/magenta on nebula) or "retro_tech" (orange/red on brushed metal)
+        self._neon_vu_theme        = "neon_drift"
+        # Flet canvas control and host container (created during UI build)
+        self._neon_vu_canvas       = None   # ft.canvas.Canvas — needles + arcs
+        self._neon_vu_bg_image     = None   # ft.Image — background texture
+        self._neon_vu_host         = None   # ft.Container (Stack: bg + canvas)
         self._spec_idle_enabled = True
         self._spec_idle_timeout = 2.0
-        self._spec_idle_effect = "random"  # random | aurora | pulse | text | rainbow | pacman | tetris | invaders | snake | starwars
-        self._spec_idle_cycle_effects = ["aurora", "pulse", "text", "rainbow", "pacman", "tetris", "invaders", "snake", "starwars"]
+        self._spec_idle_effect = "random"  # random | pulse | text | pacman | tetris | invaders | snake | starwars
+        self._spec_idle_cycle_effects = ["pulse", "text", "pacman", "tetris", "invaders", "snake", "starwars"]
         self._spec_idle_speed = 2.0  # ambient idle animation speed multiplier
-        self._spec_idle_random_current = "aurora"
+        self._spec_idle_random_current = "pulse"
         self._spec_idle_random_cycle_seconds = 10.0
         self._spec_idle_random_next_ts = time.monotonic() + self._spec_idle_random_cycle_seconds
         self._spec_idle_threshold = 0.02
@@ -232,7 +291,8 @@ class WLEDApp:
         self._spec_source_changed = False  # flag to signal audio loop to switch source
         self._spec_disabled = False  # True if audio capture failed and is disabled
         self._spec_render_mode = "grid"  # grid | graphics
-        self._spec_box_grid_size = (296, 62)
+        #ppp was 296x62, but that was a bit tight for 32 bars + spacing at 16 levels — give it a little more room to breathe
+        self._spec_box_grid_size = (300, 62)
         self._spec_box_graphics_size = self._spec_box_grid_size
         self._spec_grid_content = None
         self._spec_graphics_host = None
@@ -289,6 +349,7 @@ class WLEDApp:
         self.debug_on_open = False   # True = enable debug mode when log panel opens
         self.log_auto_open = False   # True = log panel opens automatically at startup
         # Exit popup preferences
+        self.exit_remember_actions = False
         self.exit_auto_stop_ledfx = False
         self.exit_auto_all_off = False
         self._cleanup_started = False
@@ -307,6 +368,8 @@ class WLEDApp:
         self.draggable_map = {}   # flet control uid -> ip, for drag resolution
         self.scene_btn_refs = {}  # idx -> Container ref for rainbow border on active scene
         self.active_scene_idx = None  # which scene is currently active (glowing)
+        self._wled_scene_generation  = 0  # incremented on each WLED scene change; workers bail if superseded
+        self._ledfx_scene_generation = 0  # incremented on each LedFx scene change; workers bail if superseded
         self.ledfx_running = False  # mirrors ledfx_monitor_loop — used to skip polls
         self._ledfx_launching = False  # True while launch sequence is running
         self.auto_start_ledfx_on_launch = False
@@ -334,7 +397,34 @@ class WLEDApp:
         self.mh_last_rgb = {}     # ip -> (r, g, b) last color sent
         self.mh_last_cmd = {}     # ip -> timestamp of last command sent (rate limiter)
         self.ledfx_path = None
-        
+
+        # ── MagicHome ↔ LedFx bridge state ──────────────────────────────────
+        self.mh_live_ips = set()          # MH IPs currently synced via LedFx bridge
+        self.mh_restore_until = {}        # ip → timestamp; ping loop skips state writes until then
+        self._mh_bridge_virtual_id = None  # virtual-id string for the MHBridge virtual in LedFx
+        self._mhbridge_was_streaming = False  # edge-detect: previous poll streaming state
+        self.mh_bridge_running = False    # True while UDP bridge thread is alive
+        self.mh_bridge_sock = None        # bound UDP socket (for clean shutdown)
+        self._mh_bridge_lock = threading.Lock()  # guards check-and-set in _mh_start_bridge
+        self.mh_bulb_queues = {}          # ip → Queue(maxsize=1) for colour workers
+        self.mh_live_last_delivery = {}   # ip → timestamp of last successful setRgb
+        self.mh_live_grace_until = {}    # ip → timestamp until poll loop must not auto-release
+        self.mh_bridge_thread = None
+        self._mh_bridge_port = MH_BRIDGE_PORT
+        self._mh_ledfx_device_ids = {}    # ip → LedFx device-id string (for deletion)
+        self._mh_virtual_ids = {}         # ip → LedFx virtual-id string (for effect set)
+
+        # --- Batched log queue (thread-safe UI log writes) ---
+        self._log_queue             = Queue()   # (timestamp, message, color) tuples
+        self._log_flush_interval    = 0.15      # seconds between UI flush ticks
+        self._log_flush_timer       = None      # ft.timer.Timer ref
+
+        # --- UI Watchdog heartbeat ---
+        self._ui_heartbeat_counter  = 0
+        self._ui_watchdog_last_beat = time.monotonic()
+        self._ui_freeze_threshold   = 6.0       # seconds of silence = frozen pipe
+        self._ui_watchdog_log_path  = os.path.join(LOG_DIR, "ui_watchdog.log")
+
         # --- mDNS ---
         self.browser = None
         self.zeroconf = None
@@ -388,8 +478,10 @@ class WLEDApp:
         # Run one startup scan after a short delay — gives UI time to settle
         def _delayed_startup_scan():
             
-            if self.cards:
-                return   # skip auto-scan if devices already exist
+            # Check if there are any real device cards (not just custom launcher cards)
+            _has_real_devices = any(not self.cards[ip].get("_is_custom", False) for ip in self.cards)
+            if _has_real_devices:
+                return   # skip auto-scan if real devices already exist
             time.sleep(5)
             # Update button to show scanning state
             self._refresh_icon.color = "cyan"
@@ -402,6 +494,9 @@ class WLEDApp:
             # Poll loop handles live state — nothing needed here
         threading.Thread(target=_delayed_startup_scan, daemon=True).start()
         self.page.on_close = self.cleanup
+        # ── Thread-safety patch: start batched log flusher and UI watchdog ──
+        self._start_log_flush_timer()
+        self._start_ui_watchdog()
 
     def _open_session_log(self):
         """Open the current session log file (single file reused for this app session)."""
@@ -423,25 +518,157 @@ class WLEDApp:
             return fh
         except Exception:
             return None
-
-    def log(self, message, color="grey300"):
+    def _restore_btn_label(self):
+            """Helper to reset the Refresh button state after a scan or error."""
+            try:
+                self._refresh_icon.color = "white"
+                self._refresh_text.value = "SCAN"
+                self._refresh_text.color = "white"
+                self.refresh_btn.disabled = False
+                self.refresh_btn.update()
+            except Exception as e:
+                self.dbg(f"Failed to restore button label: {e}")
+    def log(self, message, color="grey300", debug=False):
+        # PATCHED: thread-safe batched log.
+        # All threads enqueue here; the Flet timer (_start_log_flush_timer)
+        # drains the queue in one page-safe batch update per flush interval.
+        # This prevents WebSocket pipe saturation when many threads log simultaneously.
         timestamp = datetime.now().strftime("%H:%M:%S")
-        self.log_lines.controls.append(
-            ft.Text(f"[{timestamp}] {message}", size=11, color=color, selectable=True)
-        )
-        # Trim oldest entries to keep UI responsive — file log keeps full history
-        if len(self.log_lines.controls) > 500:
-            del self.log_lines.controls[:100]  # drop oldest 100 at a time
-        # Write to session log file only when enabled
+        # Always write to file immediately — debug flag never suppresses disk output.
         if self.save_logs_to_disk and self._log_fh:
-            try: self._log_fh.write(f"[{timestamp}] {message}\n")
-            except: pass
-        if not self.running: return
+            try:
+                self._log_fh.write(f"[{timestamp}] {message}\n")
+            except Exception:
+                pass
+        # Honour debug gate for UI visibility.
+        if debug and not self.debug_mode:
+            return
+        if not self.running:
+            return
+        # Enqueue; the flush timer does the actual control-tree mutation.
         try:
-            self.log_lines.update()
-            if self.log_autoscroll:
-                self.log_lines.scroll_to(offset=-1, duration=50)
-        except: pass
+            self._log_queue.put_nowait((timestamp, message, color))
+        except Exception:
+            pass
+
+    # ── PATCH: Thread-safety helpers ─────────────────────────────────────────
+
+    def _start_log_flush_timer(self):
+        """Drain the log queue in one batched UI update per flush interval.
+
+        LogFlush is the ONLY thread that ever mutates self.log_lines.controls
+        or calls log_lines.update(), so direct calls are thread-safe without
+        any call_from_thread wrapping.  Using call_from_thread here caused a
+        nested-event-loop deadlock: call_from_thread scheduled _ui_flush ON the
+        Flet event loop, then _ui_flush called log_lines.update() which
+        internally tries to do async I/O on that same loop → permanent freeze.
+        """
+        def _flush_loop():
+            while self.running:
+                time.sleep(self._log_flush_interval)
+                if not self.running:
+                    break
+                # Drain everything queued since last tick
+                batch = []
+                while True:
+                    try:
+                        batch.append(self._log_queue.get_nowait())
+                    except Exception:
+                        break
+                if not batch:
+                    continue
+                # Direct control-tree mutation — safe: this is the only thread
+                # that touches log_lines.controls (log() only enqueues now).
+                for ts, msg, color in batch:
+                    self.log_lines.controls.append(
+                        ft.Text(f"[{ts}] {msg}", size=11, color=color,
+                                selectable=True)
+                    )
+                if len(self.log_lines.controls) > 500:
+                    del self.log_lines.controls[:100]
+                try:
+                    self.log_lines.update()
+                    if self.log_autoscroll:
+                        self.log_lines.scroll_to(offset=-1, duration=50)
+                except Exception:
+                    pass
+
+        threading.Thread(target=_flush_loop, daemon=True,
+                         name="LogFlush").start()
+
+    def _ui_call(self, fn):
+        """Call a zero-argument UI function safely from any thread.
+
+        Calls fn() directly — Flet's individual control.update() is thread-safe
+        when called from a single background thread.  call_from_thread is NOT
+        used here because it causes the same nested-loop deadlock as the log
+        flush: if fn() internally calls page.update() or control.update(), it
+        re-enters the event loop that call_from_thread is already running on.
+        """
+        try:
+            fn()
+        except Exception:
+            pass
+
+    def _start_ui_watchdog(self):
+        """Independent freeze detector.
+
+        Heartbeat: a daemon thread increments a plain Python counter every 2 s.
+        No Flet involvement — avoids the call_from_thread deadlock entirely.
+        The counter is a pure Python int; GIL guarantees atomic reads/writes.
+
+        Watchdog: a second daemon thread checks the counter every 4 s and
+        writes a timestamped alert to LOG_DIR/ui_watchdog.log if it stops
+        advancing, so freezes are detectable post-mortem even with no console.
+
+        Note: because the heartbeat no longer goes through the Flet event loop,
+        the watchdog now detects Python-level thread stalls rather than Flet
+        pipe saturation specifically.  A frozen Flet pipe will still be caught
+        indirectly — the LogFlush thread will stall on log_lines.update() and
+        the queue will back up, which manifests as a silent log panel.
+        """
+        def _heartbeat_loop():
+            while self.running:
+                time.sleep(2)
+                # Plain Python assignment — no Flet, no deadlock risk.
+                self._ui_heartbeat_counter += 1
+                self._ui_watchdog_last_beat = time.monotonic()
+
+        def _watchdog():
+            last_seen = -1
+            while self.running:
+                time.sleep(4)
+                current = self._ui_heartbeat_counter
+                if current == last_seen and self.running:
+                    elapsed = time.monotonic() - self._ui_watchdog_last_beat
+                    if elapsed >= self._ui_freeze_threshold:
+                        _ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                        msg = (
+                            f"[{_ts}] UI WATCHDOG: Python threads stalled "
+                            f"({elapsed:.1f}s no heartbeat). "
+                            f"running={self.running} "
+                            f"mh_bridge_running={self.mh_bridge_running} "
+                            f"live_ips={list(self.live_ips)}\n"
+                        )
+                        try:
+                            with open(self._ui_watchdog_log_path, "a",
+                                      encoding="utf-8") as _wf:
+                                _wf.write(msg)
+                        except Exception:
+                            pass
+                        if self._log_fh:
+                            try:
+                                self._log_fh.write(msg)
+                            except Exception:
+                                pass
+                last_seen = current
+
+        threading.Thread(target=_heartbeat_loop, daemon=True,
+                         name="UIHeartbeat").start()
+        threading.Thread(target=_watchdog, daemon=True,
+                         name="UIWatchdog").start()
+
+    # ── END PATCH helpers ─────────────────────────────────────────────────────
 
     def toggle_autoscroll(self, e):
         self.log_autoscroll = not self.log_autoscroll
@@ -506,32 +733,20 @@ class WLEDApp:
         self.save_cache()
 
     def dbg(self, message, color="grey500"):
-        """Log only when debug mode is on."""
-        if self.debug_mode:
-            self.log(f"[DBG4 TRACE] {message}", color=color)
+        """Debug message — always written to file, shown in UI only when debug mode is on."""
+        self.log(f"[DBG4 TRACE] {message}", color=color, debug=True)
 
-    def log_unique(self, key, message, color="grey300"):
-
+    def log_unique(self, key, message, color="grey300", debug=False):
         last = self._last_log_by_key.get(key)
-
         if last == message:
-
             return False
-
         self._last_log_by_key[key] = message
-
-        self.log(message, color=color)
-
+        self.log(message, color=color, debug=debug)
         return True
 
-
     def dbg_unique(self, key, message, color="grey500"):
-
-        if not self.debug_mode:
-
-            return False
-
-        return self.log_unique(key, f"[DBG3 STATE] {message}", color=color)
+        """Debug unique — always written to file, shown in UI only when debug mode is on."""
+        return self.log_unique(key, f"[DBG3 STATE] {message}", color=color, debug=True)
 
 
     def _mark(self, field, changed, s):
@@ -541,82 +756,45 @@ class WLEDApp:
 
     def _dbg_wled_ping(self, ip, name, is_on, bri, fx, color, rssi, live):
 
-        if not self.debug_mode:
-
-            return
-
         # build normalized state
-
         try:
-
             bri_pct = str(int((int(bri)/255)*100)) + "%" if bri is not None else "?"
-
         except:
-
             bri_pct = "?"
-
         state = {"on": bool(is_on), "bri": bri_pct, "fx": str(fx), "color": str(color), "rssi": (int(rssi) if rssi is not None else None), "live": bool(live)}
-
         last = self._last_ping_state.get(ip)
-
         changed = []
-
         if last is None:
-
             changed = ["on","bri","fx","color","signal","live"]
-
         else:
-
             if last.get("on") != state["on"]: changed.append("on")
-
             if last.get("bri") != state["bri"]: changed.append("bri")
-
             if last.get("fx") != state["fx"]: changed.append("fx")
-
             if last.get("color") != state["color"]: changed.append("color")
-
             lr, nr = last.get("rssi"), state.get("rssi")
-
             if lr is None and nr is not None: changed.append("signal")
-
             elif lr is not None and nr is None: changed.append("signal")
-
             elif lr is not None and nr is not None and abs(int(nr)-int(lr)) >= 10: changed.append("signal")
-
             if last.get("live") != state["live"]: changed.append("live")
 
         if not changed:
-
             return
 
         self._last_ping_state[ip] = state
-
         msg = f"Ping {name} ({ip}): "
-
         msg += "on=" + self._mark("on", changed, str(state["on"])) + " "
-
         msg += "bri=" + self._mark("bri", changed, state["bri"]) + " "
-
         msg += "fx=" + self._mark("fx", changed, state["fx"]) + " "
-
         msg += "color=" + self._mark("color", changed, state["color"])
-
         if state["rssi"] is not None:
-
             msg += " signal=" + self._mark("signal", changed, str(state["rssi"]) + "%")
-
         msg += " live=" + self._mark("live", changed, str(state["live"]))
-
         msg += "  Δ " + ",".join(changed)
-
-        self.log_unique(f"ping:{ip}", f"[DBG1] WLED PING {msg}", color="white")
+        full = f"[DBG1] WLED PING {msg}"
+        self.log_unique(f"ping:{ip}", full, color="white", debug=True)
 
 
     def _dbg_ledfx_poll(self, ip, vid, active, streaming, bri, effect_name):
-
-        if not self.debug_mode:
-
-            return
 
         state = {"active": bool(active), "streaming": bool(streaming), "bri": str(bri), "effect": str(effect_name)}
         state_key = f"{ip}:{vid}"
@@ -657,7 +835,8 @@ class WLEDApp:
 
         msg += "  Δ " + ",".join(changed)
 
-        self.log_unique(f"ledfx:{ip}:{vid}", f"[DBG2] LEDFX POLL {msg}", color="white")
+        full = f"[DBG2] LEDFX POLL {msg}"
+        self.log_unique(f"ledfx:{ip}:{vid}", full, color="white", debug=True)
 
 
     def copy_log(self, e):
@@ -760,6 +939,25 @@ class WLEDApp:
                     c["live_badge"].tooltip = "Click to re-activate in LedFx"
                     try: c["live_badge"].update()
                     except: pass
+                # ── Show grey LIVE badge on all MagicHome cards ──────────────
+                for ip, c in list(self.cards.items()):
+                    if c.get("_is_custom") or self.device_types.get(ip) != "magichome":
+                        continue
+                    if ip in self.mh_live_ips:
+                        continue  # already purple (shouldn't happen on fresh start)
+                    lb = c.get("live_badge")
+                    if lb:
+                        lb.visible  = True
+                        c["live_icon"].color = "grey500"
+                        c["live_text"].color = "grey500"
+                        lb.bgcolor  = "#1e1e2a"
+                        lb.border   = ft.border.all(1, "grey700")
+                        lb.tooltip  = "Click to sync this MagicHome device with LedFx"
+                        try: lb.update()
+                        except: pass
+                # Start bridge socket when LedFx starts so it's ready for any
+                # scene or badge click without delay.
+                threading.Thread(target=self._mh_start_bridge, daemon=True).start()
                 def _delayed_scene_fetch():
                     time.sleep(5)
                     if not self.running or not self.ledfx_running:
@@ -796,7 +994,7 @@ class WLEDApp:
                 self.ledfx_segment_vids.clear()
                 self._releasing_ips.clear()
                 self._ledfx_resolve_fails.clear()
-                # Hide all badges — both orange (live) and grey (inactive) — LedFx is gone
+                # Hide all badges — both purple (live) and grey (inactive) — LedFx is gone
                 for ip, c in list(self.cards.items()):
                     if c.get("_is_custom"): continue
                     if c.get("live_badge") and c["live_badge"].visible:
@@ -820,6 +1018,27 @@ class WLEDApp:
                             self.dbg(f"{ip} ping failed during release confirm: {e}")
                             # Ping failed — unlock anyway, heartbeat will correct
                             self.page.run_task(self._async_confirm_release, ip)
+                    # ── Release all MH bridge devices and restore their state ──
+                    mh_was_live = list(self.mh_live_ips)
+                    if mh_was_live:
+                        self.log(f"[MH Live] LedFx stopped — releasing {len(mh_was_live)} MH device(s)",
+                                 color="cyan")
+                    for mh_ip in mh_was_live:
+                        try:
+                            self._mh_stop_bulb_worker(mh_ip)
+                        except Exception:
+                            pass
+                        self._mh_restore_state(mh_ip)
+                        # Unlock controls — mirror the manual-release pattern exactly:
+                        # try call_from_thread first, fall back to direct call if it throws.
+                        try:
+                            self.page.call_from_thread(lambda i=mh_ip: self._mh_set_card_unlive_ui(i))
+                        except Exception:
+                            self._mh_set_card_unlive_ui(mh_ip)
+                    self.mh_live_ips.clear()
+                    # Stop bridge when LedFx exits — it owns the port
+                    self._mh_stop_bridge()
+                    self._mh_bridge_virtual_id = None
                     # Reset fail counts and resume heartbeat
                     for ip in list(self.cards.keys()):
                         self.fail_counts[ip] = 0
@@ -948,7 +1167,59 @@ class WLEDApp:
             return
 
     def _activate_ledfx_scene(self, scene_id, scene_name=None, remember=True, source="manual"):
+        # PATCHED: all ref.update() calls are now routed through _ui_call so
+        # they execute on the Flet event loop rather than whichever daemon
+        # thread calls this method.  _apply_ledfx_scene_glow is also wrapped.
         label = scene_name or self.ledfx_scenes.get(scene_id) or scene_id
+        # Increment LedFx generation so any in-flight LedFx scene worker knows it is superseded.
+        # WLED scene operations use a separate counter so they do not cancel each other.
+        self._ledfx_scene_generation += 1
+        my_gen = self._ledfx_scene_generation
+
+        # ── Loading state helpers — always routed through _ui_call ────────────
+        def _clear_ledfx_loading_states():
+            """Clear LOADING state from all scene buttons, restoring them to normal appearance."""
+            def _ui():
+                for sid, refs in self.ledfx_scene_btn_refs.items():
+                    for ref, name_text in refs:
+                        try:
+                            # Restore to stored label
+                            scene_label = self.ledfx_scenes.get(sid, str(sid))
+                            name_text.value = scene_label
+                            name_text.color = "purple200"
+                            ref.update()
+                        except Exception:
+                            pass
+            self._ui_call(_ui)
+
+        def _ledfx_btn_loading():
+            def _ui():
+                for ref, name_text in self.ledfx_scene_btn_refs.get(scene_id, []):
+                    try:
+                        name_text.value = "LOADING..."
+                        name_text.color = "grey400"
+                        ref.update()
+                    except Exception:
+                        pass
+            self._ui_call(_ui)
+
+        def _ledfx_btn_done():
+            def _ui():
+                for ref, name_text in self.ledfx_scene_btn_refs.get(scene_id, []):
+                    try:
+                        name_text.value = label
+                        name_text.color = "purple200"
+                        ref.update()
+                    except Exception:
+                        pass
+            self._ui_call(_ui)
+
+        # Clear any previous loading states, then show loading for the new scene
+        _clear_ledfx_loading_states()
+        _ledfx_btn_loading()  # show immediately on click
+
+        def _superseded():
+            return self._ledfx_scene_generation != my_gen
         # Wake only virtuals marked active inside the selected scene.
         scene_virtuals = self.ledfx_scene_virtuals.get(scene_id, {})
         wake_vids = [vid for vid, is_active in scene_virtuals.items() if is_active]
@@ -963,26 +1234,138 @@ class WLEDApp:
                     )
                 except Exception:
                     pass
+        if _superseded():
+            _ledfx_btn_done()
+            self.log(f"[LedFx Scene] '{label}' superseded before activation — aborting", color="grey500")
+            return False
         try:
             r = requests.put(
                 "http://localhost:8888/api/scenes",
                 json={"action": "activate", "id": scene_id},
                 timeout=3,
             )
+            if _superseded():
+                _ledfx_btn_done()
+                self.log(f"[LedFx Scene] '{label}' superseded after API call — skipping UI update", color="grey500")
+                return False
             if r.status_code in (200, 204):
                 self.active_ledfx_scene_id = scene_id
                 if remember and self.last_ledfx_scene_id != scene_id:
                     self.last_ledfx_scene_id = scene_id
                     self.save_cache()
-                self._apply_ledfx_scene_glow()
-                if source == "auto":
-                    self.log(f"[LedFx Auto] Restored last scene: '{label}'", color="purple")
-                else:
-                    self.log(f"[LedFx Scene] '{label}' activated", color="purple")
+                # PATCHED: glow update routed through _ui_call
+                self._ui_call(self._apply_ledfx_scene_glow)
+                # Power on any WLED devices whose virtuals are active in this scene.
+                # LedFx streams to them regardless of their power state, but the device
+                # must be ON to show the output.  We derive the IP from ledfx_virtual_map
+                # (populated by the poll loop) or the reverse lookup from wake_vids.
+                def _power_on_active_wled():
+                    # If live_ips is empty at call time (e.g. auto-restore fired before
+                    # the first poll loop ran), wait up to 8s for it to be populated.
+                    deadline = time.time() + 8.0
+                    while not self.live_ips and time.time() < deadline:
+                        time.sleep(0.5)
+
+                    # Candidates: WLED devices currently in live_ips.
+                    # wake_vids → ledfx_virtual_map is a secondary source for
+                    # devices that became active but haven't been polled yet.
+                    candidate_ips = set()
+
+                    for vid in wake_vids:
+                        ip = self.ledfx_virtual_map.get(vid)
+                        if ip:
+                            candidate_ips.add(ip)
+
+                    for ip in list(self.live_ips):
+                        if self.device_types.get(ip) == "wled":
+                            candidate_ips.add(ip)
+
+                    if not candidate_ips:
+                        self.log(f"[LedFx Scene] power-on: no live WLED devices found for '{label}'", color="grey500")
+                        return
+
+                    for ip in candidate_ips:
+                        if self.device_types.get(ip) != "wled":
+                            continue
+                        c = self.cards.get(ip)
+                        sw = c.get("switch") if c else None
+                        if sw and sw.value:
+                            continue  # already on
+                        bri = self.individual_brightness.get(ip, 128)
+                        _nm = c.get("name_label") if c else None
+                        _dname = _nm.value if _nm else ip
+                        self.log(f"[LedFx Scene] Powering on {_dname} for scene '{label}'", color="purple")
+                        try:
+                            requests.post(f"http://{ip}/json/state",
+                                          json={"on": True, "bri": bri}, timeout=2)
+                        except Exception as _e:
+                            self.log(f"[LedFx Scene] Power-on failed for {_dname}: {_e}", color="orange400")
+                # Determine up-front whether MHBridge is in this scene so the
+                # completion thread can reference it without a closure hazard.
+                _mh_vid = self._mh_bridge_virtual_id
+                _has_mh = bool(_mh_vid and _mh_vid in wake_vids)
+
+                def _activate_mh_for_scene():
+                    """Activate all MH devices for this scene (caller joins and clears loading)."""
+                    _all_mh = [
+                        _ip for _ip, _c in self.cards.items()
+                        if not _c.get("_is_custom")
+                        and self.device_types.get(_ip) == "magichome"
+                    ]
+                    self.log(f"[MH Live] Scene '{label}' includes MHBridge — activating {len(_all_mh)} device(s)", color="purple")
+                    if not self.mh_bridge_running:
+                        self._mh_start_bridge()
+                    _mh_threads = []
+                    _watchdog_events = []
+                    for _mh_ip in _all_mh:
+                        if _mh_ip not in self.mh_live_ips:
+                            # PATCHED: card UI mutation routed through _ui_call
+                            self._ui_call(lambda i=_mh_ip: self._mh_set_card_live(i))
+                            _de = threading.Event()
+                            _watchdog_events.append(_de)
+                            def _scene_activate(i=_mh_ip, de=_de):
+                                self.send_magic_home_cmd(i, [0x31, 1, 1, 1, 0x00, 0xF0, 0x0F])
+                                time.sleep(0.1)
+                                self.send_magic_home_cmd(i, [0x71, 0x23, 0x0F])  # power ON
+                                time.sleep(0.2)
+                                self._mh_start_bulb_worker(i)
+                                self._mh_live_watchdog(i, done_event=de)
+                            _t = threading.Thread(target=_scene_activate, daemon=True)
+                            _t.start()
+                            _mh_threads.append(_t)
+                    for _t in _mh_threads:
+                        _t.join(timeout=15)
+                    # Wait for all watchdogs to confirm devices are live before returning
+                    for _de in _watchdog_events:
+                        _de.wait(timeout=30)
+
+                def _completion_worker():
+                    """Wait for ALL post-activation work to finish, then clear loading.
+                    WLED power-on and MH activation run concurrently; both must finish
+                    before LOADING is removed so the button reflects true completion.
+                    PATCHED: _ledfx_btn_done() routes through _ui_call internally,
+                    so the ref.update() executes on the event loop, not this thread."""
+                    wled_t = threading.Thread(target=_power_on_active_wled, daemon=True)
+                    wled_t.start()
+                    if _has_mh:
+                        mh_t = threading.Thread(target=_activate_mh_for_scene, daemon=True)
+                        mh_t.start()
+                        mh_t.join(timeout=45)
+                    wled_t.join(timeout=12)
+                    if not _superseded():
+                        _ledfx_btn_done()
+                        if source == "auto":
+                            self.log(f"[LedFx Auto] Restored last scene: '{label}'", color="purple")
+                        else:
+                            self.log(f"[LedFx Scene] '{label}' activated", color="purple")
+
+                threading.Thread(target=_completion_worker, daemon=True).start()
                 return True
+            _ledfx_btn_done()
             self.log(f"[LedFx Scene] '{label}' failed: HTTP {r.status_code}", color="red400")
             return False
         except Exception as ex:
+            _ledfx_btn_done()
             self.log(f"[LedFx Scene] '{label}' error: {ex}", color="red400")
             return False
 
@@ -1109,12 +1492,10 @@ class WLEDApp:
             self.auto_restore_wled_scene = bool(self.exit_wled_scene_auto_cb.value)
         if self.exit_ledfx_scene_auto_cb is not None:
             self.auto_restore_ledfx_scene = bool(self.exit_ledfx_scene_auto_cb.value)
-
         if self.exit_wled_scene_auto_cb is not None:
             self.exit_wled_scene_auto_cb.value = self.auto_restore_wled_scene
         if self.exit_ledfx_scene_auto_cb is not None:
             self.exit_ledfx_scene_auto_cb.value = self.auto_restore_ledfx_scene
-
         if not self.auto_restore_ledfx_scene:
             self._pending_ledfx_scene_restore = False
         elif self.last_ledfx_scene_id:
@@ -2404,91 +2785,27 @@ class WLEDApp:
                 ),
                 ft.Divider(),
 
-                *_section("NEW FEATURES Added in V4.6.7", "#ff9800",
-                    "SPECTRUM ANALYZER (PC AUDIO)",
-                    "The header includes a live spectrum analyzer that reacts to your PC audio.",
-                    "Click the spectrum display or MIC icon to open Spectrum Settings.",
+                *_section("NEW FEATURES Added in V4.7.0", "#ff9800",
+                    "Added Music Reactive support for Magic Home Devices, not supported in LEDFX",
+                    "If Magic Home devices exist, and LEDFX running, WLEDCC automatically creates a MHBridge device registration in LEDFX.",
+                    "MHBridge is set to one pixel, and streams its effect data to WLEDCC.",  
+                    "WLEDCC then converts this to Magic Home codes and streams that to the controllers.",
+                    "Set this MHBridge Device to any LEDFX effect giving MagicHome devices music reactive effect support not found native in LEDFX.",
                     "",
-                    "SPECTRUM SETTINGS (MODES + TUNING).",
-                    "SENSITIVITY — Global analyzer gain.",
-                    "REACTIVITY — How fast bars rise on transients.",
-                    "BAR DECAY — How fast bars fall.",
-                    "PEAK DECAY — How fast peak markers fall.",
-                    "MODE — Classic, VU (L/R), Random (1 min), Random (Per Song).",
-                    "IDLE EFFECTS — Runs ambient visuals after silence timeout.",
-                    "IDLE EFFECT OPTIONS — Pac-Man, Tetris, Invaders, Snake and more.",
+                    "Full Debug logs are always written to file now, even if debug mode is turned off for console window.",
                     "",
-                    "SPECTRUM VISUAL EQ (UI ONLY)",
-                    "10-band visual EQ is available in Spectrum Settings.",
-                    "Presets: Flat, Bass+, Smile, Vocal.",
-                    "Important: This EQ only changes the analyzer visualization in WLEDCC.",
-                    "It does not change Windows audio output or device audio tone. (yet)",
+                    "Added STAR WARS idle effect.",
                     "",
-                    "LEDFX SCENES MODE",
-                    "Scene bar can switch between WLED scenes and LedFx scenes.",
-                    "Use the scene mode toggle button in the scene bar.",
-                    "When LedFx mode is selected, WLEDCC fetches current scenes from LedFx.",
-                    "If no scenes are returned, the row shows \"No LedFx scenes\".",
+                    "Added Many new VU meters and ability to make your own custom ones.",
                     "",
-                    "EXIT POPUP AUTOMATION (BEFORE CLOSING APP)",
-                    "Auto-run on exit options let you save one-click shutdown behavior:",
-                    "- Stop LedFx automatically on exit.",
-                    "- Run All Lights Off automatically on exit.",
-                    "Startup automation options are also saved here:",
-                    "- Auto-start LedFx on app launch.",
-                    "- Auto-load last WLED scene.",
-                    "- Auto-load last LedFx scene.",
-                    "",
-                    "CUSTOM CARD AUTOMATION",
-                    "Custom cards now include per-card automation checkboxes.",
-                    "- AUTO START: launches this card target when WLEDCC starts.",
-                    "- AUTO CLOSE / STOP ON EXIT: closes target when WLEDCC exits.",
-                    "",
-                    "SPOTIFY WEB CARD CONTROLS",
-                    "Spotify web cards show controls for:",
-                    "- Previous",
-                    "- Play/Pause",
-                    "- Next",
-                    "- Show Spotify Web UI",
-                    "Status line can show now-playing style feedback when available.",
-                    "",
-                    "WINAMP CARD CONTROLS + SETUP",
-                    "Winamp cards include controls for:",
-                    "- Previous, Play, Pause, Stop, Next",
-                    "If winamp.exe path is missing, WLEDCC offers:",
-                    "- Install WINAMP (legacy installer)",
-                    "- Browse to existing winamp.exe",
-                    "- Open Winamp downloads page",
-                    "",
-                    "DEFAULT QUICK CARDS",
-                    "On first run, WLEDCC will add default custom cards:",
-                    "- WINAMP",
-                    "- SPOTIFY.COM",
-                    "",
-                    "EDIT DEVICE IP",
-                    "Device IP can be edited directly from the card IP field.",
-                    "WLEDCC rebinds the device live to the new IP.",
-                    "Note: some controls may require app restart for full re-bind.",
-                    "",
-                    "LOG OPTIONS EXPANDED",
-                    "OPEN LOG now includes additional options:",
-                    "- DBG on open (turn debug on when log opens)",
-                    "- Auto-open (open log panel at app startup)",
-                    "- Save to disk (write current session logs to file)",
-                    "- BG updates (continue log/UI updates when app is not focused)",
-                    "",
-                    "BUG FIXES",
-                    "- Brightness sliders were not showing numberical value.",
-                    "- Devices now remember last color\\brightness between sessions",
-                    "- Reduced logs to one per session, 10 Max",
-                    "- Last used scene button border now glows",
-                    "",
-                    "",
+                    "Added timer so both VU meters and Idle effects can be controlled separately.",
+                    "",                   
                 ),
 
                 *_section("WHAT IS THIS PROGRAM?", "#00f2ff",
                     "WLED COMMAND CENTER+ lets you control all your WLED, LEDFX, MagicHome, and",
-                    "custom devices from one place. Devices are auto-discovered on startup.",
+                    "custom devices from one place. Control Winamp/Spotify while chilling to a",
+                    "30 band Spectrum Analyzer and L/R VU meter.  Devices are auto-discovered on startup.",
                     "It checks for new firmware for all your Devices and provides one click ",
                     "automatic installs.  All settings, names, scenes and card order are saved",
 					"and restored between sessions.  Reboot slow devices, Sanitize Presets,",
@@ -2497,10 +2814,20 @@ class WLEDApp:
 					"favorite WEB SITES, Program EXE's, etc and all from one screen.",
                     "Setup automatic actions — like starting/stopping LEDFX or turning lights on/off. ",
                     "Even Auto start and close for your favorite music apps or WEB SITES ",
-                    "with custom CARDS on the main screen.",
+                    "with custom CARDS on the main screen including Pre/Play/Pause/Next controls.",
 					"Truely a ALL-IN-ONE Control Center for your music room.",
                 ),
 				
+                *_section("SA AND VU METERS", "cyan",
+                    "MIC ICON - click to turn ON/OFF.",
+					"HAMBURGER ICON - Open Spectrum Analyzer Settings.",
+                    "Control FPS, Reactivity, select Meter to show and more.",
+					"Some meter modes allow custom backgrounds.  Select them from dropdown below.",
+					"You can even put your own jpg image files in app folder and load those.",
+					"CUSTOM VU - this mode only shows needles but allows you to load jpg for BG image.",
+                    "Set meters to be fixed, or change randomly when song ends or timer 1 min.",
+				),	
+
 				*_section("APP NAME BAR", "cyan",
                     "SLIDERS - Use to control SPEED or BRIGHTNESS for APP NAME and CARDS.",
 					"LEFT CONTROLS - APP NAME.", \
@@ -2575,7 +2902,11 @@ class WLEDApp:
 
                 *_section("MAGICHOME NOTES", "#00ff88",
                     "MagicHome devices support color and built-in effects only.",
-                    "No Sanitize or firmware update — those are WLED features.",
+                    "UNTIL NOW!  LEDFX support just added, giving you music reactive effects",
+                    "on MH devices for the first time.  Registers a MHBridge device in LEDFX ",
+                    "that streams effect data to WLEDCC, which converts it to MH codes and sends them",
+                    "to your MH devices.  Edit this MHBridge device in LEDFX to set effects.",
+                    "Your milage may vary.  Adjust device FPS and effect decay speed for best results.",
                     "COLOR PICKER changes switch back to static mode automatically.",
                     "EFFECTS PICKER lets you select from 21 built-in patterns.",
                     "BRIGHTNESS SLIDER — works in static color mode. In effect mode, slider = speed.",
@@ -2961,6 +3292,46 @@ class WLEDApp:
             content=self._spec_graphics_layer,
             padding=ft.padding.only(left=8, right=8, top=6, bottom=6),
         )
+
+        # ── Neon VU Meter host (canvas-based: Stack → bg image + cv.Canvas) ──
+        # Asset paths — swap these strings for your own files at any time.
+        #   Mode A "Retro-Tech"  → brushed metal.jpg   (orange / red needles)
+        #   Mode B "Neon Drift"  → nebula space.jpg     (cyan / magenta needles)
+        _nvu_bg_src = self._spec_nvu_drift_bg if self._neon_vu_theme == "neon_drift" else self._spec_nvu_retro_bg
+        # Build canvas surface (graceful no-op if cv module is unavailable)
+        if cv is not None:
+            _nvu_canvas = cv.Canvas(shapes=[], width=300, height=62)
+        else:
+            _nvu_canvas = ft.Container(width=300, height=62, bgcolor="transparent")
+        self._neon_vu_canvas = _nvu_canvas
+        # Background image — ft.ImageFit.COVER fills the box without distortion.
+        # If the asset file doesn't exist yet the image is hidden (visible=False)
+        # so Flet never tries to reload it, eliminating any image-error flicker.
+        _nvu_bg_file_exists = (_nvu_bg_src != "BLANK") and os.path.isfile(os.path.join(_VERSION_DIR, _nvu_bg_src))
+        self._neon_vu_bg_image = ft.Image(
+            src=_nvu_bg_src if _nvu_bg_file_exists else "",
+            visible=_nvu_bg_file_exists,
+            fit=ft.ImageFit.COVER,
+            width=300,
+            height=62,
+            opacity=0.80,
+        )
+        # Outer host: solid dark bgcolor acts as permanent background fallback
+        # (visible even when the image is absent or still loading).
+        # HARD_EDGE clip prevents needle arcs from bleeding outside the header box.
+        self._neon_vu_host = ft.Container(
+            width=300,
+            height=62,
+            bgcolor="#07071a",          # deep space dark — visible when no image
+            clip_behavior=ft.ClipBehavior.HARD_EDGE,
+            content=ft.Stack(
+                controls=[self._neon_vu_bg_image, _nvu_canvas],
+                width=300,
+                height=62,
+                clip_behavior=ft.ClipBehavior.HARD_EDGE,
+            ),
+        )
+
         self._spectrum_box = ft.Container(
             bgcolor="#060606",
             border=ft.border.all(1, "#2b2b2b"),
@@ -3501,7 +3872,10 @@ class WLEDApp:
         )
         if scene_id not in self.ledfx_scene_btn_refs:
             self.ledfx_scene_btn_refs[scene_id] = []
-        self.ledfx_scene_btn_refs[scene_id].append(btn)
+        # Store (container, name_text) — same shape as WLED scene_btn_refs
+        # so _activate_ledfx_scene can show LOADING... on the button.
+        _name_text = btn.content.controls[0].content
+        self.ledfx_scene_btn_refs[scene_id].append((btn, _name_text))
         return btn
 
     def _apply_ledfx_scene_glow(self):
@@ -3509,7 +3883,7 @@ class WLEDApp:
         active = self.active_ledfx_scene_id
         glow_color = self.border_color if self.border_color else self._hue_to_hex(self.rainbow_hue)
         for scene_id, refs in list(self.ledfx_scene_btn_refs.items()):
-            for ref in refs:
+            for ref, _nt in refs:
                 try:
                     ref.border = ft.border.all(1, glow_color if active is not None and scene_id == active else "purple700")
                     ref.update()
@@ -4143,18 +4517,14 @@ class WLEDApp:
                 try:
                     hwnd = win32gui.FindWindow("Winamp v1.x", None)
                     if hwnd:
-                        win32gui.SendMessage(hwnd, win32con.WM_COMMAND, 40048, 0)
-                        self.log("[App] Sent PLAY + NEXT to Winamp", color="cyan")
-                        time.sleep(0.08)
-                        win32gui.SendMessage(hwnd, win32con.WM_COMMAND, 40045, 0)
-                        # Nudge once to avoid occasional first-track stickiness;
-                        # Winamp's own random mode picks the song after this.
-                        """  win32gui.SendMessage(hwnd, win32con.WM_COMMAND, 40045, 0)
+                        #ppp temp disable - using winamp setings instead.
+                        #win32gui.SendMessage(hwnd, win32con.WM_COMMAND, 40045, 0)
                         # Nudge once to avoid occasional first-track stickiness;
                         # Winamp's own random mode picks the song after this.
                         time.sleep(0.08)
-                        win32gui.SendMessage(hwnd, win32con.WM_COMMAND, 40048, 0)
-                        self.log("[App] Sent PLAY + NEXT to Winamp", color="cyan") """
+                        #ppp temp disable - using winamp setings instead.
+                        #win32gui.SendMessage(hwnd, win32con.WM_COMMAND, 40048, 0)
+                        #self.log("[App] Sent PLAY + NEXT to Winamp", color="cyan")
                         return
                 except:
                     pass
@@ -4176,6 +4546,15 @@ class WLEDApp:
                 return
             win32gui.SendMessage(hwnd, win32con.WM_COMMAND, int(command_id), 0)
             self.log(f"[Winamp] {action_label} — '{name}'", color="cyan")
+            # Winamp only flushes "remember last song" state to winamp.ini when
+            # commands come through its own UI.  External WM_COMMAND messages change
+            # the track but skip that flush, so closing Winamp reverts to whatever
+            # was playing last via its own controls.
+            # IPC_WRITEPLAYLIST (WM_USER + 251) forces Winamp to write its current
+            # playlist position to disk, making both control paths behave the same.
+            IPC_WRITEPLAYLIST = 251
+            time.sleep(0.15)  # let Winamp finish processing the command first
+            win32gui.SendMessage(hwnd, win32con.WM_USER, 0, IPC_WRITEPLAYLIST)
         except Exception as ex:
             self.log(f"[Winamp] {action_label} failed for '{name}': {ex}", color="red400")
 
@@ -4657,10 +5036,28 @@ class WLEDApp:
             return []
 
     def _log_spotify_window_titles(self, source, titles):
-        """Debug-only log for Spotify-related window titles, only when changed."""
-        if not bool(getattr(self, "debug_mode", False)):
-            return
+        """Debug-only log for Spotify-related window titles, only when changed.
+        If Spotify is not running, logs a single quiet line instead of dumping
+        all browser tab titles."""
         try:
+            # Check if Spotify exe is actually running before logging tab contents.
+            # When Spotify is not running the tab list is just noise — every open
+            # browser tab gets dumped, which is not useful.
+            _spotify_exe_up = any(
+                (p.info.get("name") or "").lower() == "spotify.exe"
+                for p in psutil.process_iter(["name"])
+            )
+            if not _spotify_exe_up:
+                # Only log once per source when Spotify is absent, not every scan
+                _absent_key = f"{source}:absent"
+                if self._spotify_title_log_cache.get(_absent_key) != True:
+                    self._spotify_title_log_cache[_absent_key] = True
+                    self._spotify_title_log_cache.pop(source, None)  # reset so next run logs fresh
+                    self.log(f"[Spotify][TabScan:{source}] Spotify not running — skipping tab scan", color="grey500", debug=True)
+                return
+            # Spotify is running — clear the absent flag so next absence logs again
+            self._spotify_title_log_cache.pop(f"{source}:absent", None)
+
             _vals = []
             _seen = set()
             for _t in (titles or []):
@@ -4674,7 +5071,8 @@ class WLEDApp:
             if _sig == _prev_sig:
                 return
             self._spotify_title_log_cache[source] = _sig
-            self.log(f"[Spotify][TabScan:{source}] {_sig}", color="grey500")
+            _msg = f"[Spotify][TabScan:{source}] {_sig}"
+            self.log(_msg, color="grey500", debug=True)
         except Exception:
             pass
 
@@ -5604,6 +6002,25 @@ class WLEDApp:
                             matches = True
                     if not matches:
                         continue
+                    # For Winamp: flush state then close gracefully so it
+                    # remembers the last track played via this app.
+                    # proc.terminate() is a hard kill that skips that flush.
+                    if self._is_winamp_target(target):
+                        try:
+                            hwnd = win32gui.FindWindow("Winamp v1.x", None)
+                            if hwnd:
+                                IPC_WRITEPLAYLIST = 251
+                                win32gui.SendMessage(hwnd, win32con.WM_USER, 0, IPC_WRITEPLAYLIST)
+                                time.sleep(0.15)
+                                win32gui.SendMessage(hwnd, win32con.WM_CLOSE, 0, 0)
+                                try:
+                                    proc.wait(timeout=3)
+                                    stopped = True
+                                    continue
+                                except Exception:
+                                    pass  # didn't exit cleanly — fall through to terminate
+                        except Exception:
+                            pass  # window gone or error — fall through to terminate
                     proc.terminate()
                     try:
                         proc.wait(timeout=2)
@@ -6377,6 +6794,10 @@ class WLEDApp:
             return
         done_event = threading.Event()
         result = {"failed": None}
+        # Increment WLED generation so any in-flight WLED scene worker knows it has been superseded.
+        # LedFx scene operations use a separate counter so they do not cancel each other.
+        self._wled_scene_generation += 1
+        my_gen = self._wled_scene_generation
         self.log(f"[Scene] Activating '{scene['name']}'...")
         # Reset old active scene border then set new one (refs is a list — one per layout row)
         old = self.active_scene_idx
@@ -6400,7 +6821,10 @@ class WLEDApp:
                 except: pass
 
                 
-        def _apply():
+        def _apply(gen=my_gen):
+            def _superseded():
+                """Return True if a newer WLED scene request has arrived."""
+                return self._wled_scene_generation != gen
             try:
                 scene_name = scene["name"]
 
@@ -6564,6 +6988,18 @@ class WLEDApp:
                 # ----------------------------
                 # Phase 1: DISPATCH (fast)
                 # ----------------------------
+                if _superseded():
+                    self.log(f"[Scene] '{scene_name}' superseded before dispatch — aborting", color="grey500")
+                    # Restore LOADING button text to scene name so it doesn't get stuck
+                    if idx in self.scene_btn_refs:
+                        for ref, name_text in self.scene_btn_refs[idx]:
+                            try:
+                                name_text.value = scene_name
+                                name_text.color = "#00f2ff"
+                                ref.update()
+                            except: pass
+                    return
+
                 self.log(f"[Scene] Dispatching '{scene_name}' to devices...", color="grey400")
 
                 for key, st in scene["data"].items():
@@ -6621,6 +7057,17 @@ class WLEDApp:
                     if not pending:
                         break
 
+                    if _superseded():
+                        self.log(f"[Scene] '{scene_name}' superseded during reconcile — aborting", color="grey500")
+                        if idx in self.scene_btn_refs:
+                            for ref, name_text in self.scene_btn_refs[idx]:
+                                try:
+                                    name_text.value = scene_name
+                                    name_text.color = "#00f2ff"
+                                    ref.update()
+                                except: pass
+                        return
+
                     self.dbg_unique("scene_round",
                         f"[Scene][DBG] Reconcile round {r}/{max_rounds}: pending={len(pending)}",
                         color="grey500")
@@ -6674,6 +7121,20 @@ class WLEDApp:
                     self.log(f"[Scene] '{scene_name}' activated.", color="green400")
 
                 # Button feedback (fixed: use scene_btn_refs[idx], not a typo)
+                # Don't overwrite button text if a newer scene has already started
+                if _superseded():
+                    self.log(f"[Scene] '{scene_name}' superseded after reconcile — skipping UI update", color="grey500")
+                    # Restore LOADING text so the button doesn't stay stuck (the newer scene's
+                    # activate_scene only resets the border, not the label, when it takes over)
+                    if idx in self.scene_btn_refs:
+                        for ref, name_text in self.scene_btn_refs[idx]:
+                            try:
+                                name_text.value = scene_name
+                                name_text.color = "#00f2ff"
+                                ref.update()
+                            except:
+                                pass
+                    return
                 result_text = f"✗ {len(failed)} failed" if failed else "✓ Done"
                 result_color = "red400" if failed else "green400"
 
@@ -6820,6 +7281,12 @@ class WLEDApp:
         self.ledfx_devices.discard(ip)
         self.poll_counters.pop(ip, None)
         self.live_ips.discard(ip)
+        # MH bridge cleanup
+        self.mh_live_ips.discard(ip)
+        self._mh_stop_bulb_worker(ip)
+        self._mh_ledfx_device_ids.pop(ip, None)
+        if not self.mh_live_ips:
+            self._mh_stop_bridge()
         self.save_cache()
         self.log(f"Removed device '{name}' ({ip})")
         try: self.page.update()
@@ -7929,7 +8396,7 @@ class WLEDApp:
                 ip = getattr(ctrl, "data", None)
                 if ip and ip in self.cards:
                     c = self.cards[ip]
-                    if (c.get("_is_custom") and c.get("_is_active")) or c.get("_glow_state") == "on" or ip in self.live_ips:
+                    if (c.get("_is_custom") and c.get("_is_active")) or c.get("_glow_state") == "on" or ip in self.live_ips or ip in self.mh_live_ips:
                         _ordered.append((ip, c))
             _card_count = len(_ordered)
             _any = False
@@ -8009,7 +8476,7 @@ class WLEDApp:
             led_active = self.active_ledfx_scene_id
             if led_active is not None and led_active in self.ledfx_scene_btn_refs:
                 _sc = border_color if border_color else self._hue_to_hex(_border_hue)
-                for ref in self.ledfx_scene_btn_refs[led_active]:
+                for ref, _nt in self.ledfx_scene_btn_refs[led_active]:
                     try:
                         ref.border = ft.border.all(1, _sc)
                         ref.update()
@@ -8020,9 +8487,8 @@ class WLEDApp:
             try:
                 _now = time.monotonic()
                 _spec_c = border_color if border_color else self._hue_to_hex(_border_hue)
-                _audio_recent = (_now - float(getattr(self, "_spec_last_audio_ts", 0.0))) <= 1.0
-                _active_audio = _audio_recent and (not bool(getattr(self, "_spec_idle_active", False)))
-                if _active_audio:
+                _sampling_on = bool(getattr(self, "_spec_sampling_enabled", True))
+                if _sampling_on:
                     self._spectrum_box.border = ft.border.all(2, _spec_c)
                 else:
                     self._spectrum_box.border = ft.border.all(1, self._dim_hex(_spec_c, 0.55))
@@ -8071,22 +8537,29 @@ class WLEDApp:
             time.sleep(0.1)
 
     def _set_spectrum_render_mode(self, mode):
-        """Switch analyzer surface between pixel-grid mode and regular graphics mode."""
-        _target = "graphics" if str(mode).lower() == "graphics" else "grid"
+        """Switch analyzer surface: 'grid' | 'graphics' | 'neon_vu'."""
+        _m = str(mode).lower()
+        _target = _m if _m in ("graphics", "neon_vu") else "grid"
         if self._spec_render_mode == _target:
             return
 
-        if _target == "graphics":
+        if _target == "neon_vu":
+            # Canvas-based Neon VU Meter — same box dimensions as graphics mode.
             self._spectrum_box.padding = ft.padding.all(0)
-            self._spectrum_box.width = self._spec_box_graphics_size[0]
-            self._spectrum_box.height = self._spec_box_graphics_size[1]
+            self._spectrum_box.width   = 300
+            self._spectrum_box.height  = 62
+            self._spectrum_box.content = self._neon_vu_host
+        elif _target == "graphics":
+            self._spectrum_box.padding = ft.padding.all(0)
+            self._spectrum_box.width   = self._spec_box_graphics_size[0]
+            self._spectrum_box.height  = self._spec_box_graphics_size[1]
             self._spectrum_box.content = self._spec_graphics_host
-            self._spec_graphics_ready = False
+            self._spec_graphics_ready  = False
             self._spec_graphics_view_size = (0, 0)
         else:
             self._spectrum_box.padding = ft.padding.symmetric(horizontal=6, vertical=4)
-            self._spectrum_box.width = self._spec_box_grid_size[0]
-            self._spectrum_box.height = self._spec_box_grid_size[1]
+            self._spectrum_box.width   = self._spec_box_grid_size[0]
+            self._spectrum_box.height  = self._spec_box_grid_size[1]
             self._spectrum_box.content = self._spec_grid_content
 
         self._spec_render_mode = _target
@@ -8262,18 +8735,37 @@ class WLEDApp:
         if not self._spec_segments:
             return
 
+        # ── Advance random modes (processed even if idle effect is about to render) ──
+        _mode = str(self._spec_mode or "classic").lower()
+        if _mode == "random":
+            _now = time.monotonic()
+            if _now >= float(self._spec_mode_random_next_ts):
+                self._advance_spectrum_random_mode()
+                self._spec_mode_random_next_ts = _now + max(1.0, float(self._spec_mode_random_cycle_seconds))
+            _mode = self._spec_mode_random_current
+        elif _mode == "random_song":
+            _now = time.monotonic()
+            # Trigger only once per song when silence timeout is reached
+            if self._spec_mode_song_switch_armed and ((_now - float(self._spec_last_audio_ts)) >= float(self._spec_mode_song_silence_seconds)):
+                self._advance_spectrum_random_mode()
+                self._spec_mode_song_switch_armed = False  # Locked until sound is detected again
+            _mode = self._spec_mode_random_current
+
         if self._spec_idle_active:
             _idle_fx = str(self._spec_idle_effect or "random").lower()
             if _idle_fx == "random":
                 _now = time.monotonic()
-                if _now >= float(self._spec_idle_random_next_ts):
+                if _now >= float(self._spec_idle_random_next_ts) and self._spec_idle_cycle_done:
                     _choices = list(getattr(self, "_spec_idle_cycle_effects", []))
                     if not _choices:
-                        _choices = ["aurora", "pulse", "text", "rainbow", "pacman", "tetris", "invaders", "snake", "starwars"]
+                        _choices = ["pulse", "text", "pacman", "tetris", "invaders", "snake", "starwars"]
                     if self._spec_idle_random_current in _choices and len(_choices) > 1:
                         _choices = [x for x in _choices if x != self._spec_idle_random_current]
                     self._spec_idle_random_current = random.choice(_choices)
                     self._spec_idle_random_next_ts = _now + max(0.1, float(self._spec_idle_random_cycle_seconds))
+                    self._spec_idle_cycle_done = False
+                    self._spec_idle_phase = 0.0
+                    self._spec_idle_scroll = 0
                 _idle_fx = self._spec_idle_random_current
 
             if _idle_fx == "starwars":
@@ -8286,8 +8778,6 @@ class WLEDApp:
                 self._render_spectrum_idle_text()
             elif _idle_fx == "pulse":
                 self._render_spectrum_idle_pulse()
-            elif _idle_fx == "rainbow":
-                self._render_spectrum_idle_rainbow_wave()
             elif _idle_fx == "pacman":
                 self._render_spectrum_idle_pacman()
             elif _idle_fx == "tetris":
@@ -8297,27 +8787,49 @@ class WLEDApp:
             elif _idle_fx == "snake":
                 self._render_spectrum_idle_snake()
             else:
-                self._render_spectrum_idle_aurora()
+                self._render_spectrum_idle_pulse()
+            return
+
+        # ── neon_vu must be checked BEFORE set_spectrum_render_mode("grid") ──
+        # Calling set_spectrum_render_mode("grid") triggers _spectrum_box.update(),
+        # which would flash the old pixel grid for one frame on every render tick.
+        if _mode in ("neon_drift", "retro_tech", "custom_vu", "neon_vu"):
+            if _mode == "neon_drift":
+                self._neon_vu_theme = "neon_drift"
+                _bg = self._spec_nvu_drift_bg
+            elif _mode == "retro_tech":
+                self._neon_vu_theme = "retro_tech"
+                _bg = self._spec_nvu_retro_bg
+            elif _mode == "custom_vu":
+                self._neon_vu_theme = "custom_vu"
+                _bg = self._spec_nvu_custom_bg
+            else: # legacy
+                _bg = self._spec_nvu_drift_bg if self._neon_vu_theme == "neon_drift" else self._spec_nvu_retro_bg
+
+            if self._neon_vu_bg_image:
+                _v = (_bg != "BLANK") and os.path.isfile(os.path.join(_VERSION_DIR, _bg))
+                _s = _bg if _v else ""
+                # If force_reload is true, append a timestamp to bypass Flet's internal image cache.
+                if getattr(self, "_spec_nvu_bg_force_reload", False):
+                    _s = f"{_s}?t={time.time()}" if _s else ""
+
+                if self._neon_vu_bg_image.src != _s or self._neon_vu_bg_image.visible != _v:
+                    self._spec_nvu_bg_force_reload = False
+                    self._neon_vu_bg_image.src = _s
+                    self._neon_vu_bg_image.visible = _v
+                    try: self._neon_vu_bg_image.update()
+                    except: pass
+
+            self._set_spectrum_render_mode("neon_vu")
+            self._render_spectrum_neon_vu()
             return
 
         self._set_spectrum_render_mode("grid")
 
-        _mode = str(self._spec_mode or "classic").lower()
-        if _mode == "random":
-            _now = time.monotonic()
-            if _now >= float(self._spec_mode_random_next_ts):
-                self._advance_spectrum_random_mode()
-                self._spec_mode_random_next_ts = _now + max(1.0, float(self._spec_mode_random_cycle_seconds))
-            _mode = self._spec_mode_random_current
-        elif _mode == "random_song":
-            _now = time.monotonic()
-            if self._spec_mode_song_switch_armed and ((_now - float(self._spec_last_audio_ts)) >= float(self._spec_mode_song_silence_seconds)):
-                self._advance_spectrum_random_mode()
-                self._spec_mode_song_switch_armed = False
-            _mode = self._spec_mode_random_current
-
         if _mode == "vu":
             self._render_spectrum_vu()
+        elif _mode == "cyber_city":
+            self._render_spectrum_cybercity()
         else:
             # Classic mode: vertical bars, left to right
             self._render_spectrum_classic()
@@ -8327,8 +8839,49 @@ class WLEDApp:
         except Exception:
             pass
 
+    def _render_spectrum_cybercity(self):
+        """Cyber City mode: bands become glowing buildings with flickering windows."""
+        _analysis_count = max(1, len(self._spec_bars))
+        _bands = self._spec_bands
+        _levels = self._spec_levels
+        _now = time.monotonic()
+
+        for bi, segs in enumerate(self._spec_segments):
+            _src_i = min(_analysis_count - 1, int((bi * _analysis_count) / max(1, _bands)))
+            val = self._spec_bars[_src_i]
+            peak = self._spec_peaks[_src_i]
+            
+            fill_h = int(val * _levels)
+            peak_h = int(peak * (_levels - 1))
+            
+            for top_idx, seg in enumerate(segs):
+                y = _levels - 1 - top_idx # height from bottom
+                
+                if y == peak_h and peak_h > 0:
+                    seg.bgcolor = "#ff3030" # Neon Red helipad/beacon
+                elif y < peak_h:
+                    # Building facade logic: windows every 2nd pixel
+                    if (y % 2 == 0) and (bi % 2 == 0):
+                        if y < fill_h:
+                            # Below current volume: localized flickering
+                            _val = math.sin(_now * 3.5 + bi * 0.5 + y)
+                            if _val > -0.8:
+                                seg.bgcolor = "#00f2ff" # Active Cyan window
+                            else:
+                                seg.bgcolor = "#333333" # Unlit Grey window
+                        else:
+                            # Above current volume but below peak: static unlit window
+                            seg.bgcolor = "#333333"
+                    else:
+                        # Building shadow/dark facade
+                        seg.bgcolor = "#0a0a20"
+                else:
+                    seg.bgcolor = "#050505" # Night sky
+
     def _advance_spectrum_random_mode(self):
-        _choices = ["classic", "vu"]
+        _choices = list(getattr(self, "_spec_mode_cycle_choices", []))
+        if not _choices:
+            _choices = ["classic", "vu", "cyber_city", "neon_drift", "retro_tech", "custom_vu"]
         if self._spec_mode_random_current in _choices and len(_choices) > 1:
             _choices = [x for x in _choices if x != self._spec_mode_random_current]
         self._spec_mode_random_current = random.choice(_choices)
@@ -8446,6 +8999,278 @@ class WLEDApp:
                         if 0 <= _row < self._spec_levels and _r_rows[_ry][_gx] == "1":
                             segs[_row].bgcolor = "#8a8a8a"
 
+    def _render_spectrum_neon_vu(self):
+        """
+        Neon VU Meter — high-performance dual arc gauge with glowing needles.
+
+        Rendered each frame via a single ft.canvas.Canvas update.
+        The background image and host container remain static; only the
+        canvas shapes list is rebuilt and pushed (O(n) for ~35 shapes).
+
+        Geometry (fits the existing 300 × 62 px spectrum header box)
+        ─────────────────────────────────────────────────────────────
+          Pivot:   (75, 80) for Left,  (225, 80) for Right
+                   — pivot sits 18 px *below* the canvas bottom edge.
+                   In screen coords (Y↓) sin(210°…330°) is negative,
+                   so all needle/arc points land *above* the pivot → inside canvas.
+          Radius:  62 px
+          Arc:     210° → 330°  (120° sweep, math/CCW from positive-X)
+                   210° maps to 0.0 signal (upper-left)
+                   330° maps to 1.0 signal (upper-right)
+
+        Ballistics
+        ──────────
+          current = (raw × 0.30) + (prev × 0.70)
+          0.30 attack  → needle springs fast toward the signal peak
+          0.70 release → heavy inertia on the way down (classic VU feel)
+
+        Glow Effect
+        ───────────
+          Three cv.Line passes per needle, decreasing stroke_width and
+          increasing opacity — no MaskFilter dependency, works on all
+          current Flet / Skia back-ends.
+        """
+        if cv is None or self._neon_vu_canvas is None:
+            return
+
+        # ── Colour palette per theme ──────────────────────────────────────
+        _theme = getattr(self, "_neon_vu_theme", "neon_drift")
+        if _theme == "retro_tech":
+            _col_l   = "#FF7700"    # Left needle  — Vintage Orange
+            _col_r   = "#FF7700"    # Right needle — Vintage Orange
+            _arc_col = "#E0E0E0"    # Scale arc    — off-white
+        elif _theme == "custom_vu":
+            _col_l   = "#000000"    # Black needles
+            _col_r   = "#000000"
+            _arc_col = "transparent"
+        else:                       # "neon_drift" (default)
+            _col_l   = "#00FFFF"    # Left needle  — Cyan
+            _col_r   = "#00FFFF"    # Right needle — Cyan
+            _arc_col = "#6600FF"    # Scale arc    — futuristic indigo-purple
+
+        # ── Ballistics — weighted average (attack 0.30 / release 0.70) ───
+        _ATT, _REL = 0.30, 0.70
+        _raw_l = max(0.0, min(1.0, float(self._spec_vu_left  or 0.0)))
+        _raw_r = max(0.0, min(1.0, float(self._spec_vu_right or 0.0)))
+        self._neon_vu_left_smooth  = _raw_l * _ATT + self._neon_vu_left_smooth  * _REL
+        self._neon_vu_right_smooth = _raw_r * _ATT + self._neon_vu_right_smooth * _REL
+
+        # ── Geometry constants ────────────────────────────────────────────
+        _CX_L      = 75           # Left  meter pivot X (px)
+        _CX_R      = 225          # Right meter pivot X (px)
+        _CY        = 86           # Adjusted pivot Y to bring labels on-screen
+        _R         = 76           # Radius optimized for 300x62 header box
+        _ANG_START = 210.0        # 0.0 signal → upper-left  (degrees, math/CCW)
+        _ANG_END   = 330.0        # 1.0 signal → upper-right
+        _ANG_SPAN  = _ANG_END - _ANG_START   # 120°
+
+        def _ang(val):
+            """Map normalised 0.0–1.0 → arc angle in degrees."""
+            return _ANG_START + max(0.0, min(1.0, float(val))) * _ANG_SPAN
+
+        def _pt(cx, r, angle_deg):
+            """Canvas point at arc position: (cx + r·cos θ,  _CY + r·sin θ)."""
+            rad = math.radians(angle_deg)
+            return cx + r * math.cos(rad), _CY + r * math.sin(rad)
+
+        shapes = []
+        _is_retro = (_theme == "retro_tech")
+        _is_custom = (_theme == "custom_vu")
+
+        # ── Background HUD elements (Neon Drift only) ────────────────────
+        if not _is_retro and not _is_custom:
+            for _cx in (_CX_L, _CX_R):
+                # Subtle concentric radar rings for that HUD feel
+                for _rad_off in [22, 45, 68]:
+                    shapes.append(cv.Circle(
+                        x=float(_cx), y=float(_CY), radius=float(_rad_off),
+                        paint=ft.Paint(color=ft.Colors.with_opacity(0.12, "#00FFFF"), 
+                                     stroke_width=0.8, style=ft.PaintingStyle.STROKE)
+                    ))
+
+        # ── Scale labels (Numbers and L/R) ────────────────────────────────
+        if _is_retro:
+            _num_labels = [(-20, 0.0), (-10, 0.25), (-5, 0.5), (0, 0.75), ("+3", 1.0)]
+            for _cx, _side_label in [(_CX_L, "L"), (_CX_R, "R")]:
+                # Draw L/R
+                shapes.append(cv.Text(
+                    x=_cx, y=_CY - 42, text=_side_label,
+                    style=ft.TextStyle(size=10, weight=ft.FontWeight.BOLD, color="white60"),
+                    alignment=ft.alignment.center
+                ))
+                # Draw Scale Numbers
+                for _txt, _v in _num_labels:
+                    _lx, _ly = _pt(_cx, _R + 1, _ang(_v))
+                    shapes.append(cv.Text(
+                        x=_lx, y=_ly, text=str(_txt),
+                        style=ft.TextStyle(size=6.5, color="white38"),
+                        alignment=ft.alignment.center
+                    ))
+        elif not _is_custom:
+            # Neon digital HUD labels
+            _num_labels = [("-20", 0.0), ("-10", 0.25), ("-5", 0.5), ("0", 0.75), ("+3", 1.0)]
+            for _cx, _side_label in [(_CX_L, "L-CH"), (_CX_R, "R-CH")]:
+                # Glowing Cyan Channel ID
+                shapes.append(cv.Text(
+                    x=_cx, y=_CY - 44, text=_side_label,
+                    style=ft.TextStyle(size=9, weight=ft.FontWeight.BOLD, color="#00FFFF", italic=True),
+                    alignment=ft.alignment.center
+                ))
+                # Neon Magenta scale markers
+                for _txt, _v in _num_labels:
+                    _lx, _ly = _pt(_cx, _R + 1, _ang(_v))
+                    shapes.append(cv.Text(
+                        x=_lx, y=_ly, text=str(_txt),
+                        style=ft.TextStyle(size=6.2, color="#FF00FF", weight=ft.FontWeight.W_600),
+                        alignment=ft.alignment.center
+                    ))
+
+        # ── Arc gauge tracks ──────────────────────────────────────────────
+        if not _is_custom:
+            for _cx in (_CX_L, _CX_R):
+                if _is_retro:
+                    # Draw main black baseline arc for retro look
+                    shapes.append(cv.Circle(
+                        x=_cx, y=_CY, radius=_R - 5,
+                        paint=ft.Paint(color="white10", stroke_width=1, style=ft.PaintingStyle.STROKE)
+                    ))
+                    continue
+                # Neon HUD Arc: Thick indigo base glow with a sharp cyan rail
+                _pts_base = []
+                for _a in range(int(_ANG_START), int(_ANG_END) + 1, 5):
+                    px, py = _pt(_cx, _R - 5, _a)
+                    if _pts_base: _pts_base.append(cv.Path.LineTo(px, py))
+                    else: _pts_base.append(cv.Path.MoveTo(px, py))
+                shapes.append(cv.Path(
+                    elements=_pts_base,
+                    paint=ft.Paint(
+                        color=ft.Colors.with_opacity(0.35, _arc_col),
+                        stroke_width=5,
+                        style=ft.PaintingStyle.STROKE,
+                    ),
+                ))
+                # Split sharp rail: Cyan up to 0, Magenta above 0
+                _ang_zero = _ang(0.75)
+                # Cyan segment
+                _pts_c = []
+                for _a in range(int(_ANG_START), int(_ang_zero) + 1, 2):
+                    px, py = _pt(_cx, _R - 5, _a)
+                    if _pts_c: _pts_c.append(cv.Path.LineTo(px, py))
+                    else: _pts_c.append(cv.Path.MoveTo(px, py))
+                if _pts_c:
+                    shapes.append(cv.Path(
+                        elements=_pts_c,
+                        paint=ft.Paint(
+                            color=ft.Colors.with_opacity(0.85, "#00FFFF"),
+                            stroke_width=1.2,
+                            style=ft.PaintingStyle.STROKE,
+                        ),
+                    ))
+                # Magenta segment
+                _pts_m = []
+                for _a in range(int(_ang_zero), int(_ANG_END) + 1, 2):
+                    px, py = _pt(_cx, _R - 5, _a)
+                    if _pts_m: _pts_m.append(cv.Path.LineTo(px, py))
+                    else: _pts_m.append(cv.Path.MoveTo(px, py))
+                if _pts_m:
+                    shapes.append(cv.Path(
+                        elements=_pts_m,
+                        paint=ft.Paint(
+                            color=ft.Colors.with_opacity(0.85, "#FF00FF"),
+                            stroke_width=1.2,
+                            style=ft.PaintingStyle.STROKE,
+                        ),
+                    ))
+
+        # ── Scale tick marks / Value lines ────────────────────────────────
+        if not _is_custom:
+            for _cx in (_CX_L, _CX_R):
+                # Retro uses many ticks; Neon uses fewer, larger glowing blocks
+                _tick_count = 41 if _is_retro else 13
+                for _i in range(_tick_count):
+                    _v     = _i / float(_tick_count - 1)
+                    _a     = _ang(_v)
+                    
+                    if _is_retro:
+                        _major = (_i % 10 == 0)
+                        _tlen = 7 if _major else 4
+                        # Color code the lines based on value
+                        _tcol = "#00CC44" if _v < 0.65 else ("#FFCC00" if _v < 0.85 else "#FF2222")
+                        _topa = 0.8 if _major else 0.4
+                    else:
+                        _major = (_i % 3 == 0)
+                        _tlen  = 6 if _major else 4
+                        _tcol  = "#00FFFF" if _v < 0.75 else "#FF00FF"
+                        _topa = 0.8 if _major else 0.35
+
+                    _ix, _iy = _pt(_cx, _R - 5 - _tlen, _a)
+                    _ox, _oy = _pt(_cx, _R - 5,         _a)
+                    shapes.append(cv.Line(
+                        x1=_ix, y1=_iy, x2=_ox, y2=_oy,
+                        paint=ft.Paint(
+                            color=ft.Colors.with_opacity(_topa, _tcol),
+                            stroke_width=1.8 if _major else 1.0,
+                        ),
+                    ))
+
+        # ── Colour zones (Power Bars for Neon mode) ──────────────────────
+        if not _is_retro and not _is_custom:
+            _zone_defs = [
+                (0.00, 0.75, "#00FFFF", 0.30),   # Cyan Range
+                (0.75, 1.00, "#FF00FF", 0.40),   # Peak Magenta
+            ]
+            for _cx in (_CX_L, _CX_R):
+                for (_v0, _v1, _zcol, _zopa) in _zone_defs:
+                    _zpts = []
+                    _a0, _a1 = int(_ang(_v0)), int(_ang(_v1))
+                    for _a in range(_a0, _a1 + 1, 2):
+                        px, py = _pt(_cx, _R - 5, _a)
+                        if _zpts:
+                            _zpts.append(cv.Path.LineTo(px, py))
+                        else:
+                            _zpts.append(cv.Path.MoveTo(px, py))
+                    if _zpts:
+                        shapes.append(cv.Path(
+                            elements=_zpts,
+                            paint=ft.Paint(
+                                color=ft.Colors.with_opacity(_zopa, _zcol),
+                                stroke_width=4,
+                                style=ft.PaintingStyle.STROKE,
+                            ),
+                        ))
+
+        # ── Needles ───────────────────────────────────────────────────────
+        for _cx, _val, _col in (
+            (_CX_L, self._neon_vu_left_smooth,  _col_l),
+            (_CX_R, self._neon_vu_right_smooth, _col_r),
+        ):
+            _tip_x, _tip_y = _pt(_cx, _R - 8, _ang(_val))
+            _px, _py = float(_cx), float(_CY)
+
+            # Single sharp needle for all themes (Cyber HUD / Vintage precision look)
+            shapes.append(cv.Line(
+                x1=_px, y1=_py, x2=_tip_x, y2=_tip_y,
+                paint=ft.Paint(color=_col, stroke_width=1.25),
+            ))
+
+        # ── Pivot cap circles (drawn last, on top of needles) ─────────────
+        for _cx, _val, _col in (
+            (_CX_L, self._neon_vu_left_smooth,  _col_l),
+            (_CX_R, self._neon_vu_right_smooth, _col_r),
+        ):
+            # Bright core cap
+            shapes.append(cv.Circle(
+                x=float(_cx), y=float(_CY), radius=2.5,
+                paint=ft.Paint(color=_col, style=ft.PaintingStyle.FILL),
+            ))
+
+        # ── Single canvas update — only needle layer redrawn ──────────────
+        try:
+            self._neon_vu_canvas.shapes = shapes
+            self._neon_vu_canvas.update()
+        except Exception:
+            pass
+
     def _build_spec_text_columns(self, text):
         # 5x7 glyphs for idle marquee text.
         _font = {
@@ -8495,10 +9320,13 @@ class WLEDApp:
 
         # Scroll text at a speed controlled by idle speed slider.
         _spd = max(0.25, min(3.0, float(self._spec_idle_speed)))
+        _old_scroll = self._spec_idle_scroll
         self._spec_idle_phase += 0.18 * _spd
         while self._spec_idle_phase >= 1.0:
             self._spec_idle_phase -= 1.0
             self._spec_idle_scroll = (self._spec_idle_scroll + 1) % len(_cols)
+        if self._spec_idle_scroll < _old_scroll:
+            self._spec_idle_cycle_done = True
 
         _y_off = max(0, (self._spec_levels - 7) // 2)
         _bg = "#101010"
@@ -8518,50 +9346,6 @@ class WLEDApp:
         except Exception:
             pass
 
-    def _render_spectrum_idle_aurora(self):
-        """Ambient idle effect: flowing multi-layer wave bands across the full grid."""
-        if not self._spec_segments:
-            return
-
-        _bg = "#101010"
-        _bands = max(1, self._spec_bands)
-        _levels = max(1, self._spec_levels)
-        _spd = max(0.25, min(3.0, float(self._spec_idle_speed)))
-
-        # Reuse idle phase to animate smooth horizontal drift.
-        self._spec_idle_phase += 0.07 * _spd
-        if self._spec_idle_phase >= 1000.0:
-            self._spec_idle_phase = 0.0
-
-        _p = self._spec_idle_phase
-        for bi, segs in enumerate(self._spec_segments):
-            # Two moving centers create a layered ambient ribbon.
-            _c1 = int((_levels - 1) * (((bi * 1.4 + _p * 7.0) % _bands) / max(1, _bands - 1)))
-            _c2 = int((_levels - 1) * (((bi * 0.8 - _p * 4.0) % _bands) / max(1, _bands - 1)))
-            _color = self._spec_palette[(bi + int(_p * 6.0)) % len(self._spec_palette)]
-
-            for top_idx, seg in enumerate(segs):
-                _dist1 = abs(top_idx - _c1)
-                _dist2 = abs(top_idx - _c2)
-
-                # Soft ribbon with brighter core and dim outer halo.
-                if _dist1 <= 1 or _dist2 <= 1:
-                    seg.bgcolor = _color
-                elif _dist1 <= 2 or _dist2 <= 2:
-                    seg.bgcolor = "#2a2a2a"
-                else:
-                    seg.bgcolor = _bg
-
-            # Add subtle deterministic sparkle for extra life.
-            _spark_row = int((bi * 3 + int(_p * 25)) % _levels)
-            if ((bi + int(_p * 13)) % 11) == 0:
-                segs[_spark_row].bgcolor = "#c8c8c8"
-
-        try:
-            self._spectrum_box.update()
-        except Exception:
-            pass
-
     def _render_spectrum_idle_pulse(self):
         """Ambient idle effect: expanding pulse rings with soft glow."""
         if not self._spec_segments:
@@ -8572,6 +9356,7 @@ class WLEDApp:
         _levels = max(1, self._spec_levels)
         _spd = max(0.25, min(3.0, float(self._spec_idle_speed)))
 
+        _old_p = self._spec_idle_phase
         self._spec_idle_phase += 0.11 * _spd
         if self._spec_idle_phase >= 1000.0:
             self._spec_idle_phase = 0.0
@@ -8585,6 +9370,9 @@ class WLEDApp:
         _cycle = _max_dist + _spawn_gap
         _r1 = (_p * 0.9) % _cycle
         _r2 = (_r1 - _spawn_gap) % _cycle
+
+        if (_p * 0.9 % _cycle) < (_old_p * 0.9 % _cycle):
+            self._spec_idle_cycle_done = True
 
         for bi, segs in enumerate(self._spec_segments):
             for top_idx, seg in enumerate(segs):
@@ -8614,36 +9402,6 @@ class WLEDApp:
         except Exception:
             pass
 
-    def _render_spectrum_idle_rainbow_wave(self):
-        """Idle effect: all bars lit with a rainbow wave scrolling right-to-left."""
-        if not self._spec_segments:
-            return
-
-        _spd = max(0.25, min(3.0, float(self._spec_idle_speed)))
-
-        # Straight row-by-row hue sweep: each row has a fixed phase offset,
-        # while columns carry a linear gradient that drifts right-to-left.
-        self._spec_idle_phase = (self._spec_idle_phase + (5.0 * _spd)) % 360.0
-
-        _col_step = 12.0  # hue delta per column
-        _row_step = 20.0  # hue delta per row (offset between rows)
-        _phase = self._spec_idle_phase
-
-        try:
-            for bi, segs in enumerate(self._spec_segments):
-                for top_idx, seg in enumerate(segs):
-                    _h = (_phase + (bi * _col_step) + (top_idx * _row_step)) % 360.0
-                    seg.bgcolor = self._hue_to_hex(_h)
-        except Exception:
-            # Never let an idle effect freeze the analyzer; fallback to aurora.
-            self._render_spectrum_idle_aurora()
-            return
-
-        try:
-            self._spectrum_box.update()
-        except Exception:
-            pass
-
     def _render_spectrum_idle_pacman(self):
         """Idle effect: Pac-Man chasing a ghost across the analyzer grid."""
         if not self._spec_segments:
@@ -8656,7 +9414,10 @@ class WLEDApp:
 
         # Horizontal track includes off-screen padding so sprites can enter/exit smoothly.
         _track = _bands + 20
+        _old_p = self._spec_idle_phase
         self._spec_idle_phase = (self._spec_idle_phase + (0.35 * _spd)) % float(_track)
+        if self._spec_idle_phase < _old_p:
+            self._spec_idle_cycle_done = True
 
         _y0 = max(0, min(_levels - 5, (_levels // 2) - 2))
         _pac_x = int(self._spec_idle_phase) - 6
@@ -8711,7 +9472,7 @@ class WLEDApp:
             _set_px(_ghost_x + 3, _y0 + 1, "#c8f7ff")
         except Exception:
             # Never allow an idle animation exception to stall rendering.
-            self._render_spectrum_idle_aurora()
+            self._render_spectrum_idle_pulse()
             return
 
         try:
@@ -8728,6 +9489,7 @@ class WLEDApp:
         _levels = max(1, self._spec_levels)
         _spd = max(0.25, min(3.0, float(self._spec_idle_speed)))
         _bg = "#101010"
+        self._spec_idle_cycle_done = True  # Tetris is infinite/random
 
         self._spec_idle_phase = (self._spec_idle_phase + (0.85 * _spd)) % 100000.0
         _tick = int(self._spec_idle_phase)
@@ -8806,7 +9568,7 @@ class WLEDApp:
 
             _draw_piece(_piece_coords, _left + _piece_x, _piece_y, _piece_color)
         except Exception:
-            self._render_spectrum_idle_aurora()
+            self._render_spectrum_idle_pulse()
             return
 
         try:
@@ -8824,6 +9586,7 @@ class WLEDApp:
         _spd = max(0.25, min(3.0, float(self._spec_idle_speed)))
         _bg = "#101010"
 
+        _old_p = self._spec_idle_phase
         self._spec_idle_phase = (self._spec_idle_phase + (0.45 * _spd)) % 100000.0
         _phase = self._spec_idle_phase
 
@@ -8865,6 +9628,11 @@ class WLEDApp:
 
             _span = max(1, _bands - 26)
             _step = _frame % (2 * _span)
+            _old_step = int(_old_p) % (2 * _span)
+
+            if _step < _old_step:
+                self._spec_idle_cycle_done = True
+
             _offset = _step if _step < _span else (2 * _span - _step)
             _x0 = max(0, min(_bands - 1, 1 + _offset))
 
@@ -8876,7 +9644,7 @@ class WLEDApp:
             for _y in range(_laser_top, min(_levels, _laser_top + 4)):
                 _set_px(_laser_x, _y, "#ff5252")
         except Exception:
-            self._render_spectrum_idle_aurora()
+            self._render_spectrum_idle_pulse()
             return
 
         try:
@@ -8894,6 +9662,7 @@ class WLEDApp:
         _spd = max(0.25, min(3.0, float(self._spec_idle_speed)))
         _bg = "#101010"
 
+        _old_p = int(self._spec_idle_phase)
         self._spec_idle_phase = (self._spec_idle_phase + (1.05 * _spd)) % 100000.0
         _phase = int(self._spec_idle_phase)
 
@@ -8918,6 +9687,9 @@ class WLEDApp:
             if not _path:
                 return
 
+            if (_phase % len(_path)) < (_old_p % len(_path)):
+                self._spec_idle_cycle_done = True
+
             _head_idx = _phase % len(_path)
             _len_snake = max(8, min(len(_path) // 2, _bands + 6))
             for _i in range(_len_snake):
@@ -8934,7 +9706,7 @@ class WLEDApp:
             _fx, _fy = _path[_food_idx]
             _set_px(_fx, _fy, "#ff6a3d")
         except Exception:
-            self._render_spectrum_idle_aurora()
+            self._render_spectrum_idle_pulse()
             return
 
         try:
@@ -9029,7 +9801,10 @@ class WLEDApp:
         _line_count = max(1, len(_lines))
         # Restart immediately after the last line exits the top cutoff (-80).
         _cycle_px = _start_y + ((_line_count - 1) * _line_gap) + 80
+        _old_p = self._spec_idle_phase
         self._spec_idle_phase = (self._spec_idle_phase + (0.30 * _spd)) % float(max(1, _cycle_px))
+        if self._spec_idle_phase < _old_p:
+            self._spec_idle_cycle_done = True
         _base_y = _start_y - self._spec_idle_phase
 
         _now = time.monotonic()
@@ -9220,10 +9995,8 @@ class WLEDApp:
         _idle_speed_txt = ft.Text(f"{self._spec_idle_speed:.2f}x", size=12, color="#ff9800")
 
         _idle_options = [
-            ("aurora", "Ambient Wave"),
             ("pulse", "Pulse Field"),
             ("text", "Marquee Text"),
-            ("rainbow", "Rainbow Wave"),
             ("pacman", "Pac-Man Chase"),
             ("tetris", "Tetris Stack"),
             ("invaders", "Space Invaders"),
@@ -9247,7 +10020,7 @@ class WLEDApp:
 
         def on_idle_effect_change(e):
             _fx = str(e.control.value or "random").lower()
-            self._spec_idle_effect = _fx if _fx in ("random", "aurora", "pulse", "text", "rainbow", "pacman", "tetris", "invaders", "snake", "starwars") else "random"
+            self._spec_idle_effect = _fx if _fx in ("random", "pulse", "text", "pacman", "tetris", "invaders", "snake", "starwars") else "random"
 
         def on_idle_speed_change(e):
             self._spec_idle_speed = round(float(e.control.value), 2)
@@ -9307,10 +10080,8 @@ class WLEDApp:
             value=self._spec_idle_effect,
             options=[
                 ft.dropdown.Option("random", "Random Cycle"),
-                ft.dropdown.Option("aurora", "Ambient Wave"),
                 ft.dropdown.Option("pulse", "Pulse Field"),
                 ft.dropdown.Option("text", "Marquee Text"),
-                ft.dropdown.Option("rainbow", "Rainbow Wave"),
                 ft.dropdown.Option("pacman", "Pac-Man Chase"),
                 ft.dropdown.Option("tetris", "Tetris Stack"),
                 ft.dropdown.Option("invaders", "Space Invaders"),
@@ -9397,11 +10168,13 @@ class WLEDApp:
                 "analysis_bands": int(self._spec_analysis_bands),
                 "sensitivity": float(self._spec_sensitivity),
                 "reactivity": float(self._spec_reactivity),
+                "mode_song_timeout": float(self._spec_mode_song_silence_seconds),
                 "bar_decay": float(self._spec_bar_decay),
                 "peak_decay": float(self._spec_peak_decay),
                 "sample_rate": int(self._spec_sample_rate),
                 "sampling_enabled": bool(self._spec_sampling_enabled),
                 "mode": str(self._spec_mode),
+                "mode_cycle_choices": list(self._spec_mode_cycle_choices),
                 "idle_enabled": bool(self._spec_idle_enabled),
                 "idle_timeout": float(self._spec_idle_timeout),
                 "idle_effect": str(self._spec_idle_effect),
@@ -9424,6 +10197,12 @@ class WLEDApp:
                 self._spec_target_fps = max(8, min(30, int(round(float(_snap.get("target_fps", 25))))))
             except Exception:
                 self._spec_target_fps = 25
+            self._spec_mode_song_silence_seconds = float(_snap.get("mode_song_timeout", 2.0))
+            if _song_timeout_slider is not None:
+                _song_timeout_slider.value = float(self._spec_mode_song_silence_seconds)
+                _song_timeout_slider.update()
+            _song_timeout_txt.value = f"{self._spec_mode_song_silence_seconds:.1f}s"
+            _song_timeout_txt.update()
             self._set_spec_analysis_bands(_snap.get("analysis_bands", self._spec_bands), restart_audio=False, reset_now=False)
             self._spec_sensitivity = float(_snap.get("sensitivity", 0.85))
             self._spec_reactivity = float(_snap.get("reactivity", 3.0))
@@ -9438,7 +10217,8 @@ class WLEDApp:
             self._spec_sample_rate = _sr if _sr in (16000, 22050, 32000, 44100, 48000) else 48000
             self._spec_sampling_enabled = bool(_snap.get("sampling_enabled", True))
             _mode = str(_snap.get("mode", "classic")).lower()
-            self._spec_mode = _mode if _mode in ("classic", "vu", "random", "random_song") else "classic"
+            self._spec_mode = _mode if _mode in ("classic", "vu", "cyber_city", "neon_drift", "retro_tech", "custom_vu", "random", "random_song", "neon_vu") else "classic"
+            self._spec_mode_cycle_choices = list(_snap.get("mode_cycle_choices", ["classic", "vu", "cyber_city", "neon_drift", "retro_tech", "custom_vu"]))
             if self._spec_mode in ("random", "random_song"):
                 self._advance_spectrum_random_mode()
                 self._spec_mode_random_next_ts = time.monotonic() + max(1.0, float(self._spec_mode_random_cycle_seconds))
@@ -9446,14 +10226,14 @@ class WLEDApp:
             self._spec_idle_enabled = bool(_snap.get("idle_enabled", True))
             self._spec_idle_timeout = float(_snap.get("idle_timeout", 2.0))
             _idle_fx = str(_snap.get("idle_effect", "random")).lower()
-            self._spec_idle_effect = _idle_fx if _idle_fx in ("random", "aurora", "pulse", "text", "rainbow", "pacman", "tetris", "invaders", "snake", "starwars") else "random"
+            self._spec_idle_effect = _idle_fx if _idle_fx in ("random", "pulse", "text", "pacman", "tetris", "invaders", "snake", "starwars") else "random"
             try:
                 self._spec_idle_speed = max(0.25, min(3.0, float(_snap.get("idle_speed", 3.0))))
             except Exception:
                 self._spec_idle_speed = 3.0
             _idle_cycle = _snap.get("idle_cycle_effects", self._spec_idle_cycle_effects)
             if isinstance(_idle_cycle, list):
-                _allowed = ["aurora", "pulse", "text", "rainbow", "pacman", "tetris", "invaders", "snake", "starwars"]
+                _allowed = ["pulse", "text", "pacman", "tetris", "invaders", "snake", "starwars"]
                 self._spec_idle_cycle_effects = [x for x in _idle_cycle if isinstance(x, str) and x in _allowed]
                 if not self._spec_idle_cycle_effects:
                     self._spec_idle_cycle_effects = list(_allowed)
@@ -9498,6 +10278,7 @@ class WLEDApp:
         source_list = None
         _sens_slider = None
         _react_slider = None
+        _song_timeout_slider = None
         _bar_decay_slider = None
         _peak_decay_slider = None
 
@@ -9616,6 +10397,7 @@ class WLEDApp:
 
         _sens_pct = ft.Text(f"{int(self._spec_sensitivity * 100)}%", size=12, color="#ff9800")
         _fps_txt = ft.Text(f"{int(self._spec_target_fps)} FPS", size=12, color="#ff9800")
+        _song_timeout_txt = ft.Text(f"{self._spec_mode_song_silence_seconds:.1f}s", size=12, color="#ff9800")
         _bars_txt = ft.Text(f"{int(self._spec_analysis_bands)}", size=12, color="#ff9800")
         _react_pct = ft.Text(f"{self._spec_reactivity:.2f}x", size=12, color="#ff9800")
         _bar_decay_pct = ft.Text(f"{self._spec_bar_decay:.2f}x", size=12, color="#ff9800")
@@ -9633,6 +10415,11 @@ class WLEDApp:
             _bars_txt.value = f"{_new_bars}"
             _bars_txt.update()
             self._set_spec_analysis_bands(_new_bars, restart_audio=True, reset_now=False)
+
+        def on_song_timeout_change(e):
+            self._spec_mode_song_silence_seconds = round(float(e.control.value), 1)
+            _song_timeout_txt.value = f"{self._spec_mode_song_silence_seconds:.1f}s"
+            _song_timeout_txt.update()
 
         def on_sensitivity_change(e):
             self._spec_sensitivity = round(float(e.control.value), 2)
@@ -9660,11 +10447,61 @@ class WLEDApp:
 
         def on_mode_change(e):
             _mode = str(e.control.value or "classic").lower()
-            self._spec_mode = _mode if _mode in ("classic", "vu", "random", "random_song") else "classic"
+            self._spec_mode = _mode if _mode in ("classic", "vu", "cyber_city", "neon_drift", "retro_tech", "custom_vu", "random", "random_song") else "classic"
+            if _mode == "neon_drift": self._neon_vu_theme = "neon_drift"
+            elif _mode == "retro_tech": self._neon_vu_theme = "retro_tech"
+            elif _mode == "custom_vu": self._neon_vu_theme = "custom_vu"
             if self._spec_mode in ("random", "random_song"):
                 self._advance_spectrum_random_mode()
                 self._spec_mode_random_next_ts = time.monotonic() + max(1.0, float(self._spec_mode_random_cycle_seconds))
                 self._spec_mode_song_switch_armed = True
+            # Background row visibility
+            _is_vu = _mode in ("neon_drift", "retro_tech", "custom_vu")
+            _bg_col.visible = _is_vu
+            if _is_vu:
+                if _mode == "neon_drift": _bg_dd.value = self._spec_nvu_drift_bg
+                elif _mode == "retro_tech": _bg_dd.value = self._spec_nvu_retro_bg
+                else: _bg_dd.value = self._spec_nvu_custom_bg
+            try: _bg_col.update()
+            except: pass
+
+        def on_bg_change(e):
+            self._spec_nvu_bg_force_reload = True
+            if self._spec_mode == "neon_drift":
+                self._spec_nvu_drift_bg = e.control.value
+            elif self._spec_mode == "retro_tech":
+                self._spec_nvu_retro_bg = e.control.value
+            elif self._spec_mode == "custom_vu":
+                self._spec_nvu_custom_bg = e.control.value
+            self._render_spectrum() # force update
+
+        _spec_options = [
+            ("classic", "Classic"),
+            ("vu", "VU (L/R)"),
+            ("cyber_city", "Cyber City"),
+            ("neon_drift", "Neon Drift"),
+            ("retro_tech", "Retro-Tech"),
+            ("custom_vu", "Custom VU"),
+        ]
+
+        def _ensure_mode_cycle_default():
+            if not isinstance(self._spec_mode_cycle_choices, list):
+                self._spec_mode_cycle_choices = [k for k, _ in _spec_options]
+            self._spec_mode_cycle_choices = [k for k in self._spec_mode_cycle_choices if any(k == o[0] for o in _spec_options)]
+            if not self._spec_mode_cycle_choices:
+                self._spec_mode_cycle_choices = [k for k, _ in _spec_options]
+
+        _ensure_mode_cycle_default()
+
+        def on_cycle_mode_toggle(mode_key, enabled):
+            _ensure_mode_cycle_default()
+            if enabled:
+                if mode_key not in self._spec_mode_cycle_choices:
+                    self._spec_mode_cycle_choices.append(mode_key)
+            else:
+                self._spec_mode_cycle_choices = [x for x in self._spec_mode_cycle_choices if x != mode_key]
+                if not self._spec_mode_cycle_choices:
+                    self._spec_mode_cycle_choices = [mode_key]
 
         def on_idle_enabled_change(e):
             self._spec_idle_enabled = bool(e.control.value)
@@ -9709,12 +10546,16 @@ class WLEDApp:
         )
 
         _mode_dd = ft.Dropdown(
-            width=170,
+            width=200,
             value=self._spec_mode,
             options=[
-                ft.dropdown.Option("classic", "Classic"),
-                ft.dropdown.Option("vu", "VU (L/R)"),
-                ft.dropdown.Option("random", "Random (1 min)"),
+                ft.dropdown.Option("classic",     "Classic (Fixed)"),
+                ft.dropdown.Option("vu",          "VU L/R (Fixed)"),
+                ft.dropdown.Option("cyber_city",  "Cyber City (Fixed)"),
+                ft.dropdown.Option("neon_drift",  "Neon Drift (Fixed)"),
+                ft.dropdown.Option("retro_tech",  "Retro-Tech (Fixed)"),
+                ft.dropdown.Option("custom_vu",   "Custom VU (Fixed)"),
+                ft.dropdown.Option("random",      "Random (1 min)"),
                 ft.dropdown.Option("random_song", "Random (Per Song)"),
             ],
             on_change=on_mode_change,
@@ -9722,55 +10563,146 @@ class WLEDApp:
             dense=True,
         )
 
+        _mode_cycle_checks = []
+        for _m_key, _m_label in _spec_options:
+            _mode_cycle_checks.append(
+                ft.Checkbox(
+                    label=_m_label,
+                    value=(_m_key in self._spec_mode_cycle_choices),
+                    on_change=lambda e, k=_m_key: on_cycle_mode_toggle(k, bool(e.control.value)),
+                    active_color="#ff9800",
+                    scale=0.9,
+                )
+            )
+
+        _m_left = [c for i, c in enumerate(_mode_cycle_checks) if i % 2 == 0]
+        _m_right = [c for i, c in enumerate(_mode_cycle_checks) if i % 2 == 1]
+
+        _mode_cycle_grid = ft.Row([
+            ft.Column(_m_left, spacing=0, tight=True, expand=True),
+            ft.Column(_m_right, spacing=0, tight=True, expand=True),
+        ], spacing=10, expand=True)
+
+        _jpg_names = sorted([os.path.basename(f) for f in glob.glob(os.path.join(_VERSION_DIR, "*.jpg"))])
+        if not _jpg_names:
+            _jpg_names = ["nebula space.jpg", "brushed_metal.jpg"]
+        _jpg_names.insert(0, "BLANK")
+
+        _bg_dd = ft.Dropdown(
+            width=200,
+            options=[ft.dropdown.Option(n) for n in _jpg_names],
+            value=(self._spec_nvu_drift_bg if self._spec_mode == "neon_drift" 
+                   else (self._spec_nvu_retro_bg if self._spec_mode == "retro_tech" 
+                         else self._spec_nvu_custom_bg)),
+            on_change=on_bg_change,
+            text_size=12,
+            dense=True,
+        )
+
+        _bg_col = ft.Column([
+            ft.Text("VU BG Image:", size=12, color="grey400"),
+            ft.Container(content=_bg_dd, width=200, alignment=ft.alignment.center_right),
+        ], spacing=2, tight=True,
+           visible=(self._spec_mode in ("neon_drift", "retro_tech", "custom_vu")))
+
         sensitivity_section = ft.Column([
-            ft.Row([ft.Text("FPS:", size=12, color="grey400"), _fps_txt], spacing=8),
-            ft.Slider(
-                min=8, max=30,
-                value=float(self._spec_target_fps),
-                divisions=22,
-                active_color="#ff9800",
-                on_change=on_target_fps_change,
-            ),
-            ft.Row([ft.Text("Bars:", size=12, color="grey400"), _bars_txt], spacing=8),
-            ft.Slider(
-                min=6, max=float(self._spec_bands),
-                value=float(self._spec_analysis_bands),
-                divisions=max(1, int(self._spec_bands) - 6),
-                active_color="#ff9800",
-                on_change=on_analysis_bars_change,
-            ),
-            ft.Text("Visual width stays the same; fewer analysis bars are stretched across the same display.", size=10, color="grey500"),
-            ft.Divider(height=1, color="grey800"),
-            ft.Row([ft.Text("Sensitivity:", size=12, color="grey400"), _sens_pct], spacing=8),
-            _sens_slider,
-            ft.Row([ft.Text("Reactivity:", size=12, color="grey400"), _react_pct], spacing=8),
-            (_react_slider := ft.Slider(
-                min=0.25, max=3.0,
-                value=self._spec_reactivity,
-                divisions=55,
-                active_color="#ff9800",
-                on_change=on_reactivity_change,
-            )),
-            ft.Row([ft.Text("Bar Decay:", size=12, color="grey400"), _bar_decay_pct], spacing=8),
-            (_bar_decay_slider := ft.Slider(
-                min=0.1, max=5.0,
-                value=self._spec_bar_decay,
-                divisions=49,
-                active_color="#ff9800",
-                on_change=on_bar_decay_change,
-            )),
-            ft.Row([ft.Text("Peak Decay:", size=12, color="grey400"), _peak_decay_pct], spacing=8),
-            (_peak_decay_slider := ft.Slider(
-                min=0.1, max=5.0,
-                value=self._spec_peak_decay,
-                divisions=49,
-                active_color="#ff9800",
-                on_change=on_peak_decay_change,
-            )),
             ft.Row([
-                ft.Text("Mode:", size=12, color="grey400"),
-                ft.Container(content=_mode_dd, expand=True, alignment=ft.alignment.center_right),
+                ft.Text("FPS:", size=12, color="grey400"),
+                _fps_txt,
+                ft.Slider(
+                    min=8, max=30,
+                    value=float(self._spec_target_fps),
+                    divisions=22,
+                    active_color="#ff9800",
+                    on_change=on_target_fps_change,
+                    expand=True,
+                ),
             ], spacing=8, vertical_alignment=ft.CrossAxisAlignment.CENTER),
+
+            ft.Row([
+                ft.Text("Bars:", size=12, color="grey400"),
+                _bars_txt,
+                ft.Slider(
+                    min=6, max=float(self._spec_bands),
+                    value=float(self._spec_analysis_bands),
+                    divisions=max(1, int(self._spec_bands) - 6),
+                    active_color="#ff9800",
+                    on_change=on_analysis_bars_change,
+                    expand=True,
+                ),
+            ], spacing=8, vertical_alignment=ft.CrossAxisAlignment.CENTER),
+            
+            ft.Row([
+                ft.Text("Sensitivity:", size=12, color="grey400"),
+                _sens_pct,
+                (_sens_slider := ft.Slider(
+                    min=0.1, max=1.5,
+                    value=self._spec_sensitivity,
+                    divisions=28,
+                    active_color="#ff9800",
+                    on_change=on_sensitivity_change,
+                    expand=True,
+                )),
+            ], spacing=8, vertical_alignment=ft.CrossAxisAlignment.CENTER),
+
+            ft.Row([
+                ft.Text("Reactivity:", size=12, color="grey400"),
+                _react_pct,
+                (_react_slider := ft.Slider(
+                    min=0.25, max=3.0,
+                    value=self._spec_reactivity,
+                    divisions=55,
+                    active_color="#ff9800",
+                    on_change=on_reactivity_change,
+                    expand=True,
+                )),
+            ], spacing=8, vertical_alignment=ft.CrossAxisAlignment.CENTER),
+            ft.Row([
+                ft.Text("Bar Decay:", size=12, color="grey400"),
+                _bar_decay_pct,
+                (_bar_decay_slider := ft.Slider(
+                    min=0.1, max=5.0,
+                    value=self._spec_bar_decay,
+                    divisions=49,
+                    active_color="#ff9800",
+                    on_change=on_bar_decay_change,
+                    expand=True,
+                )),
+            ], spacing=8, vertical_alignment=ft.CrossAxisAlignment.CENTER),
+            ft.Row([
+                ft.Text("Peak Decay:", size=12, color="grey400"),
+                _peak_decay_pct,
+                (_peak_decay_slider := ft.Slider(
+                    min=0.1, max=5.0,
+                    value=self._spec_peak_decay,
+                    divisions=49,
+                    active_color="#ff9800",
+                    on_change=on_peak_decay_change,
+                    expand=True,
+                )),
+            ], spacing=8, vertical_alignment=ft.CrossAxisAlignment.CENTER),
+            ft.Row([
+                ft.Text("Song Timeout:", size=12, color="grey400"),
+                _song_timeout_txt,
+                (_song_timeout_slider := ft.Slider(
+                    min=1.0, max=15.0,
+                    value=float(self._spec_mode_song_silence_seconds),
+                    divisions=28,
+                    active_color="#ff9800",
+                    on_change=on_song_timeout_change,
+                    expand=True,
+                )),
+            ], spacing=8, vertical_alignment=ft.CrossAxisAlignment.CENTER),
+            ft.Row([
+                ft.Column([
+                    ft.Text("Included in Random:", size=11, color="grey500", italic=True),
+                    _mode_cycle_grid,
+                ], spacing=2, tight=True, expand=True),
+                ft.Column([
+                    ft.Container(content=_mode_dd, width=200, alignment=ft.alignment.top_right),
+                    _bg_col,
+                ], spacing=4, tight=True),
+            ], spacing=8, vertical_alignment=ft.CrossAxisAlignment.START),
             ft.Divider(height=1, color="grey800"),
         ], spacing=0, tight=True)
 
@@ -9902,10 +10834,31 @@ class WLEDApp:
         time.sleep(1.0)
         _current_device = None
         _last_idle_only_render = 0.0
+        _was_sampling = bool(getattr(self, "_spec_sampling_enabled", True))
 
         while self.running and not self._spec_disabled:
-            if not bool(getattr(self, "_spec_sampling_enabled", True)):
-                _now = time.monotonic()
+            _now = time.monotonic()
+            _sampling = bool(getattr(self, "_spec_sampling_enabled", True))
+
+            # Transition: manually toggled OFF via MIC button — trigger idle immediately
+            if _was_sampling and not _sampling:
+                self._spec_idle_active = bool(getattr(self, "_spec_idle_enabled", True))
+                if self._spec_idle_active:
+                    self._spec_idle_phase = 0.0
+                    self._spec_idle_scroll = 0
+                    self._spec_idle_cycle_done = False
+                    if str(self._spec_idle_effect).lower() == "random":
+                        self._spec_idle_random_next_ts = _now
+                        self._spec_idle_cycle_done = True
+
+            # Transition: manually toggled ON via MIC button — restore audio mode
+            if not _was_sampling and _sampling:
+                self._spec_last_audio_ts = _now  # reset silence timer
+                self._spec_idle_active = False   # start in live audio mode
+
+            _was_sampling = _sampling
+
+            if not _sampling:
                 _render_interval = self._get_spec_render_interval()
                 self._spec_idle_active = bool(getattr(self, "_spec_idle_enabled", True))
                 if self._spec_idle_active:
@@ -10110,11 +11063,29 @@ class WLEDApp:
                         _vals = _vals * _eq_curve
 
                         _now = time.monotonic()
+                        # 1. Reset main idle timer immediately on any sound above threshold
                         if _mx > float(self._spec_idle_threshold):
                             self._spec_last_audio_ts = _now
-                            self._spec_mode_song_switch_armed = True
+
+                            # 2. Debounce logic for re-arming song-switch (requires ~150ms of audio)
+                            if _mx > float(self._spec_idle_threshold) * 1.25:
+                                self._spec_mode_song_debounce += 1
+                                if self._spec_mode_song_debounce >= 4:
+                                    self._spec_mode_song_switch_armed = True
+                            else:
+                                self._spec_mode_song_debounce = 0
+                        else:
+                            self._spec_mode_song_debounce = 0
 
                         _idle_on = bool(self._spec_idle_enabled) and ((_now - self._spec_last_audio_ts) >= float(self._spec_idle_timeout))
+                        if _idle_on and not self._spec_idle_active:
+                            self._spec_idle_phase = 0.0
+                            self._spec_idle_scroll = 0
+                            self._spec_idle_cycle_done = False
+                            if str(self._spec_idle_effect).lower() == "random":
+                                self._spec_idle_random_next_ts = _now
+                                self._spec_idle_cycle_done = True
+
                         self._spec_idle_active = _idle_on
                         if _idle_on:
                             if _now - _last_render >= _render_interval:
@@ -10219,6 +11190,7 @@ class WLEDApp:
         _ledfx_last_poll  = 0
         _offline_skip     = {}
         _ledfx_poll_count = 0
+        _mhbridge_was_streaming = False  # edge-detect for MHBridge state changes
         # Window to wait for ping replies before moving on.
         # Must be >= per-device timeout (1.5s) + retry gaps (0.6s) = ~2.1s per attempt.
         # We allow 3 attempts max so worst-case is ~4.5s — clamp window to 5s.
@@ -10386,6 +11358,80 @@ class WLEDApp:
                         if ip not in ledfx_active:
                             self._set_card_unlive(ip, ping_delay=0)
 
+                    # ── MHBridge streaming detection → edge-triggered activate / release ──
+                    # Detect MHBridge virtual by device name (127.0.0.1 never appears
+                    # in the normal ip→virtual map).
+                    _mhbridge_streaming = False
+                    for _vid, _v in virtuals.items():
+                        _is_dev = _v.get("is_device")
+                        if not _is_dev:
+                            continue
+                        _dev_cfg = devices.get(_is_dev, {}).get("config", {})
+                        if _dev_cfg.get("name") == "MHBridge":
+                            _mhbridge_streaming = bool(_v.get("active", False) or _v.get("streaming", False))
+                            self.dbg_unique(
+                                "mhbridge_stream",
+                                f"[MH Live] MHBridge virtual '{_vid}' — "
+                                f"active={_v.get('active')} streaming={_v.get('streaming')}",
+                                color="grey500",
+                            )
+                            break
+
+                    # ── False→True edge: MHBridge just started streaming ───────────────────────
+                    # Activate every MH device — triggered by a scene, the LedFx app,
+                    # or anything else that made MHBridge active.  Fires exactly once
+                    # per transition, not on every poll tick.
+                    if _mhbridge_streaming and not _mhbridge_was_streaming:
+                        _all_mh_ips = [
+                            _ip for _ip, _c in self.cards.items()
+                            if not _c.get("_is_custom")
+                            and self.device_types.get(_ip) == "magichome"
+                        ]
+                        self.log(f"[MH Live] MHBridge active — activating {len(_all_mh_ips)} MH device(s)",
+                                 color="purple")
+                        if not self.mh_bridge_running:
+                            self._mh_start_bridge()
+                        for _mh_ip in _all_mh_ips:
+                            if _mh_ip not in self.mh_live_ips:
+                                self._mh_set_card_live(_mh_ip)
+                                def _auto_activate(i=_mh_ip):
+                                    # Set near-black first so device wakes dark, not
+                                    # blasting full brightness before stream arrives.
+                                    self.send_magic_home_cmd(i, [0x31, 1, 1, 1, 0x00, 0xF0, 0x0F])
+                                    time.sleep(0.1)
+                                    self.send_magic_home_cmd(i, [0x71, 0x23, 0x0F])  # power ON
+                                    time.sleep(0.2)
+                                    self._mh_start_bulb_worker(i)
+                                    self._mh_live_watchdog(i)
+                                threading.Thread(target=_auto_activate, daemon=True).start()
+
+                    # ── True→False edge: MHBridge stopped streaming ──────────────────────
+                    # Release all live MH devices, but respect the grace period for
+                    # devices that just went live and haven't had time to connect yet.
+                    if not _mhbridge_streaming and _mhbridge_was_streaming and self.mh_live_ips:
+                        _now = time.time()
+                        _was_live = [
+                            _ip for _ip in self.mh_live_ips
+                            if _now >= self.mh_live_grace_until.get(_ip, 0)
+                        ]
+                        if _was_live:
+                            self.log(f"[MH Live] MHBridge inactive — releasing {len(_was_live)} device(s)",
+                                     color="cyan")
+                            for _mh_ip in _was_live:
+                                self._mh_stop_bulb_worker(_mh_ip)
+                                self._mh_restore_state(_mh_ip)
+                                self.mh_live_grace_until.pop(_mh_ip, None)
+                                try:
+                                    self.page.call_from_thread(
+                                        lambda i=_mh_ip: self._mh_set_card_unlive_ui(i)
+                                    )
+                                except Exception:
+                                    self._mh_set_card_unlive_ui(_mh_ip)
+                            if not self.mh_live_ips - set(self.mh_live_grace_until.keys()):
+                                self.mh_live_ips.clear()
+
+                    _mhbridge_was_streaming = _mhbridge_streaming
+
                 except Exception as e:
                     self.dbg_unique("ledfx_poll_error", f"[LedFx Poll] Error: {e}", color="orange400")
 
@@ -10535,8 +11581,12 @@ class WLEDApp:
             except Exception:
                 pass
 
-    def _ping_device(self, ip, force_full=False):
+    def _ping_device(self, ip, force_full=False, bypass_live=False):
         if self._is_locked(ip) and not force_full: return
+        # Skip MH pings while the LedFx bridge owns this device —
+        # the bridge drives the hardware directly; polling would interfere.
+        # bypass_live=True lets broadcast_power verify state at exit even for live devices.
+        if ip in self.mh_live_ips and not bypass_live: return
         _card = self.cards.get(ip)
         _disp = (_card["name_label"].value if _card else None) or ip
         _last_error = None
@@ -10602,27 +11652,44 @@ class WLEDApp:
                         
                         _mh_fx = "off"
 
-                        if pattern == 0x61:
-                            # Static color mode: device reports *scaled* RGB.
-                            # Normalize back to an approximate full-brightness base color so future scaling can brighten.
-                            if bri_raw > 0:
-                                base_r = min(255, int(r * 255 / bri_raw))
-                                base_g = min(255, int(g * 255 / bri_raw))
-                                base_b = min(255, int(b * 255 / bri_raw))
-                                self.mh_last_rgb[ip] = (base_r, base_g, base_b)
-                            # else: keep previous base color (don’t overwrite with black)
+                        # Settle guard: skip state writes for a few seconds after
+                        # restoring pre-LedFx state so the first ping back does not
+                        # overwrite good restored data with LedFx's last color.
+                        _in_settle = (time.time() < self.mh_restore_until.get(ip, 0))
 
-                            self.mh_mode[ip] = {"pattern": None}
+                        if not _in_settle:
+                            # ONLY update cached color/mode if the device is actually ON.
+                            # Hardware reports for color are invalid/black when power is off.
+                            if is_on:
+                                # Static color mode: device reports *scaled* RGB.
+                                # Normalize back to full-brightness base color for future scaling,
+                                # but ignore micro-brightness (probes/LedFx black) to prevent corruption.
+                                if pattern == 0x61 and bri_raw > 5:
+                                    base_r = min(255, int(r * 255 / bri_raw))
+                                    base_g = min(255, int(g * 255 / bri_raw))
+                                    base_b = min(255, int(b * 255 / bri_raw))
+                                    self.mh_last_rgb[ip] = (base_r, base_g, base_b)
+                                    self.mh_mode[ip] = {"pattern": None}
+                                elif 0x25 <= pattern <= 0x38:
+                                    self.mh_mode[ip] = {"pattern": pattern, "speed": speed_byte}
+                            elif is_on and 0x25 <= pattern <= 0x38:
+                                delay = max(1, min(0x1f, speed_byte))
+                                inv_spd = int((delay - 1) * 100 / (0x1f - 1))
+                                spd_pct = 100 - inv_spd
+                                self.mh_mode[ip] = {"pattern": pattern, "speed": speed_byte}
+                                bri = int(spd_pct * 255 / 100)
+                            if is_on:
+                                self.individual_brightness[ip] = max(1, bri)
                         
-                        elif is_on and 0x25 <= pattern <= 0x38:
-                            delay = max(1, min(0x1f, speed_byte))
-                            inv_spd = int((delay - 1) * 100 / (0x1f - 1))
-                            spd_pct = 100 - inv_spd
-                            self.mh_mode[ip] = {"pattern": pattern, "speed": speed_byte}
-                            bri = int(spd_pct * 255 / 100)
+                        # Double-check settle guard before writing to persistent cache
+                        if not _in_settle and (
+                                self.mh_mode.get(ip, {}) != _mh_prev_mode or
+                                self.mh_last_rgb.get(ip) != _mh_prev_rgb or
+                                self.individual_brightness.get(ip) != _mh_prev_bri
+                            ):
+                                self.save_cache()
 
-                        # Human-readable MH button label:
-                        # static mode shows color name; effect mode shows effect name.
+                        # Label and debug log always computed from raw packet values
                         if not is_on:
                             _mh_mode_label = self._mh_label_for_ip(ip)
                         elif pattern == 0x61:
@@ -10631,43 +11698,17 @@ class WLEDApp:
                             _mh_mode_label = MH_MODE_NAME_BY_PATTERN.get(pattern, f"EFFECT 0x{pattern:02X}")
                         else:
                             _mh_mode_label = f"MODE 0x{pattern:02X}"
-
-                        if is_on:
-                            self.individual_brightness[ip] = max(1, bri)
-                        # Debug ping log — matches WLED format
                         _mh_card = self.cards.get(ip, {})
                         _mh_name = _mh_card.get("name_label")
                         _mh_cn   = _mh_name.value if _mh_name else ip
                         _mh_bri_pct = f"{int((bri/255)*100)}%" if bri else "?"
-                        
-                        # if is_on and pattern == 0x61:
-                        #     _mh_col_hex = "#{:02x}{:02x}{:02x}".format(r, g, b)
-                        #     _mh_fx = f"color={self._hex_to_name(_mh_col_hex)}"
-                        # elif is_on and 0x25 <= pattern <= 0x38:
-                        #     _mh_fx = f"effect=0x{pattern:02X} spd={_mh_bri_pct}"
-                        # else:
-                        #     _mh_fx = "off"
-                        
-                        # Describe device mode (static vs effect)
-                        # Always define first
-                        _mh_fx = "off"
-                        if is_on and pattern == 0x61:
-                            _mh_col_hex = "#{:02x}{:02x}{:02x}".format(r, g, b)
-                            _mh_fx = f"color={self._hex_to_name(_mh_col_hex)}"
-                        elif is_on and 0x25 <= pattern <= 0x38:
-                            _mh_fx = f"effect=0x{pattern:02X} spd={_mh_bri_pct}"
-                        
-                        _mh_fx = f"color={_mh_col_name}({_mh_col_hex})"
-
-                        if (
-                            self.mh_mode.get(ip, {}) != _mh_prev_mode or
-                            self.mh_last_rgb.get(ip) != _mh_prev_rgb or
-                            self.individual_brightness.get(ip) != _mh_prev_bri
-                        ):
-                            self.save_cache()
-                        
+                        _settle_tag = " (settling)" if _in_settle else ""
+                        _mh_fx = f"color={_mh_col_name}({_mh_col_hex}){_settle_tag}"
                         self.dbg_unique(f"mhping:{ip}", f"Ping {_mh_cn} ({ip}): on={is_on} bri={_mh_bri_pct} {_mh_fx}")
-                        self._schedule_status_update(ip, True, is_on=is_on, fx_name=_mh_mode_label, current_bri=(max(1, bri) if is_on else None))
+
+                        # Skip UI status push while LedFx bridge owns this device or while settling
+                        if ip not in self.mh_live_ips and not _in_settle:
+                            self._schedule_status_update(ip, True, is_on=is_on, fx_name=_mh_mode_label, current_bri=(max(1, bri) if is_on else None))
                 
                 self.fail_counts[ip] = 0
                 return  # success
@@ -10701,6 +11742,10 @@ class WLEDApp:
             item = self.brightness_queue.get()
             if not item: break
             ip, bri = item
+            # Never send brightness commands while LedFx bridge owns the device
+            if ip in self.mh_live_ips:
+                self.brightness_queue.task_done()
+                continue
             if self.device_types.get(ip) == "wled":
                 self._safe_request("POST", ip, {"bri": max(1, min(255, int(bri)))})
             else:
@@ -11056,19 +12101,34 @@ class WLEDApp:
         self._spec_sample_rate = _sr if _sr in (16000, 22050, 32000, 44100, 48000) else 48000
         self._spec_sampling_enabled = bool(c.get("spec_sampling_enabled", True))
         _mode = str(c.get("spec_mode", "classic")).lower()
-        self._spec_mode = _mode if _mode in ("classic", "vu", "random", "random_song") else "classic"
+        self._spec_mode_song_silence_seconds = _clamp(c.get("spec_mode_song_timeout", 2.0), 1.0, 15.0, 2.0)
+        if _mode == "neon_vu":
+            _mode = str(c.get("spec_neon_vu_theme", "neon_drift")).lower()
+        self._spec_mode = _mode if _mode in ("classic", "vu", "cyber_city", "neon_drift", "retro_tech", "custom_vu", "random", "random_song", "neon_vu") else "classic"
         if self._spec_mode in ("random", "random_song"):
             self._advance_spectrum_random_mode()
             self._spec_mode_random_next_ts = time.monotonic() + max(1.0, float(self._spec_mode_random_cycle_seconds))
             self._spec_mode_song_switch_armed = True
+        self._spec_nvu_drift_bg = c.get("spec_nvu_drift_bg", "nebula space.jpg")
+        self._spec_nvu_retro_bg = c.get("spec_nvu_retro_bg", "brushed metal.jpg")
+        self._spec_nvu_custom_bg = c.get("spec_nvu_custom_bg", "retro yellow.jpg")
+        # Restore Neon VU theme (persisted separately from the main mode key)
+        _nvu_theme = str(c.get("spec_neon_vu_theme", "neon_drift")).lower()
+        self._neon_vu_theme = _nvu_theme if _nvu_theme in ("neon_drift", "retro_tech", "custom_vu") else "neon_drift"
+        _m_cycle_saved = c.get("spec_mode_cycle_choices", self._spec_mode_cycle_choices)
+        if isinstance(_m_cycle_saved, list):
+            _allowed_m = ["classic", "vu", "cyber_city", "neon_drift", "retro_tech", "custom_vu"]
+            self._spec_mode_cycle_choices = [x for x in _m_cycle_saved if x in _allowed_m]
+            if not self._spec_mode_cycle_choices:
+                self._spec_mode_cycle_choices = list(_allowed_m)
         self._spec_idle_enabled = bool(c.get("spec_idle_enabled", True))
         self._spec_idle_timeout = _clamp(c.get("spec_idle_timeout", 2.0), 2.0, 30.0, 2.0)
         _idle_fx = str(c.get("spec_idle_effect", "random")).lower()
-        self._spec_idle_effect = _idle_fx if _idle_fx in ("random", "aurora", "pulse", "text", "rainbow", "pacman", "tetris", "invaders", "snake", "starwars") else "random"
+        self._spec_idle_effect = _idle_fx if _idle_fx in ("random", "pulse", "text", "pacman", "tetris", "invaders", "snake", "starwars") else "random"
         self._spec_idle_speed = _clamp(c.get("spec_idle_speed", 3.0), 0.25, 3.0, 3.0)
         _idle_cycle_saved = c.get("spec_idle_cycle_effects", self._spec_idle_cycle_effects)
         if isinstance(_idle_cycle_saved, list):
-            _allowed = ["aurora", "pulse", "text", "rainbow", "pacman", "tetris", "invaders", "snake", "starwars"]
+            _allowed = ["pulse", "text", "pacman", "tetris", "invaders", "snake", "starwars"]
             self._spec_idle_cycle_effects = [x for x in _idle_cycle_saved if isinstance(x, str) and x in _allowed]
             if not self._spec_idle_cycle_effects:
                 self._spec_idle_cycle_effects = list(_allowed)
@@ -11332,7 +12392,13 @@ class WLEDApp:
             "spec_bar_decay": self._spec_bar_decay,
             "spec_peak_decay": self._spec_peak_decay,
             "spec_mode": self._spec_mode,
+            "spec_neon_vu_theme": self._neon_vu_theme,
+            "spec_nvu_drift_bg": self._spec_nvu_drift_bg,
+            "spec_nvu_retro_bg": self._spec_nvu_retro_bg,
+            "spec_nvu_custom_bg": self._spec_nvu_custom_bg,
+            "spec_mode_cycle_choices": self._spec_mode_cycle_choices,
             "spec_idle_enabled": self._spec_idle_enabled,
+            "spec_mode_song_timeout": self._spec_mode_song_silence_seconds,
             "spec_idle_timeout": self._spec_idle_timeout,
             "spec_idle_effect": self._spec_idle_effect,
             "spec_idle_speed": self._spec_idle_speed,
@@ -11626,8 +12692,11 @@ class WLEDApp:
                                     self.send_magic_home_cmd(ip, [0x31,
                                         int(r0*ratio), int(g0*ratio), int(b0*ratio), 0x00, 0xF0, 0x0F])
                             self.send_magic_home_cmd(ip, [0x71, 0x23 if s else 0x24, 0x0F])
-                            # MH has no poll loop — update card visuals after confirmed send
-                            self._update_card_visuals(ip, s)
+                            # Do NOT update card visuals optimistically — ping the device
+                            # and let the real response drive the switch state update.
+                            # bypass_live=True so this works even at exit when devices
+                            # may still be in mh_live_ips.
+                            self._mh_confirm_ping(ip, delay=0.8, bypass_live=True)
                         except Exception as _e:
                             _nm = self.cards.get(ip, {}).get("name_label")
                             _dname = _nm.value if _nm else ip
@@ -11877,9 +12946,14 @@ class WLEDApp:
 
     def toggle_live_badge(self, ip):
         """Toggle LedFx control for a device.
-        Orange badge (live) → click releases to WLED, badge goes grey.
-        Grey badge (manually released) → click re-activates in LedFx, badge goes orange.
+        Purple badge (live) → click releases to WLED, badge goes grey.
+        Grey badge (manually released) → click re-activates in LedFx, badge goes purple.
+        MagicHome devices → dispatched to _toggle_mh_live_badge().
         """
+        # ── MagicHome: handled by dedicated bridge toggle ──────────────────
+        if self.device_types.get(ip) == "magichome":
+            self._toggle_mh_live_badge(ip)
+            return
         c = self.cards.get(ip)
         if not c: return
         name = c["name_label"].value if c.get("name_label") else ip
@@ -12250,11 +13324,11 @@ class WLEDApp:
     async def _async_update_visuals(self, ip, is_on):
         self._update_card_visuals(ip, is_on)
 
-    def _mh_confirm_ping(self, ip, delay=1.0):
+    def _mh_confirm_ping(self, ip, delay=1.0, bypass_live=False):
         """Ping MagicHome device after delay to confirm command worked."""
         def _ping():
             time.sleep(delay)
-            self._ping_device(ip, True)
+            self._ping_device(ip, True, bypass_live=bypass_live)
         threading.Thread(target=_ping, daemon=True).start()
 
     def _update_card_visuals(self, ip, is_on):
@@ -12379,20 +13453,37 @@ class WLEDApp:
 
     def _should_use_narrow(self, w):
         """Return True if narrow layout should be used.
-        When LedFx is running with scenes visible, the row is very crowded so
-        we use a high threshold — effectively always narrow unless maximized.
-        When LedFx is not running, use the scene-count based formula.
+        This logic calculates the total horizontal space required for the 1-row 'WIDE'
+        layout. If the current window width (w) is less than this, we switch to
+        the 2-row 'NARROW' layout to prevent control overlap.
         """
-        scene_count = sum(1 for s in self.scenes if s is not None) + 1
+        if self._scene_mode == "ledfx":
+            # Count LedFx scene buttons. If empty, it shows "No LedFx scenes" text.
+            _count = len(self.ledfx_scenes)
+            scene_count = max(1, _count)
+            # LedFx buttons are slightly narrower (96px + 6px spacing) vs WLED (110px + 6px)
+            multiplier = 102
+        else:
+            # Count WLED scene buttons + 1 for the ADD button.
+            scene_count = sum(1 for s in self.scenes if s is not None) + 1
+            multiplier = 116
+
+        # Real-world pixel estimates for UI groups:
+        # Left (Power/Log/Manual/Merge): ~485px 
+        # LedFx Group (UI/Stop/Update): ~380px
+        # Center Fixed (Toggle): ~140px 
+        # Slider Usable Space: ~50px (reduced from 180px per user request)
+        # Extra Margin/Buffer: ~60px
+
         if self.ledfx_running:
-            # Slider + scene toggle + 8 scenes + LedFx buttons fills the row fast.
-            # Go narrow unless the window is very wide (near maximized on large screen).
-            # Each scene is ~116px, toggle ~130px, LedFx buttons ~290px, power ~430px.
-            space_needed = 430 + 290 + 130 + (scene_count * 116) + 200
+            # When LedFx is active, right-side buttons appear. 
+            # We need significantly more horizontal room to prevent overlap.
+            space_needed = 485 + 380 + 140 + 50 + 60 + (scene_count * multiplier)
             return w < space_needed
         else:
-            space_needed = 720 + (scene_count * 116) + 200
-            return w < space_needed
+            # Without LedFx, the right side is empty.
+            space_needed = 485 + 140 + 50 + 60 + (scene_count * multiplier)
+            return w < max(900, space_needed)
 
     def _apply_master_layout(self, w):
         """Switch master bar between wide (1-row) and narrow (2-row) layouts."""
@@ -12492,6 +13583,9 @@ class WLEDApp:
             pass
         self.running = False
         self.brightness_queue.put(None)
+        # Stop MH bridge and all bulb workers cleanly
+        self._mh_stop_bridge()
+        self.mh_bulb_queues.clear()
         # Flush any pending debounced save before closing
         if self._save_timer is not None:
             self._save_timer.cancel()
@@ -12515,6 +13609,602 @@ class WLEDApp:
         if not self.running: return
         try: control.update()
         except: pass
+
+    # ═══════════════════════════════════════════════════════════════════════
+    # MagicHome ↔ LedFx bridge  (merged from testWebSock2.py)
+    # ═══════════════════════════════════════════════════════════════════════
+
+    def _mh_restore_state(self, ip):
+        """Restore MH device to last known user state after LedFx releases it. 
+        Synchronously captures the cached state and sets a settle guard to 
+        prevent pings from corrupting the snapshot during the transition."""
+
+        # Set settle guard IMMEDIATELY in the calling thread to block poll loop 
+        # from overwriting state with LedFx colors during the release window.
+        self.mh_restore_until[ip] = time.time() + 4.5
+
+        # Capture snapshots now while we are still guaranteed to have the "clean" 
+        # pre-LedFx state (pings were blocked while live).
+        _rgb   = tuple(self.mh_last_rgb.get(ip, (255, 255, 255)))
+        _mode  = dict(self.mh_mode.get(ip, {"pattern": None}))
+        _bri   = int(self.individual_brightness.get(ip, 128))
+        _card  = self.cards.get(ip, {})
+        _sw    = _card.get("switch")
+        _was_on = bool(_sw.value) if _sw else True
+
+        def _restore(i=ip, rgb=_rgb, mode=_mode, bri=_bri, was_on=_was_on):
+            time.sleep(0.4)
+            try:
+                r, g, b = rgb
+                ratio = bri / 255.0
+                r1 = max(0, min(255, int(r * ratio)))
+                g1 = max(0, min(255, int(g * ratio)))
+                b1 = max(0, min(255, int(b * ratio)))
+                
+                # Set near-black before restoring so device does not flash
+                # LedFx's last color at full brightness during the transition.
+                self.send_magic_home_cmd(i, [0x31, 1, 1, 1, 0x00, 0xF0, 0x0F])
+                time.sleep(0.1)
+                
+                if was_on:
+                    if mode.get("pattern") is not None:
+                        self.send_magic_home_cmd(i, [0x61, mode["pattern"],
+                                                     mode.get("speed", 0x1A), 0x0F])
+                    else:
+                        self.send_magic_home_cmd(i, [0x71, 0x23, 0x0F])  # power ON
+                        self.send_magic_home_cmd(i, [0x31, r1, g1, b1, 0x00, 0xF0, 0x0F])
+                else:
+                    self.send_magic_home_cmd(i, [0x71, 0x24, 0x0F])       # power OFF
+
+                name = self.cards.get(i, {}).get("name_label")
+                self.log(f"[MH Live] {name.value if name else i} — state restored",
+                         color="cyan")
+                self._mh_confirm_ping(i, delay=4.0, bypass_live=True)
+            except Exception as e:
+                self.log(f"[MH Live] {ip} restore error: {e}", color="orange400")
+        threading.Thread(target=_restore, daemon=True).start()
+
+    def _mh_start_bulb_worker(self, ip):
+        """Spawn a dedicated queue-backed thread that sends colours to one MH bulb."""
+        if not _FLUX_LED_AVAILABLE:
+            self.log("[MH Live] flux_led not installed — run: pip install flux_led",
+                     color="red400")
+            return
+        if ip in self.mh_bulb_queues:
+            return  # worker already running for this IP
+        from queue import Queue as _Q
+        q = _Q(maxsize=1)
+        self.mh_bulb_queues[ip] = q
+        def _worker(i=ip, _q=q):
+            try:
+                bulb = _WifiLedBulb(i)
+                self.log(f"[MH Live] flux_led connected → {i}", color="purple")
+            except Exception as e:
+                self.log(f"[MH Live] flux_led connect failed for {i}: {e}", color="red400")
+                self.mh_bulb_queues.pop(i, None)
+                return
+            while self.running and self.mh_bridge_running:
+                try:
+                    item = _q.get(timeout=1.0)
+                    r, g, b = item
+                    try:
+                        bulb.setRgb(r, g, b)
+                        self.mh_live_last_delivery[i] = time.time()
+                    except Exception:
+                        pass   # unreachable bulb — skip update silently
+                    _q.task_done()
+                except Exception:
+                    pass
+        threading.Thread(target=_worker, daemon=True).start()
+
+    def _mh_stop_bulb_worker(self, ip):
+        """Remove the bulb queue for an IP so its worker exits naturally."""
+        self.mh_bulb_queues.pop(ip, None)
+
+    def _mh_start_bridge(self):
+        """Start UDP bridge: listens on 127.0.0.1 for LedFx 3-byte RGB packets,
+        fans out to all MH devices in mh_live_ips via per-device Queue workers.
+        Pattern mirrors testWebSock3ledfxREG.py."""
+        # Lock prevents two threads both passing the running-check simultaneously
+        # (e.g. two devices going live at the same time), which would cause a
+        # double sock.bind() and WinError 10048.
+        with self._mh_bridge_lock:
+            if self.mh_bridge_running:
+                return
+            # Tentatively claim the slot; reverted inside the thread if bind fails.
+            self.mh_bridge_running = True
+
+        def _bridge():
+            UPDATE_THROTTLE = .1   # seconds — increase if lights flicker or controller crashes due to too-frequent updates
+            try:
+                sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                # SO_REUSEADDR lets the OS release the port immediately on close,
+                # avoiding WinError 10048 on fast stop→start cycles.
+                sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                sock.bind(("127.0.0.1", self._mh_bridge_port))
+                sock.settimeout(0.5)
+                self.mh_bridge_sock = sock
+                # Only log "started" after the bind actually succeeds
+                self.log(f"[MH Live] UDP bridge started on 127.0.0.1:{self._mh_bridge_port}",
+                         color="purple")
+            except Exception as e:
+                self.log(f"[MH Live] Bridge bind failed: {e}", color="red400")
+                self.mh_bridge_running = False
+                return
+
+            last_send_time = 0
+            last_color = (0, 0, 0)
+            try:
+                while self.mh_bridge_running and self.running:
+                    try:
+                        data, _ = sock.recvfrom(1024)
+                    except socket.timeout:
+                        continue
+                    except Exception:
+                        break
+                    if len(data) >= 3:
+                        r, g, b = data[0], data[1], data[2]
+                        now = time.time()
+                        if (r, g, b) != last_color and (now - last_send_time) > UPDATE_THROTTLE:
+                            for qip, q in list(self.mh_bulb_queues.items()):
+                                if qip not in self.mh_live_ips:
+                                    continue
+                                if q.full():
+                                    try: q.get_nowait()
+                                    except: pass
+                                try: q.put_nowait((r, g, b))
+                                except: pass
+                            last_color = (r, g, b)
+                            last_send_time = now
+            finally:
+                try: sock.close()
+                except: pass
+                self.mh_bridge_sock  = None
+                self.mh_bridge_running = False
+                self.log("[MH Live] UDP bridge stopped", color="grey500")
+
+        self.mh_bridge_thread = threading.Thread(target=_bridge, daemon=True)
+        self.mh_bridge_thread.start()
+
+    def _mh_stop_bridge(self):
+        """Signal the bridge loop to exit and close its socket."""
+        self.mh_bridge_running = False
+        if self.mh_bridge_sock:
+            try: self.mh_bridge_sock.close()
+            except: pass
+
+    def _mh_register_in_ledfx(self, ip):
+        """Register an MH bridge entry in LedFx as a UDP HyperHDR device,
+        then fire an initial effect so the virtual is active immediately.
+        LedFx sends UDP to 127.0.0.1 — the bridge listener on the same machine
+        receives those packets and forwards them to the real MH device IPs."""
+        try:
+            name  = self.cards.get(ip, {}).get("name_label")
+            cname = (name.value if name else ip)
+
+            # ── Step 1: check whether MHBridge already exists in LedFx ───────────────────────
+            # Always look first so we never attempt a duplicate POST when devices
+            # are already connected (which produced redundant registration attempts
+            # and WinError 10048 from a second bridge bind on the same port).
+            body = {}
+            try:
+                dr = requests.get("http://localhost:8888/api/devices", timeout=3)
+                if dr.status_code == 200:
+                    devs = dr.json()
+                    if isinstance(devs, dict):
+                        devs = devs.get("devices", devs)
+                    items = devs.values() if isinstance(devs, dict) else (devs if isinstance(devs, list) else [])
+                    for dev in items:
+                        if not isinstance(dev, dict):
+                            continue
+                        cfg = dev.get("config", {})
+                        if cfg.get("name") == "MHBridge" and cfg.get("ip_address") == "127.0.0.1":
+                            body = dev
+                            self.log(f"[MH Live] MHBridge already in LedFx — reusing (id={dev.get('id')})", color="purple")
+                            break
+            except Exception as _le:
+                self.log(f"[MH Live] Could not query LedFx devices: {_le}", color="red400")
+
+            # ── Step 2: only POST if MHBridge was not found ─────────────────────────
+            if not body:
+                payload = {
+                    "type": "udp",
+                    "config": {
+                        "name":            "MHBridge",
+                        "ip_address":      "127.0.0.1",
+                        "port":            self._mh_bridge_port,
+                        "pixel_count":     1,
+                        "refresh_rate":    30,
+                        "udp_packet_type": "RGB (HyperHDR)",
+                    }
+                }
+                self.log(f"[MH Live] Registering MHBridge in LedFx (UDP 127.0.0.1:{self._mh_bridge_port})…",
+                         color="purple")
+                r = requests.post("http://localhost:8888/api/devices", json=payload, timeout=4)
+                self.log(f"[MH Live] LedFx registration HTTP {r.status_code}: {r.text[:120]}",
+                         color="purple" if r.status_code in (200, 201) else "orange400")
+                if r.status_code in (200, 201):
+                    body = r.json()
+                else:
+                    self.log("[MH Live] Registration failed and no existing MHBridge found.", color="red400")
+                    return False
+            # LedFx returns different shapes across versions — try all known paths
+            dev_id = (
+                body.get("device", {}).get("id")
+                or body.get("id")
+                or body.get("data", {}).get("id")
+                or body.get("device_id")
+            )
+            # Virtual ID: LedFx auto-creates a virtual whose id is the slugified name.
+            # The response may include it directly; fall back to a slug of the device name.
+            virtual_id = (
+                body.get("virtual", {}).get("id")
+                or body.get("virtual_id")
+                or body.get("device", {}).get("virtual_id")
+                or cname.lower().replace(" ", "-")
+            )
+            if dev_id:
+                self._mh_ledfx_device_ids[ip] = str(dev_id)
+            self._mh_virtual_ids[ip] = str(virtual_id)
+            self.log(f"[MH Live] '{cname}' registered — device_id={dev_id}  virtual_id={virtual_id}",
+                     color="purple")
+
+            # Fire an initial effect so LedFx starts streaming to the bridge immediately
+            _strobe_cfg = {
+                "strobe_width":           0,
+                "bass_strobe_decay_rate": 0.1,
+            }
+            threading.Thread(
+                target=self._mh_set_ledfx_effect,
+                args=(ip, "real_strobe", _strobe_cfg),
+                daemon=True,
+            ).start()
+            return True
+
+        except Exception as e:
+            self.log(f"[MH Live] {ip} LedFx registration error: {e}", color="orange400")
+        return False
+
+    def _mh_set_ledfx_effect(self, ip, effect_name="real_strobe", config=None, retries=5):
+        """POST an effect to the LedFx virtual associated with this MH device.
+        Retries a few times to handle the brief startup delay after registration."""
+        virtual_id = self._mh_virtual_ids.get(ip)
+        if not virtual_id:
+            return
+        url = f"http://localhost:8888/api/virtuals/{virtual_id}/effects"
+        payload = {"type": effect_name, "config": config or {}}
+        for attempt in range(retries):
+            try:
+                resp = requests.post(url, json=payload, timeout=3)
+                if resp.status_code in (200, 201):
+                    self.log(f"[MH Live] Effect '{effect_name}' set on virtual '{virtual_id}'",
+                             color="purple")
+                    return
+                self.log(f"[MH Live] Effect set attempt {attempt+1}: HTTP {resp.status_code} — {resp.text[:80]}",
+                         color="orange400")
+            except Exception as e:
+                self.log(f"[MH Live] Effect set attempt {attempt+1} error: {e}", color="orange400")
+            time.sleep(1.5)
+
+    def _mh_activate_virtual(self, ip):
+        """PUT active=True to the LedFx virtual for this MH device so the poll
+        loop sees _mhbridge_streaming=True and does not auto-release it.
+        Called after _mh_register_in_ledfx when the user manually clicks the
+        grey live badge.  Scene-triggered activations skip this — the scene
+        itself handles virtual activation."""
+        virtual_id = self._mh_virtual_ids.get(ip)
+        if not virtual_id:
+            return
+        try:
+            r = requests.put(
+                f"http://localhost:8888/api/virtuals/{virtual_id}",
+                json={"active": True},
+                timeout=3,
+            )
+            if r.status_code in (200, 201):
+                self.log(f"[MH Live] Virtual '{virtual_id}' activated in LedFx", color="purple")
+            else:
+                self.log(f"[MH Live] Virtual activate HTTP {r.status_code}: {r.text[:80]}", color="orange400")
+        except Exception as e:
+            self.log(f"[MH Live] Virtual activate error: {e}", color="orange400")
+
+    def _mh_live_watchdog(self, ip, check_after=4.0, retry_interval=5.0, max_retries=3, done_event=None):
+        """Verify a newly-live MH device is truly reacting to LedFx commands.
+
+        Problem: is_on alone is unreliable — some device firmware reports "on"
+        even when the device is visually off.  Instead we do a write-then-read
+        round trip: send RGB(1,1,1), query the color back, confirm it matches.
+        A device that is truly alive and responding will echo what we wrote.
+        Every step is logged so you can see exactly what happened.
+        """
+        PROBE_RGB = (1, 1, 1)   # near-black — barely visible, non-disruptive
+        TOLERANCE = 10           # allow small firmware rounding on readback
+
+        def _verify(i, cname):
+            """Send probe color, read back state, return (ok, detail_string)."""
+            if not _FLUX_LED_AVAILABLE:
+                return None, "flux_led not available"
+            try:
+                self.log(f"[MH Live] [{cname}] watchdog: connecting for probe…", color="grey500")
+                b = _WifiLedBulb(i)
+                self.log(f"[MH Live] [{cname}] watchdog: connected OK", color="grey500")
+            except Exception as e:
+                return None, f"connect failed: {e}"
+
+            # Step 1: read initial state
+            try:
+                b.update_state()
+                initial_on = b.is_on
+                self.log(f"[MH Live] [{cname}] watchdog: initial is_on={initial_on}", color="grey500")
+            except Exception as e:
+                initial_on = None
+                self.log(f"[MH Live] [{cname}] watchdog: update_state failed: {e}", color="orange400")
+
+            # Step 2: send probe color
+            try:
+                r, g, bv = PROBE_RGB
+                self.log(f"[MH Live] [{cname}] watchdog: sending probe RGB{PROBE_RGB}…", color="grey500")
+                b.setRgb(r, g, bv)
+            except Exception as e:
+                return False, f"setRgb probe failed: {e}"
+
+            # Step 3: read back and compare
+            time.sleep(0.5)
+            try:
+                b.update_state()
+                readback_on = b.is_on
+                try:
+                    rb_rgb = b.getRgb()
+                except Exception:
+                    rb_rgb = None
+                self.log(
+                    f"[MH Live] [{cname}] watchdog: readback is_on={readback_on}  rgb={rb_rgb}",
+                    color="grey500",
+                )
+                if not readback_on:
+                    return False, f"is_on=False after probe (rgb readback={rb_rgb})"
+                if rb_rgb is not None:
+                    rr, rg, rb2 = rb_rgb
+                    pr, pg, pb = PROBE_RGB
+                    if (abs(rr - pr) <= TOLERANCE and
+                            abs(rg - pg) <= TOLERANCE and
+                            abs(rb2 - pb) <= TOLERANCE):
+                        return True, f"round-trip OK — readback rgb={rb_rgb}"
+                    else:
+                        return False, f"color mismatch — sent {PROBE_RGB}, got {rb_rgb}"
+                # getRgb unavailable but is_on=True — accept on alone
+                return True, f"is_on=True (getRgb not available)"
+            except Exception as e:
+                return None, f"readback error: {e}"
+
+        def _power_on(i, cname):
+            if _FLUX_LED_AVAILABLE:
+                try:
+                    b = _WifiLedBulb(i)
+                    b.turnOn()
+                    self.log(f"[MH Live] [{cname}] watchdog: turnOn sent via flux_led", color="orange400")
+                    return
+                except Exception as e:
+                    self.log(f"[MH Live] [{cname}] watchdog: flux_led turnOn error: {e}", color="red400")
+            # raw TCP fallback
+            self.send_magic_home_cmd(i, [0x71, 0x23, 0x0F])
+            self.log(f"[MH Live] [{cname}] watchdog: raw TCP power-on sent", color="orange400")
+
+        def _watch(i=ip):
+            try:
+                c = self.cards.get(i, {})
+                name = c.get("name_label")
+                cname = name.value if name else i
+                self.log(f"[MH Live] [{cname}] watchdog started — checking in {check_after:.0f}s", color="grey500")
+                time.sleep(check_after)
+
+                for attempt in range(1, max_retries + 1):
+                    if i not in self.mh_live_ips:
+                        self.log(f"[MH Live] [{cname}] watchdog: device released, exiting", color="grey500")
+                        return
+
+                    self.log(f"[MH Live] [{cname}] watchdog: probe attempt {attempt}/{max_retries}", color="grey500")
+                    ok, detail = _verify(i, cname)
+
+                    if ok is True:
+                        self._mh_live_badge_set_color(i, ok=True)
+                        self.log(f"[MH Live] \u2713 [{cname}] device confirmed live — {detail}", color="purple")
+                        return
+
+                    if ok is None:
+                        self.log(f"[MH Live] \u26a0 [{cname}] probe inconclusive (attempt {attempt}/{max_retries}) — {detail}", color="orange400")
+                    else:
+                        self.log(f"[MH Live] \u26a0 [{cname}] device not responding (attempt {attempt}/{max_retries}) — {detail}", color="orange400")
+
+                    self._mh_live_badge_set_color(i, ok=False)
+                    _power_on(i, cname)
+                    time.sleep(retry_interval)
+
+                # Final check after all retries
+                if i in self.mh_live_ips:
+                    ok, detail = _verify(i, cname)
+                    if ok is True:
+                        self._mh_live_badge_set_color(i, ok=True)
+                        self.log(f"[MH Live] \u2713 [{cname}] device confirmed live on final check — {detail}", color="purple")
+                    else:
+                        self.log(
+                            f"[MH Live] \u2717 [{cname}] FAILED after {max_retries} retries — {detail}. "
+                            f"Try toggling live off/on.",
+                            color="red400",
+                        )
+            finally:
+                if done_event:
+                    done_event.set()
+
+        threading.Thread(target=_watch, daemon=True).start()
+
+    def _mh_live_badge_set_color(self, ip, ok: bool):
+        """Flip the live badge to amber (problem) or purple (ok) from any thread."""
+        def _ui():
+            c = self.cards.get(ip)
+            if not c or ip not in self.mh_live_ips:
+                return
+            lb = c.get("live_badge")
+            if not lb:
+                return
+            if ok:
+                c["live_icon"].color = "#7b1fa2"
+                c["live_text"].color = "#7b1fa2"
+                lb.bgcolor = "#1a001a"
+                lb.border  = ft.border.all(1, "#7b1fa2")
+                lb.tooltip = "LedFx has control — click to release back to MagicHome"
+            else:
+                c["live_icon"].color = "#e65100"
+                c["live_text"].color = "#e65100"
+                lb.bgcolor = "#1a0800"
+                lb.border  = ft.border.all(1, "#e65100")
+                lb.tooltip = "LedFx sync problem — retrying power-on…"
+            try: lb.update()
+            except: pass
+        try:
+            self.page.call_from_thread(_ui)
+        except Exception:
+            _ui()
+
+    def _mh_set_card_live(self, ip):
+        """Lock MH card into LedFx sync — show purple badge, freeze controls."""
+        c = self.cards.get(ip)
+        if not c or c.get("_is_custom"):
+            return
+        if self.device_types.get(ip) != "magichome":
+            return
+        if ip in self.mh_live_ips:
+            return
+        name  = c.get("name_label")
+        cname = name.value if name else ip
+        self.log(f"[MH Live] {cname} — entering LedFx sync", color="purple")
+        self.mh_live_ips.add(ip)
+        # Grace period: suppress poll-loop auto-release for 12s while bridge connects
+        self.mh_live_grace_until[ip] = time.time() + 12.0
+        # Lock the same controls that WLED locks, plus power switch + brightness
+        for key in ("color_btn", "action_btn"):
+            ctrl = c.get(key)
+            if ctrl:
+                ctrl.disabled = True
+                ctrl.opacity  = 0.3
+                try: ctrl.update()
+                except: pass
+        for key in ("switch", "bri_slider"):
+            ctrl = c.get(key)
+            if ctrl:
+                ctrl.disabled = True
+                ctrl.opacity  = 0.3
+                try: ctrl.update()
+                except: pass
+        # Purple live badge (mirrors WLED orange badge logic)
+        lb = c.get("live_badge")
+        if lb:
+            lb.visible  = True
+            c["live_icon"].color = "#7b1fa2"
+            c["live_text"].color = "#7b1fa2"
+            lb.bgcolor  = "#1a001a"
+            lb.border   = ft.border.all(1, "#7b1fa2")
+            lb.tooltip  = "LedFx has control — click to release back to MagicHome"
+            try: lb.update()
+            except: pass
+        # Mark glow as "on" so the border animation loop includes this card —
+        # matches how WLED live cards glow even when their power switch is off
+        c["glow"].bgcolor = "#0a1a1a"
+        c["glow"].border  = ft.border.all(2, self._hue_to_hex(self.rainbow_hue))
+        c["_glow_state"]  = "on"
+        c["status"].visible = False
+        try: c["card"].update(); c["glow"].update()
+        except: pass
+
+    def _mh_set_card_unlive_ui(self, ip):
+        """Restore MH card visuals after LedFx releases it (call from UI thread)."""
+        c = self.cards.get(ip)
+        if not c:
+            return
+        self.mh_live_ips.discard(ip)
+        for key in ("color_btn", "action_btn", "switch", "bri_slider"):
+            ctrl = c.get(key)
+            if ctrl:
+                ctrl.disabled = False
+                ctrl.opacity  = 1.0
+                try: ctrl.update()
+                except: pass
+        lb = c.get("live_badge")
+        if lb:
+            if self.ledfx_running:
+                lb.visible  = True
+                c["live_icon"].color = "grey500"
+                c["live_text"].color = "grey500"
+                lb.bgcolor  = "#1e1e2a"
+                lb.border   = ft.border.all(1, "grey700")
+                lb.tooltip  = "Click to sync this MagicHome device with LedFx"
+            else:
+                lb.visible = False
+            try: lb.update()
+            except: pass
+        # Restore glow to match actual power state so border animation
+        # and card colour return to their pre-live appearance
+        sw = c.get("switch")
+        is_on = bool(sw.value) if sw else False
+        if is_on:
+            c["_glow_state"] = "on"
+            c["glow"].bgcolor = "#121420"
+            c["glow"].border  = ft.border.all(2, "#2b2b3b")
+        else:
+            c["_glow_state"] = "off"
+            c["glow"].bgcolor = "#121420"
+            c["glow"].border  = ft.border.all(2, "#2b2b3b")
+        c["status"].visible = True
+        try: c["card"].update(); c["glow"].update()
+        except: pass
+
+    def _toggle_mh_live_badge(self, ip):
+        """Click handler for MH live badge: toggle bridge sync on/off."""
+        c = self.cards.get(ip)
+        if not c:
+            return
+        name  = c.get("name_label")
+        cname = name.value if name else ip
+
+        if ip in self.mh_live_ips:
+            # ── Release: stop THIS device's worker only; bridge keeps running for others ───────
+            def _release(i=ip):
+                self._mh_stop_bulb_worker(i)
+                self._mh_restore_state(i) # Sets guard synchronously before discard
+                self.mh_live_ips.discard(i)
+                self.mh_live_grace_until.pop(i, None)
+                if not self.mh_live_ips:
+                    self._mh_stop_bridge()
+                try:
+                    self.page.call_from_thread(lambda: self._mh_set_card_unlive_ui(i))
+                except Exception:
+                    self._mh_set_card_unlive_ui(i)
+                self.log(f"[MH Live] {cname} — released from LedFx sync", color="cyan")
+            threading.Thread(target=_release, daemon=True).start()
+
+        else:
+            # ── Go live: lock card, start bridge + worker + register ────────────
+            self._mh_set_card_live(ip)
+            def _activate(i=ip):
+                # Ensure bridge socket is up
+                if not self.mh_bridge_running:
+                    self._mh_start_bridge()
+                # Set near-black before powering on so device does not flash
+                # at full brightness before the first LedFx packet arrives.
+                self.send_magic_home_cmd(i, [0x31, 1, 1, 1, 0x00, 0xF0, 0x0F])
+                time.sleep(0.1)
+                self.send_magic_home_cmd(i, [0x71, 0x23, 0x0F])  # power ON
+                time.sleep(0.2)
+                self._mh_start_bulb_worker(i)
+                ok = self._mh_register_in_ledfx(i)
+                if ok:
+                    # Always activate the virtual — ensures LedFx starts streaming
+                    # regardless of whether MHBridge was already registered.
+                    self._mh_activate_virtual(i)
+                # Start watchdog: confirm colours are flowing to this device
+                self._mh_live_watchdog(i)
+            threading.Thread(target=_activate, daemon=True).start()
+            self.log(f"[MH Live] {cname} — connecting to LedFx sync...", color="purple")
 
 class WLEDListener:
     def __init__(self, outer): self.outer = outer
