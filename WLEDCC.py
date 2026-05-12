@@ -2523,6 +2523,9 @@ class WLEDApp:
                     self.log(f"[WLEDCC] Update check HTTP status: {resp.status_code}", color="orange400")
                     return
                 payload = resp.json()
+                if payload.get("prerelease"):
+                    self.log("[WLEDCC] Latest is pre-release; ignoring.", color="grey500")
+                    return
 
             latest_tag = payload.get("tag_name", "").strip()
             latest_clean = latest_tag.lstrip("vV")
@@ -3698,7 +3701,7 @@ class WLEDApp:
                 _st.value = "WLED SCENES"
                 _st.color = "white"
             for _t in self._scene_toggle_btns:
-                _t.bgcolor = "cyan"
+                _t.bgcolor = "blue900"
                 try: _t.update()
                 except: pass
             self._rebuild_scene_rows_for_mode()
