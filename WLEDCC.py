@@ -40,6 +40,7 @@ except Exception:
 import requests
 from zeroconf import Zeroconf, ServiceBrowser
 import threading
+import asyncio
 import uuid
 import json
 import os
@@ -539,6 +540,7 @@ class WLEDApp:
                     if self.log_autoscroll:
                         async def _scroll():
                             try:
+                                await asyncio.sleep(0.01)
                                 await self.log_lines.scroll_to(offset=-1, duration=50)
                             except Exception:
                                 pass
@@ -1257,51 +1259,24 @@ class WLEDApp:
                     self.save_cache()
                 # PATCHED: glow update routed through _ui_call
                 self._ui_call(self._apply_ledfx_scene_glow)
-                # Power on any WLED devices whose virtuals are active in this scene.
-                # LedFx streams to them regardless of their power state, but the device
-                # must be ON to show the output.  We derive the IP from ledfx_virtual_map
-                # (populated by the poll loop) or the reverse lookup from wake_vids.
-                def _power_on_active_wled():
-                    # If live_ips is empty at call time (e.g. auto-restore fired before
-                    # the first poll loop ran), wait up to 8s for it to be populated.
-                    deadline = time.time() + 8.0
-                    while not self.live_ips and time.time() < deadline:
-                        time.sleep(0.5)
-
-                    # Candidates: WLED devices currently in live_ips.
-                    # wake_vids → ledfx_virtual_map is a secondary source for
-                    # devices that became active but haven't been polled yet.
-                    candidate_ips = set()
-
+                # Ensure WLED devices from this scene are marked as live during auto-restore (at startup, before LedFx monitor loop detects them).
+                # No power-on command — LedFx handles device control.
+                def _ensure_scene_devices_live():
+                    if source != "auto":
+                        return  # Skip for manual scene selection
+                    # Add scene devices to live_ips if not already there
+                    scene_device_ips = set()
                     for vid in wake_vids:
                         ip = self.ledfx_virtual_map.get(vid)
-                        if ip:
-                            candidate_ips.add(ip)
-
-                    for ip in list(self.live_ips):
-                        if self.device_types.get(ip) == "wled":
-                            candidate_ips.add(ip)
-
-                    if not candidate_ips:
-                        self.log(f"[LedFx Scene] power-on: no live WLED devices found for '{label}'", color="grey500")
-                        return
-
-                    for ip in candidate_ips:
-                        if self.device_types.get(ip) != "wled":
-                            continue
-                        c = self.cards.get(ip)
-                        sw = c.get("switch") if c else None
-                        if sw and sw.value:
-                            continue  # already on
-                        bri = self.individual_brightness.get(ip, 128)
-                        _nm = c.get("name_label") if c else None
-                        _dname = _nm.value if _nm else ip
-                        self.log(f"[LedFx Scene] Powering on {_dname} for scene '{label}'", color="purple")
-                        try:
-                            requests.post(f"http://{ip}/json/state",
-                                          json={"on": True, "bri": bri}, timeout=2)
-                        except Exception as _e:
-                            self.log(f"[LedFx Scene] Power-on failed for {_dname}: {_e}", color="orange400")
+                        if ip and self.device_types.get(ip) == "wled":
+                            if ip not in self.live_ips:
+                                self.live_ips.add(ip)
+                                scene_device_ips.add(ip)
+                    # Wait for any newly-added devices to be fully detected by monitor loop
+                    if scene_device_ips:
+                        deadline = time.time() + 8.0
+                        while scene_device_ips - self.live_ips and time.time() < deadline:
+                            time.sleep(0.5)
                 # Determine up-front whether MHBridge is in this scene so the
                 # completion thread can reference it without a closure hazard.
                 _mh_vid = self._mh_bridge_virtual_id
@@ -1342,18 +1317,14 @@ class WLEDApp:
                         _de.wait(timeout=30)
 
                 def _completion_worker():
-                    """Wait for ALL post-activation work to finish, then clear loading.
-                    WLED power-on and MH activation run concurrently; both must finish
-                    before LOADING is removed so the button reflects true completion.
+                    """Ensure scene devices are live, wait for MH activation, then clear loading.
                     PATCHED: _ledfx_btn_done() routes through _ui_call internally,
                     so the ref.update() executes on the event loop, not this thread."""
-                    wled_t = threading.Thread(target=_power_on_active_wled, daemon=True)
-                    wled_t.start()
+                    _ensure_scene_devices_live()
                     if _has_mh:
                         mh_t = threading.Thread(target=_activate_mh_for_scene, daemon=True)
                         mh_t.start()
                         mh_t.join(timeout=45)
-                    wled_t.join(timeout=12)
                     if not _superseded():
                         _ledfx_btn_done()
                         if source == "auto":
@@ -10802,7 +10773,7 @@ class WLEDApp:
         if not (w and h and w > 100 and h > 100):
             return
         cols = self._cols_for_width(w)
-        self.log(f"[DBG-Resize] e.w={w:.0f} e.h={h:.0f} → {cols} cols", color="cyan")
+        self.log(f"[DBG-Resize] e.w={w:.0f} e.h={h:.0f} → {cols} cols", color="cyan", debug=True)
         # e.width is the authoritative real page width from Flutter.
         # page.window.width returns the last value WE SET, not the OS size —
         # never use it for layout calculations.
