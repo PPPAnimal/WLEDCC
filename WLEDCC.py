@@ -56,13 +56,18 @@ from datetime import datetime
 import glob
 import random
 import math
+import colorsys
 import win32gui
 import win32con
 import ctypes
+import webbrowser
 try:
     import winreg
 except Exception:
     winreg = None
+
+# ── SA engine — all spectrum/VU/idle logic lives here ────────────────────────
+from SA import SpectrumController
 
 # flux_led is required for MagicHome ↔ LedFx bridge (pip install flux_led)
 try:
@@ -149,6 +154,22 @@ MH_MODES = [
 ]
 MH_MODE_NAME_BY_PATTERN = {pat: label for (label, _desc, pat) in MH_MODES if pat is not None}
 
+_HUE_TABLE = [
+    "#{:02x}{:02x}{:02x}".format(int(r*255), int(g*255), int(b*255))
+    for h in range(360)
+    for r, g, b in [colorsys.hsv_to_rgb(h / 360.0, 0.85, 0.75)]
+]
+
+_SWATCH_COLORS = [
+    ("#FF0000","Red"),("#FF4400","Orange-Red"),("#FF8800","Orange"),
+    ("#FFCC00","Amber"),("#FFFF00","Yellow"),("#AAFF00","Lime"),
+    ("#00FF00","Green"),("#00FFAA","Mint"),("#00FFFF","Cyan"),
+    ("#0088FF","Sky"),("#0000FF","Blue"),("#4400FF","Indigo"),
+    ("#8800FF","Violet"),("#FF00FF","Magenta"),("#FF0088","Pink"),
+    ("#FF88AA","Rose"),("#FFFFFF","White"),("#AAAAAA","Warm White"),
+    ("#444444","Dim"),("#000000","Off"),
+]
+
 class WLEDApp:
     def __init__(self, page: ft.Page):
         self.page = page
@@ -219,90 +240,12 @@ class WLEDApp:
         self._breath_border_dir = 1
         self._strobe_title = True
         self._strobe_border = True
-        # Winamp-style spectrum analyzer state (header visualizer)
-        self._spec_bands = 32
-        self._spec_analysis_bands = 32
-        self._spec_levels = 16
-        self._spec_bars = [0.0] * self._spec_analysis_bands
-        self._spec_peaks = [0.0] * self._spec_analysis_bands
-        self._spec_peak_hold = [0] * self._spec_analysis_bands
-        self._spec_band_avg = [0.0] * self._spec_analysis_bands  # per-band adaptive floor for dynamics
-        self._spec_segments = []
-        self._spec_gain = 1.0
-        self._spec_target_fps = 25
-        self._spec_sensitivity = 0.85  # 0.1-1.5 user preamp scale, default 85%
-        self._spec_reactivity = 3.0  # rise speed multiplier
-        self._spec_bar_decay = 2.0   # bar fall speed multiplier
-        self._spec_peak_decay = 1.0  # peak fall speed multiplier
-        self._spec_mode = "classic"  # classic | vu | random | random_song
-        self._spec_mode_random_current = "classic"
-        self._spec_mode_random_cycle_seconds = 60.0
-        self._spec_mode_cycle_choices = ["classic", "vu", "cyber_city", "neon_drift", "retro_tech", "custom_vu"]
-        self._spec_mode_random_next_ts = time.monotonic() + self._spec_mode_random_cycle_seconds
-        self._spec_mode_song_silence_seconds = 2.0  # Synced to default idle timeout
-        self._spec_mode_song_switch_armed = True
-        self._spec_nvu_drift_bg = "nebula space.jpg"
-        self._spec_nvu_retro_bg = "brushed metal.jpg"
-        self._spec_nvu_custom_bg = "retro yellow.jpg"
-        self._spec_nvu_bg_force_reload = False
-        self._spec_mode_song_debounce = 0  # frames of consecutive audio to trigger song start
-        self._spec_capture_channels = 2  # prefer stereo; fallback to mono if device does not support it
-        self._spec_sample_rate = 48000  # lower values reduce analyzer CPU usage
-        self._spec_sampling_enabled = True  # quick toggle: when off, skip audio capture (idle-only mode)
-        self._spec_vu_gain = 0.18
-        self._spec_vu_left = 0.0
-        self._spec_vu_right = 0.0
-        self._spec_vu_peak_left = 0.0
-        self._spec_vu_peak_right = 0.0
-        # ── Neon VU Meter (canvas-based) ─────────────────────────────────
-        # Smooth needle positions (ballistic physics — weighted average)
-        self._neon_vu_left_smooth  = 0.0
-        self._neon_vu_right_smooth = 0.0
-        # Visual theme: "neon_drift" (cyan/magenta on nebula) or "retro_tech" (orange/red on brushed metal)
-        self._neon_vu_theme        = "neon_drift"
-        # Flet canvas control and host container (created during UI build)
-        self._neon_vu_canvas       = None   # ft.canvas.Canvas — needles + arcs
-        self._neon_vu_bg_image     = None   # ft.Image — background texture
-        self._neon_vu_host         = None   # ft.Container (Stack: bg + canvas)
-        self._spec_idle_enabled = True
-        self._spec_idle_timeout = 2.0
-        self._spec_idle_effect = "random"  # random | pulse | text | pacman | tetris | invaders | snake | starwars
-        self._spec_idle_cycle_effects = ["pulse", "text", "pacman", "tetris", "invaders", "snake", "starwars"]
-        self._spec_idle_speed = 2.0  # ambient idle animation speed multiplier
-        self._spec_idle_random_current = "pulse"
-        self._spec_idle_random_cycle_seconds = 10.0
-        self._spec_idle_random_next_ts = time.monotonic() + self._spec_idle_random_cycle_seconds
-        self._spec_idle_threshold = 0.02
-        self._spec_idle_active = False
-        self._spec_last_audio_ts = time.monotonic()
-        self._spec_idle_text = " SPECTRUM ANALYZER "
-        self._spec_idle_scroll = 0
-        self._spec_idle_phase = 0.0
-        self._spec_eq_freqs = [60, 170, 310, 600, 1000, 3000, 6000, 12000, 14000, 15000]
-        self._spec_eq_gains = [1.0] * len(self._spec_eq_freqs)  # UI-only visual EQ multipliers
-        self._spec_log_once = False
-        self._spec_no_audio_warned = False
-        self._spec_audio_sources = []  # list of (name, id) tuples for available audio devices
-        self._spec_source_order = []  # preferred source ordering by name (selected source pinned first)
-        self._spec_selected_source = None  # selected audio source name or None for default
-        self._spec_profiles = {}  # per-source analyzer profiles: sensitivity + eq gains
-        self._spec_preview_pending = False  # unsaved preview session active across dialog reopen
-        self._spec_preview_snapshot = None  # baseline state to restore on Close/Refresh
-        self._spec_source_changed = False  # flag to signal audio loop to switch source
-        self._spec_disabled = False  # True if audio capture failed and is disabled
-        self._spec_render_mode = "grid"  # grid | graphics
-        #ppp was 296x62, but that was a bit tight for 32 bars + spacing at 16 levels — give it a little more room to breathe
-        self._spec_box_grid_size = (300, 62)
-        self._spec_box_graphics_size = self._spec_box_grid_size
-        self._spec_grid_content = None
-        self._spec_graphics_host = None
-        self._spec_graphics_layer = None
-        self._spec_graphics_ready = False
-        self._spec_graphics_stars = []
-        self._spec_graphics_lines = []
-        self._spec_graphics_view_size = (0, 0)
-        self._spec_display_cleared = False
-        self._spec_np_patch_applied = False
+        self._last_solid_border_sig = None  # (border_color, card_count) — skip redundant card updates
+        # ── Spectrum analyzer — all state owned by SpectrumController ─────
+        # self._sa is created in _build_ui() after load_cache() runs.
+        # self._sa_legacy_config is populated by load_cache() for migration.
+        self._sa = None
+        self._sa_legacy_config = {}
         self.brightness_debounce_timer = None
         self._save_timer = None          # debounce timer for save_cache
         self._session_backup_written = False  # write one backup per session only
@@ -348,6 +291,7 @@ class WLEDApp:
         self.debug_mode = False   # True = show verbose debug logs
         self.debug_on_open = False   # True = enable debug mode when log panel opens
         self.log_auto_open = False   # True = log panel opens automatically at startup
+        self.simplified_view = False  # True = show simplified single-list view (hides log + master bar)
         # Exit popup preferences
         self.exit_remember_actions = False
         self.exit_auto_stop_ledfx = False
@@ -389,6 +333,11 @@ class WLEDApp:
         self._ledfx_ip_cache = {}    # mDNS hostname -> resolved IP
         self._ledfx_resolve_fails = {}  # hostname -> fail count (suppress after 3)
         self.live_ips = set()     # IPs currently in LedFx live mode — heartbeat paused
+        self._list_update_needed   = False
+        self._ordered_dirty        = True
+        self._ordered_cache        = None
+        self._live_ips_frozen      = frozenset()
+        self._mh_live_ips_frozen   = frozenset()
         self.lor2_ips = set()     # IPs where we sent lor:2 (WLED holding control)
         self._scene_mode = "wled"   # "wled" or "ledfx" — which scene set is showing
         self.ledfx_scenes = {}      # id -> name, fetched from LedFx on start
@@ -440,11 +389,9 @@ class WLEDApp:
         # Session log file is opened only when save_logs_to_disk is enabled
         self._log_fh = None
         self._session_log_path = None
-        self.file_picker = ft.FilePicker(on_result=self.on_file_result)
-        self.page.overlay.append(self.file_picker)
+        self.file_picker = ft.FilePicker(on_upload=self.on_file_result)
         self._exe_pick_callback = None          # set before opening exe_picker
-        self.exe_picker = ft.FilePicker(on_result=self._on_exe_pick_result)
-        self.page.overlay.append(self.exe_picker)
+        self.exe_picker = ft.FilePicker(on_upload=self._on_exe_pick_result)
 
         self.load_cache()
         _default_cards_seeded = self._seed_default_custom_cards()
@@ -459,6 +406,7 @@ class WLEDApp:
         if self.log_auto_open and self.debug_on_open:
             self.debug_mode = True
             self._sync_debug_button_state()
+            self._sync_sa_status_visibility()
 
         self.log(f"System initialized. Version {APP_VERSION}", color="white")
         self.log(f"[Version] Reading from: {_VERSION_FILE}", color="grey500")
@@ -474,7 +422,7 @@ class WLEDApp:
         threading.Thread(target=self._startup_ledfx_autostart, daemon=True).start()
         threading.Thread(target=self._run_custom_autolaunches, daemon=True).start()
         threading.Thread(target=self._custom_launcher_monitor_loop, daemon=True).start()
-        threading.Thread(target=self._audio_analyzer_loop, daemon=True).start()
+        self._sa.start()   # SA audio analyzer thread (SpectrumController)
         # Run one startup scan after a short delay — gives UI time to settle
         def _delayed_startup_scan():
             
@@ -589,7 +537,12 @@ class WLEDApp:
                 try:
                     self.log_lines.update()
                     if self.log_autoscroll:
-                        self.log_lines.scroll_to(offset=-1, duration=50)
+                        async def _scroll():
+                            try:
+                                await self.log_lines.scroll_to(offset=-1, duration=50)
+                            except Exception:
+                                pass
+                        self.page.run_task(_scroll)
                 except Exception:
                     pass
 
@@ -679,6 +632,29 @@ class WLEDApp:
         try: self.autoscroll_btn.update()
         except: pass
 
+    def _toggle_simplified_view(self, e=None):
+        self.simplified_view = not self.simplified_view
+        if self.simplified_view:
+            self.log_row.visible = False
+            self.master_bar.visible = False
+            self.top_update_row.visible = False
+            self._sa.menu_host.visible = False
+            self._device_scroll.expand = True
+            self._simplified_view_btn.icon = ft.Icons.FULLSCREEN_EXIT
+            self._simplified_view_btn.icon_color = "cyan"
+            self._simplified_view_btn.tooltip = "Exit simplified view (show log and controls)"
+        else:
+            self.log_row.visible = True
+            self.master_bar.visible = True
+            self.top_update_row.visible = True
+            self._sa.menu_host.visible = True
+            self._device_scroll.expand = True
+            self._simplified_view_btn.icon = ft.Icons.FULLSCREEN
+            self._simplified_view_btn.icon_color = "grey400"
+            self._simplified_view_btn.tooltip = "Toggle simplified view (hide log and controls)"
+        try: self._main_col.update()
+        except: self.page.update()
+
     def clear_log(self, e):
         self.log_lines.controls.clear()
         try: self.log_lines.update()
@@ -693,12 +669,26 @@ class WLEDApp:
         self._sync_debug_button_state()
         self.log(f"[Debug] Debug mode {'ON' if self.debug_mode else 'OFF'}", 
                  color="orange400" if self.debug_mode else "grey400")
-
+        # Also show/hide SA status text
+        self._sync_sa_status_visibility()
     def _sync_debug_button_state(self):
         self._debug_btn_text.value = "DEBUG: ON" if self.debug_mode else "DEBUG: OFF"
         self._debug_btn_text.color = "orange400" if self.debug_mode else "grey400"
         try: self.debug_btn.update()
         except: pass
+        self._sync_sa_status_visibility()
+
+    def _sync_sa_status_visibility(self):
+        """Show/hide SA status text and overlay based on debug mode."""
+        try:
+            self._sa_status_overlay.visible = self.debug_mode
+            self._sa_status_overlay.update()
+        except Exception:
+            pass
+        try:
+            self._sa.sync_status_visibility()
+        except Exception:
+            pass
 
     def _on_debug_on_open_change(self, e):
         self.debug_on_open = e.control.value
@@ -841,7 +831,9 @@ class WLEDApp:
 
     def copy_log(self, e):
         lines = [c.value for c in self.log_lines.controls if hasattr(c, "value")]
-        self.page.set_clipboard("\n".join(lines))
+        text = "\n".join(lines)
+        async def _copy(): await ft.Clipboard().set(text)
+        self.page.run_task(_copy)
         self.copy_log_btn.content.value = "COPIED!"
         self.copy_log_btn.content.color = "cyan"
         try: self.copy_log_btn.update()
@@ -860,6 +852,7 @@ class WLEDApp:
         if new_vis and self.debug_on_open and not self.debug_mode:
             self.debug_mode = True
             self._sync_debug_button_state()
+            self._sync_sa_status_visibility()
         self.page.update()
 
     def open_log_folder(self, e):
@@ -870,12 +863,12 @@ class WLEDApp:
             self.log(f"[Log] Could not open folder: {ex}", color="red400")
 
     def _open_log(self):
-        """Force the log panel open and scroll to bottom."""
         if not self.log_container.visible:
             self.log_container.visible = True
             if self.debug_on_open and not self.debug_mode:
                 self.debug_mode = True
                 self._sync_debug_button_state()
+                self._sync_sa_status_visibility()
             try: self.page.update()
             except: pass
 
@@ -906,8 +899,10 @@ class WLEDApp:
             _txt = "STOP LEDFX" if is_running else "START LEDFX"
             _bg  = "red800"   if is_running else "purple700"
             if not self._ledfx_launching:  # dont overwrite STARTING... text
+                for _bt in self._ledfx_btn_texts:
+                    _bt.value = _txt
                 for _b in self._ledfx_btns:
-                    _b.text = _txt; _b.bgcolor = _bg
+                    _b.bgcolor = _bg
                 for _u in self._ledfx_ui_btns:
                     _u.visible = is_running
                 for _t in self._scene_toggle_btns:
@@ -922,6 +917,7 @@ class WLEDApp:
                     for _t in self._scene_toggle_btns:
                         try: _t.update()
                         except: pass
+                        
             # LedFx just started — show grey badge on all WLED cards immediately,
             # fetch LedFx scenes for the scene toggle
             if is_running and not _was_running:
@@ -935,7 +931,7 @@ class WLEDApp:
                     c["live_icon"].color = "grey500"
                     c["live_text"].color = "grey500"
                     c["live_badge"].bgcolor = "#1e1e2a"
-                    c["live_badge"].border = ft.border.all(1, "grey700")
+                    c["live_badge"].border = ft.Border.all(1, "grey700")
                     c["live_badge"].tooltip = "Click to re-activate in LedFx"
                     try: c["live_badge"].update()
                     except: pass
@@ -951,7 +947,7 @@ class WLEDApp:
                         c["live_icon"].color = "grey500"
                         c["live_text"].color = "grey500"
                         lb.bgcolor  = "#1e1e2a"
-                        lb.border   = ft.border.all(1, "grey700")
+                        lb.border   = ft.Border.all(1, "grey700")
                         lb.tooltip  = "Click to sync this MagicHome device with LedFx"
                         try: lb.update()
                         except: pass
@@ -973,8 +969,10 @@ class WLEDApp:
                 self._scene_mode = "wled"
                 self.ledfx_scenes = {}
                 self._rebuild_scene_rows_for_mode()
+                for _st in self._scene_toggle_texts:
+                    _st.value = "LEDFX SCENES"; _st.color = "white"
                 for _t in self._scene_toggle_btns:
-                    _t.text = "LEDFX SCENES"
+                    _t.bgcolor = "purple900"
                     try: _t.update()
                     except: pass
                 if self._restore_wled_scene_on_ledfx_stop and self.auto_restore_wled_scene:
@@ -1036,6 +1034,7 @@ class WLEDApp:
                         except Exception:
                             self._mh_set_card_unlive_ui(mh_ip)
                     self.mh_live_ips.clear()
+                    self._ordered_dirty = True
                     # Stop bridge when LedFx exits — it owns the port
                     self._mh_stop_bridge()
                     self._mh_bridge_virtual_id = None
@@ -1187,6 +1186,7 @@ class WLEDApp:
                             scene_label = self.ledfx_scenes.get(sid, str(sid))
                             name_text.value = scene_label
                             name_text.color = "purple200"
+                            name_text.update()
                             ref.update()
                         except Exception:
                             pass
@@ -1198,6 +1198,7 @@ class WLEDApp:
                     try:
                         name_text.value = "LOADING..."
                         name_text.color = "grey400"
+                        name_text.update()
                         ref.update()
                     except Exception:
                         pass
@@ -1209,6 +1210,7 @@ class WLEDApp:
                     try:
                         name_text.value = label
                         name_text.color = "purple200"
+                        name_text.update()
                         ref.update()
                     except Exception:
                         pass
@@ -1591,11 +1593,11 @@ class WLEDApp:
                 content=ft.Column([
                     ft.Text("Choose actions before exit:", size=12, color="grey300"),
                     ft.Row([
-                        ft.ElevatedButton("Stop LedFx", on_click=lambda _: self._run_exit_stop_ledfx(auto=False), bgcolor="red900", color="white"),
+                        ft.Button("Stop LedFx", on_click=lambda _: self._run_exit_stop_ledfx(auto=False), bgcolor="red900", color="white"),
                         self.exit_stop_ledfx_auto_cb,
                     ], spacing=10, vertical_alignment=ft.CrossAxisAlignment.CENTER),
                     ft.Row([
-                        ft.ElevatedButton("All Off", on_click=lambda _: self._run_exit_all_off(auto=False), bgcolor="red900", color="white"),
+                        ft.Button("All Off", on_click=lambda _: self._run_exit_all_off(auto=False), bgcolor="red900", color="white"),
                         self.exit_all_off_auto_cb,
                     ], spacing=10, vertical_alignment=ft.CrossAxisAlignment.CENTER),
                     ft.Row([
@@ -1615,17 +1617,18 @@ class WLEDApp:
                             content=ft.Image(
                                 src="https://www.paypalobjects.com/en_US/i/btn/btn_donate_LG.gif",
                                 height=18,
-                                fit=ft.ImageFit.CONTAIN,
+                                fit=ft.BoxFit.CONTAIN,
                                 tooltip="Donate via hosted PayPal button",
                             ),
-                            on_tap=lambda _: self.page.launch_url("https://www.paypal.com/donate/?hosted_button_id=DLFMQSFHUZ28S"),
+                            on_tap=lambda _: webbrowser.open_new_tab("https://www.paypal.com/donate/?hosted_button_id=DLFMQSFHUZ28S"),
+                            # self.page.launch_url("https://www.paypal.com/donate/?hosted_button_id=DLFMQSFHUZ28S"),
                             mouse_cursor=ft.MouseCursor.CLICK,
                         ),
                     ], spacing=12, vertical_alignment=ft.CrossAxisAlignment.CENTER),
                 ], tight=True, spacing=10, width=450),
                 actions=[
                     ft.TextButton("Cancel", on_click=self._close_exit_dialog),
-                    ft.ElevatedButton("Close App", bgcolor="orange400", color="black", on_click=self._confirm_app_close),
+                    ft.Button("Close App", bgcolor="orange400", color="black", on_click=self._confirm_app_close),
                 ],
                 actions_alignment=ft.MainAxisAlignment.END,
             )
@@ -1656,8 +1659,12 @@ class WLEDApp:
     def _finalize_exit(self):
         self.cleanup(None)
         try:
-            win = self.page.window
-            win.destroy()
+            async def _safe_destroy():
+                try:
+                    await self.page.window.destroy()
+                except Exception:
+                    pass
+            self.page.run_task(_safe_destroy)
             return
         except:
             pass
@@ -1849,7 +1856,9 @@ class WLEDApp:
         def _open_downloads(_):
             _close()
             try:
-                self.page.launch_url(SPOTIFY_DOWNLOADS_PAGE_URL)
+                webbrowser.open_new_tab(SPOTIFY_DOWNLOADS_PAGE_URL)
+                #self.page.run_task(lambda: ft.UrlLauncher().launch_url(SPOTIFY_DOWNLOADS_PAGE_URL))
+                #self.page.launch_url(SPOTIFY_DOWNLOADS_PAGE_URL)
             except Exception:
                 pass
 
@@ -1860,7 +1869,7 @@ class WLEDApp:
                 ft.Text("Browse to your existing Spotify.exe, or open the download page.", size=12, color="grey500"),
             ], tight=True, spacing=8, width=420),
             actions=[
-                ft.ElevatedButton("Install Spotify", icon=ft.Icons.DOWNLOAD_FOR_OFFLINE, bgcolor="green700", color="white", on_click=_install_spotify),
+                ft.Button("Install Spotify", icon=ft.Icons.DOWNLOAD_FOR_OFFLINE, bgcolor="green700", color="white", on_click=_install_spotify),
                 ft.TextButton("Browse EXE", on_click=_browse),
                 ft.TextButton("Open Download Page", on_click=_open_downloads),
                 ft.TextButton("Cancel", on_click=_close),
@@ -1966,7 +1975,7 @@ class WLEDApp:
                 ft.Text("LedFx path is unknown. What would you like to do?", size=13),
             ], tight=True, width=380),
             actions=[
-                ft.ElevatedButton("INSTALL FRESH", icon=ft.Icons.DOWNLOAD_FOR_OFFLINE,
+                ft.Button("INSTALL FRESH", icon=ft.Icons.DOWNLOAD_FOR_OFFLINE,
                     bgcolor="yellow700", color="black", on_click=do_install),
                 ft.TextButton("Browse to exe", on_click=do_browse),
                 ft.TextButton("Cancel", on_click=close),
@@ -2029,7 +2038,9 @@ class WLEDApp:
         def _open_downloads(_):
             _close()
             try:
-                self.page.launch_url(WINAMP_DOWNLOADS_PAGE_URL)
+                webbrowser.open_new_tab(WINAMP_DOWNLOADS_PAGE_URL)
+                #self.page.run_task(lambda: ft.UrlLauncher().launch_url(WINAMP_DOWNLOADS_PAGE_URL))
+                #self.page.launch_url(WINAMP_DOWNLOADS_PAGE_URL)
             except Exception:
                 pass
 
@@ -2040,7 +2051,7 @@ class WLEDApp:
                 ft.Text("Choose Install Legacy or Browse to your existing winamp.exe.", size=12, color="grey500"),
             ], tight=True, spacing=8, width=420),
             actions=[
-                ft.ElevatedButton("Install WINAMP", icon=ft.Icons.DOWNLOAD_FOR_OFFLINE, bgcolor="yellow700", color="black", on_click=_install_legacy),
+                ft.Button("Install WINAMP", icon=ft.Icons.DOWNLOAD_FOR_OFFLINE, bgcolor="yellow700", color="black", on_click=_install_legacy),
                 ft.TextButton("Browse EXE", on_click=_browse),
                 ft.TextButton("Open Downloads Page", on_click=_open_downloads),
                 ft.TextButton("Cancel", on_click=_close),
@@ -2169,8 +2180,10 @@ class WLEDApp:
 
     def _launch_ledfx(self):
         """Start ledfx.exe and open the web UI once it is ready."""
+        for _bt in self._ledfx_btn_texts:
+            _bt.value = "STARTING..."
         for _b in self._ledfx_btns:
-            _b.disabled = True; _b.text = "STARTING..."; _b.bgcolor = "orange800"
+            _b.disabled = True; _b.bgcolor = "orange800"
             try: _b.update()
             except: pass
         self.log("[LedFx] Launching background process...")
@@ -2184,8 +2197,9 @@ class WLEDApp:
             for i in range(30):
                 time.sleep(1)
                 remaining = 30 - i
+                for _bt in self._ledfx_btn_texts:
+                    _bt.value = f"STARTING... ({remaining}s)"
                 for _b in self._ledfx_btns:
-                    _b.text = f"STARTING... ({remaining}s)"
                     try: _b.update()
                     except: pass
                 try:
@@ -2198,8 +2212,10 @@ class WLEDApp:
                 self.log("[LedFx] Timed out waiting for web UI — try opening http://localhost:8888 manually.", color="red400")
             self._ledfx_launching = False
             self._ledfx_launching = False
+            for _bt in self._ledfx_btn_texts:
+                _bt.value = "STOP LEDFX"
             for _b in self._ledfx_btns:
-                _b.text = "STOP LEDFX"; _b.bgcolor = "red800"; _b.disabled = False
+                _b.bgcolor = "red800"; _b.disabled = False
                 try: _b.update()
                 except: pass
 
@@ -2403,7 +2419,9 @@ class WLEDApp:
         if not self.wledcc_download_url:
             self.log("[WLEDCC] No installer asset found in latest release. Opening releases page.", color="orange400")
             try:
-                self.page.launch_url(WLEDCC_RELEASES_PAGE_URL)
+                webbrowser.open_new_tab(WLEDCC_RELEASES_PAGE_URL)
+                #self.page.run_task(lambda: ft.UrlLauncher().launch_url(WLEDCC_RELEASES_PAGE_URL))
+                #self.page.launch_url(WLEDCC_RELEASES_PAGE_URL)
             except:
                 pass
             return
@@ -2674,7 +2692,7 @@ class WLEDApp:
                 self.log(f"[LedFx]   {ep}")
             threading.Thread(target=_deferred_cleanup, args=(zip_path, extract_path), daemon=True).start()
 
-    def on_file_result(self, e: ft.FilePickerResultEvent):
+    def on_file_result(self, e: ft.ControlEvent):
         """Called when user browses to an existing ledfx.exe."""
         if e.files:
             self.ledfx_path = e.files[0].path
@@ -2686,7 +2704,7 @@ class WLEDApp:
                 except: pass
             self._launch_ledfx()
 
-    def _on_exe_pick_result(self, e: ft.FilePickerResultEvent):
+    def _on_exe_pick_result(self, e: ft.ControlEvent):
         """Called when user browses to an EXE in the Add Device dialog."""
         if e.files and self._exe_pick_callback:
             self._exe_pick_callback(e.files[0].path)
@@ -2721,12 +2739,13 @@ class WLEDApp:
                 self.page.window_height = saved_h
             else:
                 self.page.window_maximized = True
-        self.page.on_resized = self._on_window_resize
+        self.page.on_resize = self._on_window_resize
         # Intercept window close so we can show exit options first.
         try:
             win = self.page.window
             win.prevent_close = True
             win.on_event = self.handle_window_event
+            win.update()
         except AttributeError:
             try:
                 self.page.window_prevent_close = True
@@ -2781,7 +2800,7 @@ class WLEDApp:
                     content=ft.Text("by SullySSignS.ca", size=10, color="grey600"),
                     on_click=lambda _: self.page.launch_url("https://www.sullyssigns.ca"),
                     tooltip="Visit sullyssigns.ca",
-                    style=ft.ButtonStyle(padding=ft.padding.only(top=0, bottom=0)),
+                    style=ft.ButtonStyle(padding=ft.Padding.only(top=0, bottom=0)),
                 ),
                 ft.Divider(),
 
@@ -2988,9 +3007,10 @@ class WLEDApp:
                 ft.Container(height=10),
                 ft.TextButton(
                     content=ft.Text("SullySSignS.ca", size=10, color="grey700"),
-                    on_click=lambda _: self.page.launch_url("https://www.sullyssigns.ca"),
+                    on_click=lambda _: webbrowser.open_new_tab("https://www.sullyssigns.ca"),
+                    # self.page.launch_url("https://www.sullyssigns.ca"),
                     tooltip="Visit sullyssigns.ca",
-                    style=ft.ButtonStyle(padding=ft.padding.only(top=0, bottom=0)),
+                    style=ft.ButtonStyle(padding=ft.Padding.only(top=0, bottom=0)),
                 ),
             ]
         )
@@ -2998,7 +3018,7 @@ class WLEDApp:
         self.help_dialog = ft.AlertDialog(
             title=ft.Text("WLED Command Center+ — Manual", color="#00f2ff"),
             content=manual_content,
-            actions=[ft.ElevatedButton("Close", bgcolor="cyan", color="black",
+            actions=[ft.Button("Close", bgcolor="cyan", color="black",
                 on_click=lambda _: (setattr(self.help_dialog, "open", False), self.page.update()))]
         )
         self.page.overlay.append(self.help_dialog)
@@ -3010,34 +3030,34 @@ class WLEDApp:
         self.log_scroll_container = ft.Container(
             content=self.log_lines,
             height=self._log_height, bgcolor="#050507", border_radius=6,
-            border=ft.border.all(1, "#2b2b3b"), padding=6,
+            border=ft.Border.all(1, "#2b2b3b"), padding=6,
         )
         self.autoscroll_btn = ft.TextButton(
             content=ft.Text("AUTO-SCROLL: ON", size=9, color="cyan", weight="bold"),
             on_click=self.toggle_autoscroll,
-            style=ft.ButtonStyle(padding=ft.padding.symmetric(horizontal=6, vertical=2))
+            style=ft.ButtonStyle(padding=ft.Padding.symmetric(horizontal=6, vertical=2))
         )
         self.copy_log_btn = ft.TextButton(
             content=ft.Text("COPY LOG", size=9, color="grey400", weight="bold"),
             on_click=self.copy_log,
-            style=ft.ButtonStyle(padding=ft.padding.symmetric(horizontal=6, vertical=2))
+            style=ft.ButtonStyle(padding=ft.Padding.symmetric(horizontal=6, vertical=2))
         )
         self.clear_log_btn = ft.TextButton(
             content=ft.Text("CLEAR LOG", size=9, color="grey400", weight="bold"),
             on_click=self.clear_log,
-            style=ft.ButtonStyle(padding=ft.padding.symmetric(horizontal=6, vertical=2))
+            style=ft.ButtonStyle(padding=ft.Padding.symmetric(horizontal=6, vertical=2))
         )
         self.open_folder_btn = ft.TextButton(
             content=ft.Text("OPEN FOLDER", size=9, color="grey400", weight="bold"),
             on_click=self.open_log_folder,
             tooltip=f"Open data folder in Explorer:\n{LOG_DIR}",
-            style=ft.ButtonStyle(padding=ft.padding.symmetric(horizontal=6, vertical=2))
+            style=ft.ButtonStyle(padding=ft.Padding.symmetric(horizontal=6, vertical=2))
         )
         self._debug_btn_text = ft.Text("DEBUG: OFF", size=9, color="grey400", weight="bold")
         self.debug_btn = ft.TextButton(
             content=self._debug_btn_text,
             on_click=self.toggle_debug,
-            style=ft.ButtonStyle(padding=ft.padding.symmetric(horizontal=6, vertical=2))
+            style=ft.ButtonStyle(padding=ft.Padding.symmetric(horizontal=6, vertical=2))
         )
         self.debug_on_open_cb = ft.Checkbox(
             label="DBG on open",
@@ -3096,7 +3116,7 @@ class WLEDApp:
                     ft.Container(width=40, height=3, bgcolor="grey700", border_radius=2),
                 ], alignment="center"),
                 bgcolor="#050507",
-                border_radius=ft.border_radius.only(bottom_left=6, bottom_right=6),
+                border_radius=ft.BorderRadius.only(bottom_left=6, bottom_right=6),
             ),
         )
 
@@ -3110,13 +3130,13 @@ class WLEDApp:
                 _drag_handle,
             ], expand=True),
             visible=self.log_auto_open, expand=True, padding=10,
-            border=ft.border.all(1, "#2b2b3b"), border_radius=8, margin=ft.margin.only(bottom=10)
+            border=ft.Border.all(1, "#2b2b3b"), border_radius=8, margin=ft.Margin.only(bottom=10)
         )
         self.log_scroll_container.expand = True
 
         self._refresh_icon = ft.Icon(ft.Icons.REFRESH, size=14, color="grey400")
         self._refresh_text = ft.Text("SCAN", size=11, color="grey400", weight="bold")
-        self.refresh_btn = ft.ElevatedButton(
+        self.refresh_btn = ft.Button(
             content=ft.Row([self._refresh_icon, self._refresh_text], spacing=4, tight=True),
             on_click=self.on_refresh_click,
             bgcolor="#1e1e2a",
@@ -3127,24 +3147,29 @@ class WLEDApp:
             ),
         )
         # ledfx buttons — two instances each so both wide and narrow layouts stay in sync
-        self.ledfx_btn_wide   = ft.ElevatedButton("START LEDFX", icon=ft.Icons.EQUALIZER, color="white", bgcolor="purple700", on_click=self.toggle_ledfx, height=36)
-        self.ledfx_btn_narrow = ft.ElevatedButton("START LEDFX", icon=ft.Icons.EQUALIZER, color="white", bgcolor="purple700", on_click=self.toggle_ledfx, height=36)
-        self.ledfx_ui_btn_wide   = ft.ElevatedButton("LEDFX UI", icon=ft.Icons.OPEN_IN_BROWSER, color="white", bgcolor="purple900", visible=False, on_click=lambda _: self.page.launch_url("http://localhost:8888/#/devices"), height=36)
-        self.ledfx_ui_btn_narrow = ft.ElevatedButton("LEDFX UI", icon=ft.Icons.OPEN_IN_BROWSER, color="white", bgcolor="purple900", visible=False, on_click=lambda _: self.page.launch_url("http://localhost:8888/#/devices"), height=36)
-        self.scene_toggle_btn_wide   = ft.ElevatedButton("LEDFX SCENES", icon=ft.Icons.SWAP_HORIZ, color="white", bgcolor="purple900", visible=False, on_click=self.toggle_scene_mode, height=36)
-        self.scene_toggle_btn_narrow = ft.ElevatedButton("LEDFX SCENES", icon=ft.Icons.SWAP_HORIZ, color="white", bgcolor="purple900", visible=False, on_click=self.toggle_scene_mode, height=36)
-        self.wledcc_update_btn = ft.ElevatedButton(
+        # Use child ft.Text refs so .value updates from background threads repaint correctly
+        self._ledfx_btn_text_wide   = ft.Text("START LEDFX", color="white")
+        self._ledfx_btn_text_narrow = ft.Text("START LEDFX", color="white")
+        self.ledfx_btn_wide   = ft.Button(content=ft.Row([ft.Icon(ft.Icons.EQUALIZER, color="white"), self._ledfx_btn_text_wide],  spacing=4, tight=True), bgcolor="purple700", on_click=self.toggle_ledfx, height=36)
+        self.ledfx_btn_narrow = ft.Button(content=ft.Row([ft.Icon(ft.Icons.EQUALIZER, color="white"), self._ledfx_btn_text_narrow], spacing=4, tight=True), bgcolor="purple700", on_click=self.toggle_ledfx, height=36)
+        self.ledfx_ui_btn_wide   = ft.Button(content=ft.Row([ft.Icon(ft.Icons.OPEN_IN_BROWSER, color="white"), ft.Text("LEDFX UI", color="white")], spacing=4, tight=True), bgcolor="purple900", visible=False, on_click=lambda _: webbrowser.open_new_tab("http://localhost:8888/#/devices"), height=36)
+        self.ledfx_ui_btn_narrow = ft.Button(content=ft.Row([ft.Icon(ft.Icons.OPEN_IN_BROWSER, color="white"), ft.Text("LEDFX UI", color="white")], spacing=4, tight=True), bgcolor="purple900", visible=False, on_click=lambda _: webbrowser.open_new_tab("http://localhost:8888/#/devices"), height=36)
+        self._scene_toggle_text_wide   = ft.Text("LEDFX SCENES", color="white")
+        self._scene_toggle_text_narrow = ft.Text("LEDFX SCENES", color="white")
+        self.scene_toggle_btn_wide   = ft.Button(content=ft.Row([ft.Icon(ft.Icons.SWAP_HORIZ, color="white"), self._scene_toggle_text_wide],  spacing=4, tight=True), bgcolor="purple900", visible=False, on_click=self.toggle_scene_mode, height=36)
+        self.scene_toggle_btn_narrow = ft.Button(content=ft.Row([ft.Icon(ft.Icons.SWAP_HORIZ, color="white"), self._scene_toggle_text_narrow], spacing=4, tight=True), bgcolor="purple900", visible=False, on_click=self.toggle_scene_mode, height=36)
+        self.wledcc_update_btn = ft.Button(
             "UPDATE APP",
             icon=ft.Icons.SYSTEM_UPDATE_ALT,
             color="black",
             bgcolor="yellow700",
             visible=False,
             height=20,
-            style=ft.ButtonStyle(padding=ft.padding.symmetric(horizontal=6, vertical=0)),
+            style=ft.ButtonStyle(padding=ft.Padding.symmetric(horizontal=6, vertical=0)),
             on_click=self.install_or_update_wledcc,
         )
-        self.ledfx_update_btn_wide   = ft.ElevatedButton("UPDATE LEDFX", icon=ft.Icons.DOWNLOAD_FOR_OFFLINE, color="black", bgcolor="yellow700", visible=False, on_click=self.install_or_update_ledfx)
-        self.ledfx_update_btn_narrow = ft.ElevatedButton("UPDATE LEDFX", icon=ft.Icons.DOWNLOAD_FOR_OFFLINE, color="black", bgcolor="yellow700", visible=False, on_click=self.install_or_update_ledfx)
+        self.ledfx_update_btn_wide   = ft.Button("UPDATE LEDFX", icon=ft.Icons.DOWNLOAD_FOR_OFFLINE, color="black", bgcolor="yellow700", visible=False, on_click=self.install_or_update_ledfx)
+        self.ledfx_update_btn_narrow = ft.Button("UPDATE LEDFX", icon=ft.Icons.DOWNLOAD_FOR_OFFLINE, color="black", bgcolor="yellow700", visible=False, on_click=self.install_or_update_ledfx)
         self.update_progress_bar = ft.ProgressBar(value=0, width=260, color="yellow700", bgcolor="#2b2b3b")
         self.update_percent_text = ft.Text("0%", size=10, color="yellow700")
         self.update_progress_label = ft.Text("DOWNLOAD", size=10, color="yellow700", weight="bold")
@@ -3156,8 +3181,10 @@ class WLEDApp:
         )
         # Convenience lists for broadcasting state to both layouts at once
         self._ledfx_btns        = [self.ledfx_btn_wide,          self.ledfx_btn_narrow]
+        self._ledfx_btn_texts   = [self._ledfx_btn_text_wide,    self._ledfx_btn_text_narrow]
         self._ledfx_ui_btns     = [self.ledfx_ui_btn_wide,       self.ledfx_ui_btn_narrow]
         self._scene_toggle_btns = [self.scene_toggle_btn_wide,   self.scene_toggle_btn_narrow]
+        self._scene_toggle_texts= [self._scene_toggle_text_wide, self._scene_toggle_text_narrow]
         self._ledfx_update_btns = [self.ledfx_update_btn_wide,   self.ledfx_update_btn_narrow]
         self._progress_bars     = [self.update_progress_bar]
         self._percent_texts     = [self.update_percent_text]
@@ -3171,6 +3198,10 @@ class WLEDApp:
             self._title_chars.append(
                 ft.Text(_ch, size=28, weight="bold", italic=True, color="#00f2ff")
             )
+        self._title_non_space = [c for c in self._title_chars if c.value != " "]
+        self._cached_cols = None
+        self._current_layout_w = 1200  # updated by _on_window_resize via e.width (the only reliable source)
+        self._last_title_solid_sig = None
 
         # ── Title animation controls (near SullySigns) ───────────────────────
         self._title_speed_slider = ft.Slider(
@@ -3181,7 +3212,7 @@ class WLEDApp:
         _title_color_btn = ft.Container(
             width=28, height=28, border_radius=6,
             gradient=ft.LinearGradient(
-                begin=ft.alignment.top_left, end=ft.alignment.bottom_right,
+                begin=ft.Alignment.TOP_LEFT, end=ft.Alignment.BOTTOM_RIGHT,
                 colors=["#FF0000","#FF8800","#FFFF00","#00FF00","#00FFFF","#0000FF","#FF00FF","#FF0000"],
             ),
             tooltip="Title color",
@@ -3192,7 +3223,7 @@ class WLEDApp:
             height=28, 
             border_radius=6,
             bgcolor="#1e2133",
-            border=ft.border.only(top=ft.border.BorderSide(1, "white10")), 
+            border=ft.Border.only(top=ft.BorderSide(1, "white10")), 
             shadow=[
                 ft.BoxShadow(
                     blur_radius=10, 
@@ -3214,7 +3245,7 @@ class WLEDApp:
         _border_color_btn = ft.Container(
             width=28, height=28, border_radius=6,
             gradient=ft.LinearGradient(
-                begin=ft.alignment.top_left, end=ft.alignment.bottom_right,
+                begin=ft.Alignment.TOP_LEFT, end=ft.Alignment.BOTTOM_RIGHT,
                 colors=["#FF0000","#FF8800","#FFFF00","#00FF00","#00FFFF","#0000FF","#FF00FF","#FF0000"],
             ),
             tooltip="Border color",
@@ -3226,7 +3257,7 @@ class WLEDApp:
             height=28, 
             border_radius=6,
             bgcolor="#1e2133",
-            border=ft.border.only(top=ft.border.BorderSide(1, "white10")), 
+            border=ft.Border.only(top=ft.BorderSide(1, "white10")), 
             shadow=[
                 ft.BoxShadow(
                     blur_radius=10, 
@@ -3244,9 +3275,10 @@ class WLEDApp:
             ft.Text(f"v{APP_VERSION}", size=10, color="grey600"),
             ft.TextButton(
                 content=ft.Text("by SullySSignS.ca", size=10, color="grey600"),
-                on_click=lambda _: self.page.launch_url("https://www.sullyssigns.ca"),
+                on_click=lambda _: webbrowser.open_new_tab("https://www.sullyssigns.ca"),
+                #self.page.launch_url("https://www.sullyssigns.ca"),
                 tooltip="Visit sullyssigns.ca",
-                style=ft.ButtonStyle(padding=ft.padding.all(0)),
+                style=ft.ButtonStyle(padding=ft.Padding.all(0)),
             ),
         ], vertical_alignment="end", spacing=6)
 
@@ -3257,144 +3289,21 @@ class WLEDApp:
         ], spacing=4, vertical_alignment=ft.CrossAxisAlignment.END)
         self._title_anim_wrap = ft.Container(
             content=self._title_anim_row,
-            padding=ft.padding.only(top=0),
+            padding=ft.Padding.only(top=0),
         )
 
-        # ── Winamp-style spectrum analyzer (in header gap) ───────────────────
-        _spec_palette = [
-            "#00a800", "#00b500", "#00c300", "#00d000", "#00dd00", "#22e000",
-            "#4de200", "#7ae400", "#a8e600", "#d6dd00", "#f0c400", "#f59f00",
-            "#f97800", "#fb4f00", "#fd2d00", "#ff0000",
-        ]
-        self._spec_segments = []
-        _band_controls = []
-        for _ in range(self._spec_bands):
-            _levels = []
-            for _lvl in range(self._spec_levels):
-                _c = ft.Container(
-                    width=7,
-                    height=2,
-                    border_radius=1,
-                    bgcolor="#101010",
-                )
-                _levels.append(_c)
-            self._spec_segments.append(_levels)
-            _band_controls.append(
-                ft.Column(_levels, spacing=1, tight=True, horizontal_alignment=ft.CrossAxisAlignment.CENTER)
-            )
-
-        self._spec_palette = _spec_palette
-        self._spec_grid_content = ft.Row(_band_controls, spacing=2, vertical_alignment=ft.CrossAxisAlignment.END)
-        self._spec_graphics_layer = ft.Stack([], expand=True)
-        self._spec_graphics_host = ft.Container(
-            expand=True,
-            bgcolor="#05050c",
-            content=self._spec_graphics_layer,
-            padding=ft.padding.only(left=8, right=8, top=6, bottom=6),
+        # ── Spectrum analyzer — delegate entirely to SpectrumController ──────
+        # SpectrumController reads/writes SA-config.json (shared with SA.py).
+        # self._sa_legacy_config was populated by load_cache() for one-time
+        # migration of users who previously only had settings in wledcc_cache.json.
+        self._sa = SpectrumController(
+            page             = self.page,
+            version_dir      = _VERSION_DIR,
+            legacy_config    = self._sa_legacy_config,
+            on_save          = self.save_cache,
+            log_fn           = self.log,
+            debug_mode_fn    = lambda: self.debug_mode,
         )
-
-        # ── Neon VU Meter host (canvas-based: Stack → bg image + cv.Canvas) ──
-        # Asset paths — swap these strings for your own files at any time.
-        #   Mode A "Retro-Tech"  → brushed metal.jpg   (orange / red needles)
-        #   Mode B "Neon Drift"  → nebula space.jpg     (cyan / magenta needles)
-        _nvu_bg_src = self._spec_nvu_drift_bg if self._neon_vu_theme == "neon_drift" else self._spec_nvu_retro_bg
-        # Build canvas surface (graceful no-op if cv module is unavailable)
-        if cv is not None:
-            _nvu_canvas = cv.Canvas(shapes=[], width=300, height=62)
-        else:
-            _nvu_canvas = ft.Container(width=300, height=62, bgcolor="transparent")
-        self._neon_vu_canvas = _nvu_canvas
-        # Background image — ft.ImageFit.COVER fills the box without distortion.
-        # If the asset file doesn't exist yet the image is hidden (visible=False)
-        # so Flet never tries to reload it, eliminating any image-error flicker.
-        _nvu_bg_file_exists = (_nvu_bg_src != "BLANK") and os.path.isfile(os.path.join(_VERSION_DIR, _nvu_bg_src))
-        self._neon_vu_bg_image = ft.Image(
-            src=_nvu_bg_src if _nvu_bg_file_exists else "",
-            visible=_nvu_bg_file_exists,
-            fit=ft.ImageFit.COVER,
-            width=300,
-            height=62,
-            opacity=0.80,
-        )
-        # Outer host: solid dark bgcolor acts as permanent background fallback
-        # (visible even when the image is absent or still loading).
-        # HARD_EDGE clip prevents needle arcs from bleeding outside the header box.
-        self._neon_vu_host = ft.Container(
-            width=300,
-            height=62,
-            bgcolor="#07071a",          # deep space dark — visible when no image
-            clip_behavior=ft.ClipBehavior.HARD_EDGE,
-            content=ft.Stack(
-                controls=[self._neon_vu_bg_image, _nvu_canvas],
-                width=300,
-                height=62,
-                clip_behavior=ft.ClipBehavior.HARD_EDGE,
-            ),
-        )
-
-        self._spectrum_box = ft.Container(
-            bgcolor="#060606",
-            border=ft.border.all(1, "#2b2b2b"),
-            border_radius=4,
-            padding=ft.padding.only(left=6, right=6, top=4, bottom=0),
-            width=self._spec_box_grid_size[0],
-            height=self._spec_box_grid_size[1],
-            content=self._spec_grid_content,
-            tooltip="PC Audio Spectrum",
-            ink=True,
-            on_click=self._open_spectrum_source_selector,
-        )
-        
-        # Spectrum audio source selector button
-        self._spec_idle_settings_btn = ft.IconButton(
-            icon=ft.Icons.TUNE,
-            icon_size=12,
-            icon_color="#ff9800",
-            tooltip="Idle effects settings",
-            style=ft.ButtonStyle(
-                bgcolor="transparent",
-                shape=ft.RoundedRectangleBorder(radius=6),
-                padding=ft.padding.all(1),
-            ),
-            on_click=self._open_spectrum_idle_settings,
-        )
-
-        self._spec_settings_btn = ft.IconButton(
-            icon=ft.Icons.MENU,
-            icon_size=12,
-            icon_color="#ff9800",
-            tooltip="Spectrum settings",
-            style=ft.ButtonStyle(
-                bgcolor="transparent",
-                shape=ft.RoundedRectangleBorder(radius=6),
-                padding=ft.padding.all(1),
-            ),
-            on_click=self._open_spectrum_source_selector,
-        )
-
-        self._spec_sampling_btn = ft.IconButton(
-            icon=ft.Icons.MIC,
-            icon_size=12,
-            tooltip="Sampling ON",
-            style=ft.ButtonStyle(
-                bgcolor="transparent",
-                shape=ft.RoundedRectangleBorder(radius=5),
-                padding=ft.padding.all(1),
-            ),
-            on_click=self._toggle_spec_sampling,
-        )
-        self._spec_idle_quick_btn = ft.IconButton(
-            icon=ft.Icons.AUTO_AWESOME,
-            icon_size=12,
-            tooltip="Idle effects ON",
-            style=ft.ButtonStyle(
-                bgcolor="transparent",
-                shape=ft.RoundedRectangleBorder(radius=5),
-                padding=ft.padding.all(1),
-            ),
-            on_click=self._toggle_spec_idle_quick,
-        )
-        self._sync_spec_quick_buttons()
 
         self._title_combined_row = ft.Row([
             self._title_meta_row,
@@ -3405,29 +3314,47 @@ class WLEDApp:
         ], spacing=0, tight=True, expand=True)
         self._title_left_wrap = ft.Container(
             content=self._title_left_col,
-            padding=ft.padding.only(bottom=0),
+            padding=ft.Padding.only(bottom=0),
             expand=True,
         )
         self._header_title_split = False
 
+        self._simplified_view_btn = ft.IconButton(
+            icon=ft.Icons.FULLSCREEN,
+            icon_color="grey400",
+            tooltip="Toggle simplified view (hide log and controls)",
+            on_click=self._toggle_simplified_view,
+        )
         self._header_right_row = ft.Row([
             ft.Row([
                 self._border_speed_slider,
                 _border_color_btn,
                 _border_effect_btn,
             ], spacing=4, vertical_alignment=ft.CrossAxisAlignment.END),
+            self._simplified_view_btn,
             self.refresh_btn,
         ], spacing=10, vertical_alignment=ft.CrossAxisAlignment.END)
 
+        # SA status text overlay (visible in debug mode)
+        self._sa_status_overlay = ft.Container(
+            content=self._sa.status_text,
+            left=4, bottom=2,
+            visible=False,
+        )
+
         self.header = ft.Row([
             self._title_left_wrap,
-            ft.Row([
-                ft.Column([self._spec_sampling_btn, self._spec_settings_btn], spacing=0, tight=True),
-                self._spectrum_box,
-                ft.Column([self._spec_idle_quick_btn, self._spec_idle_settings_btn], spacing=0, tight=True),
-            ], spacing=2, vertical_alignment=ft.CrossAxisAlignment.END),
+            ft.Container(
+                content=ft.Stack([
+                    self._sa.widget,
+                    self._sa.btn_overlay,
+                    self._sa_status_overlay,
+                ]),
+                on_hover=self._sa._on_sa_hover,
+            ),
             self._header_right_row,
         ], alignment="start", vertical_alignment=ft.CrossAxisAlignment.END)
+
 
         self.top_update_row = ft.Row(
             [self.wledcc_update_btn],
@@ -3465,19 +3392,25 @@ class WLEDApp:
         self._slider_actual_width = 999  # estimated in _should_use_narrow from window width
 
         # Controls that are truly shared (buttons, not rendered in the tree twice simultaneously)
-        _all_off  = ft.ElevatedButton("ALL OFF", on_click=lambda _: self.broadcast_power(False), bgcolor="red900", color="white", height=36)
-        _all_on   = ft.ElevatedButton("ALL ON",  on_click=lambda _: self.broadcast_power(True),  bgcolor="green900", color="white", height=36)
+        _all_off  = ft.Button("ALL OFF", on_click=lambda _: self.broadcast_power(False), bgcolor="red900", color="white", height=36)
+        _all_on   = ft.Button("ALL ON",  on_click=lambda _: self.broadcast_power(True),  bgcolor="green900", color="white", height=36)
         _log_btn  = ft.TextButton(
             content=ft.Row([ft.Icon(ft.Icons.TERMINAL, size=16, color="grey400"), ft.Text("OPEN LOG", size=10, color="grey400")], spacing=4, tight=True),
-            on_click=self.toggle_logs, style=ft.ButtonStyle(padding=ft.padding.symmetric(horizontal=8, vertical=6)))
+            on_click=self.toggle_logs, style=ft.ButtonStyle(padding=ft.Padding.symmetric(horizontal=8, vertical=6)))
         _man_btn  = ft.TextButton(
             content=ft.Row([ft.Icon(ft.Icons.HELP_OUTLINE, size=16, color="grey400"), ft.Text("MANUAL", size=10, color="grey400")], spacing=4, tight=True),
-            on_click=self.show_help, style=ft.ButtonStyle(padding=ft.padding.symmetric(horizontal=8, vertical=6)))
-        self._merge_btn_icon = ft.Icon(ft.Icons.MERGE, size=16, color="grey400")
-        self._merge_btn_text = ft.Text("MERGE", size=10, color="grey400")
-        _merge_btn = ft.TextButton(
-            content=ft.Row([self._merge_btn_icon, self._merge_btn_text], spacing=4, tight=True),
-            on_click=self.start_merge_mode, style=ft.ButtonStyle(padding=ft.padding.symmetric(horizontal=8, vertical=6)),
+            on_click=self.show_help, style=ft.ButtonStyle(padding=ft.Padding.symmetric(horizontal=8, vertical=6)))
+        self._merge_btn_icon_wide   = ft.Icon(ft.Icons.MERGE, size=16, color="grey400")
+        self._merge_btn_text_wide   = ft.Text("MERGE", size=10, color="grey400")
+        self._merge_btn_icon_narrow = ft.Icon(ft.Icons.MERGE, size=16, color="grey400")
+        self._merge_btn_text_narrow = ft.Text("MERGE", size=10, color="grey400")
+        _merge_btn_wide = ft.TextButton(
+            content=ft.Row([self._merge_btn_icon_wide, self._merge_btn_text_wide], spacing=4, tight=True),
+            on_click=self.start_merge_mode, style=ft.ButtonStyle(padding=ft.Padding.symmetric(horizontal=8, vertical=6)),
+            tooltip="Drag a new card onto an old card to replace its IP")
+        _merge_btn_narrow = ft.TextButton(
+            content=ft.Row([self._merge_btn_icon_narrow, self._merge_btn_text_narrow], spacing=4, tight=True),
+            on_click=self.start_merge_mode, style=ft.ButtonStyle(padding=ft.Padding.symmetric(horizontal=8, vertical=6)),
             tooltip="Drag a new card onto an old card to replace its IP")
         # ledfx rows — the same button instances are referenced in both layouts.
         # Since only one layout is visible at a time and these controls are never
@@ -3507,7 +3440,7 @@ class WLEDApp:
         # WIDE layout — single row, all controls side by side
         self._master_wide = ft.Row([
             ft.Column([
-                ft.Row([_all_off, _all_on, _log_btn, _man_btn, _merge_btn], spacing=4)
+                ft.Row([_all_off, _all_on, _log_btn, _man_btn, _merge_btn_wide], spacing=4)
             ], tight=True),
             ft.Column([
                 _bri_row_wide,
@@ -3520,7 +3453,7 @@ class WLEDApp:
         self._master_narrow = ft.Column([
             ft.Row([
                 ft.Column([
-                    ft.Row([_all_off, _all_on, _log_btn, _man_btn], spacing=4)
+                    ft.Row([_all_off, _all_on, _log_btn, _man_btn, _merge_btn_narrow], spacing=4)
                 ], tight=True),
                 ft.Container(content=_slider_narrow, expand=True),
                 ft.Column([_ledfx_row_narrow],
@@ -3534,7 +3467,7 @@ class WLEDApp:
 
         self.master_bar = ft.Container(
             content=ft.Column([self._master_wide, self._master_narrow], spacing=0),
-            padding=10, bgcolor="#121218", border_radius=10, border=ft.border.all(1, "#2b2b3b")
+            padding=10, bgcolor="#121218", border_radius=10, border=ft.Border.all(1, "#2b2b3b")
         )
         
         self.device_list = ft.ResponsiveRow(spacing=15, run_spacing=15, columns=60)
@@ -3548,21 +3481,23 @@ class WLEDApp:
             expand=True,
         )
         self._main_col = ft.Column(
-            [self.log_row, self.update_progress_row, self.top_update_row, self.header, self.master_bar,
+            [self.log_row, self.update_progress_row, self.top_update_row,
+             self.header,
+             self._sa.menu_host,   # SA settings panel — hidden until menu opens
+             self.master_bar,
              ft.Divider(height=10, color="transparent"), self._device_scroll],
             spacing=2,
             scroll=None,
             expand=True,
         )
         self.page.add(self._main_col)
-        # Apply correct col width immediately based on starting window size
-        try:
-            w = self.page.window.width or 1200
-        except:
-            w = getattr(self.page, 'window_width', 1200) or 1200
-        self._apply_col_width(w)
-        self._apply_header_layout(w)
-        self._apply_master_layout(w)
+        # Seed _current_layout_w from the saved width so new cards created during
+        # startup get the right col value. page.on_resize will update this to the
+        # real width as soon as the OS reports it.
+        self._current_layout_w = saved_w
+        self._apply_col_width(saved_w)
+        self._apply_header_layout(saved_w)
+        self._apply_master_layout(saved_w)
         
         # Restore mixed card order (WLED + custom) exactly as saved.
         # Only force the + Add Device card to the end.
@@ -3614,7 +3549,7 @@ class WLEDApp:
             btn = ft.Container(
                 width=110, height=44,
                 border_radius=6,
-                border=ft.border.all(1, "#2b2b3b"),
+                border=ft.Border.all(1, "#2b2b3b"),
                 bgcolor="#1e1e2a",
                 ink=True,
                 tooltip="Record current state as a scene",
@@ -3628,9 +3563,9 @@ class WLEDApp:
             btn = ft.Container(
                 width=110, height=44,
                 border_radius=6,
-                border=ft.border.all(1, "#2b2b3b"),
+                border=ft.Border.all(1, "#2b2b3b"),
                 bgcolor="#1e1e2a",
-                padding=ft.padding.symmetric(horizontal=4, vertical=4),
+                padding=ft.Padding.symmetric(horizontal=4, vertical=4),
                 content=ft.Column([
                     ft.Container(
                         content=ft.Text(scene["name"], size=10, weight="bold",
@@ -3642,13 +3577,13 @@ class WLEDApp:
                     ),
                     ft.Row([
                         ft.IconButton(ft.Icons.EDIT, icon_size=10, icon_color="grey600",
-                            tooltip="Rename", padding=ft.padding.all(2),
+                            tooltip="Rename", padding=ft.Padding.all(2),
                             on_click=lambda _, i=idx: self.rename_scene(i)),
                         ft.IconButton(ft.Icons.CLOSE, icon_size=10, icon_color="red400",
-                            tooltip="Clear", padding=ft.padding.all(2),
+                            tooltip="Clear", padding=ft.Padding.all(2),
                             on_click=lambda _, i=idx: self.clear_scene(i)),
                         ft.IconButton(ft.Icons.TUNE, icon_size=10, icon_color="cyan",
-                            tooltip="Edit scene devices", padding=ft.padding.all(2),
+                            tooltip="Edit scene devices", padding=ft.Padding.all(2),
                             on_click=lambda _, i=idx: self.edit_scene(i)),
                     ], spacing=0, alignment="center"),
                 ], spacing=0, tight=True, horizontal_alignment="center"),
@@ -3694,10 +3629,7 @@ class WLEDApp:
         self.scene_row_narrow.controls.clear()
         self.scene_row_narrow.controls.extend(narrow_btns)
         # Recalculate layout — adding scenes may force switch to narrow
-        try:
-            w = self.page.window.width or 1200
-        except AttributeError:
-            w = getattr(self.page, "window_width", 1200) or 1200
+        w = getattr(self, '_current_layout_w', None) or 1200
         self._apply_master_layout(w)
         try:
             self.master_bar.update()
@@ -3762,10 +3694,11 @@ class WLEDApp:
                 self.log(f"[LedFx] Retrying scene fetch ({attempt + 1}/{max_attempts})...", color="orange400")
         # Restore toggle button text and rebuild row regardless of success/failure
         if self._scene_mode == "ledfx":
+            for _st in self._scene_toggle_texts:
+                _st.value = "WLED SCENES"
+                _st.color = "white"
             for _t in self._scene_toggle_btns:
-                _t.text = "WLED SCENES"
                 _t.bgcolor = "cyan"
-                _t.color = "black"
                 try: _t.update()
                 except: pass
             self._rebuild_scene_rows_for_mode()
@@ -3777,10 +3710,10 @@ class WLEDApp:
             self._scene_mode = "ledfx"
             if self.auto_restore_ledfx_scene and self.last_ledfx_scene_id:
                 self._pending_ledfx_scene_restore = True
+            for _st in self._scene_toggle_texts:
+                _st.value = "LOADING..."
             for _t in self._scene_toggle_btns:
-                _t.text = "LOADING..."
                 _t.bgcolor = "grey700"
-                _t.color = "white"
                 try: _t.update()
                 except: pass
             self.log("[Scene] Switched to LedFx scenes", color="purple")
@@ -3789,10 +3722,10 @@ class WLEDApp:
             return  # _fetch_ledfx_scenes rebuilds the row when done
         else:
             self._scene_mode = "wled"
+            for _st in self._scene_toggle_texts:
+                _st.value = "LEDFX SCENES"; _st.color = "white"
             for _t in self._scene_toggle_btns:
-                _t.text = "LEDFX SCENES"
                 _t.bgcolor = "purple900"
-                _t.color = "white"
                 try: _t.update()
                 except: pass
             self.log("[Scene] Switched to WLED scenes", color="cyan")
@@ -3831,10 +3764,7 @@ class WLEDApp:
         self.scene_row_narrow.controls.extend(narrow_btns)
         if self._scene_mode == "ledfx":
             self._apply_ledfx_scene_glow()
-        try:
-            w = self.page.window.width or 1200
-        except AttributeError:
-            w = getattr(self.page, "window_width", 1200) or 1200
+        w = getattr(self, '_current_layout_w', None) or 1200
         self._apply_master_layout(w)
         try:
             self.master_bar.update()
@@ -3852,9 +3782,9 @@ class WLEDApp:
         btn = ft.Container(
             width=96, height=44,
             border_radius=6,
-            border=ft.border.all(1, "purple700"),
+            border=ft.Border.all(1, "purple700"),
             bgcolor="#1a1a2e",
-            padding=ft.padding.symmetric(horizontal=4, vertical=4),
+            padding=ft.Padding.symmetric(horizontal=4, vertical=4),
             ink=True,
             tooltip=f"Activate LedFx scene: {scene_name}",
             on_click=_activate,
@@ -3885,7 +3815,7 @@ class WLEDApp:
         for scene_id, refs in list(self.ledfx_scene_btn_refs.items()):
             for ref, _nt in refs:
                 try:
-                    ref.border = ft.border.all(1, glow_color if active is not None and scene_id == active else "purple700")
+                    ref.border = ft.Border.all(1, glow_color if active is not None and scene_id == active else "purple700")
                     ref.update()
                 except:
                     pass
@@ -4079,17 +4009,15 @@ class WLEDApp:
         for ctrl in list(self.device_list.controls):
             if getattr(ctrl, "data", None) == "__add_device__":
                 self.device_list.controls.remove(ctrl)
-        try:
-            _cur_w = self.page.window.width or 1200
-        except AttributeError:
-            _cur_w = getattr(self.page, 'window_width', 1200) or 1200
+                self._ordered_dirty = True
+        _cur_w = getattr(self, '_current_layout_w', None) or 1200
         _col_map = {1: 60, 2: 30, 3: 20, 4: 15, 5: 12}
         _cur_col = _col_map[self._cols_for_width(_cur_w)]
         placeholder = ft.Container(
             data="__add_device__",
             col=_cur_col,
             content=ft.Container(
-                border=ft.border.all(2, "#2b2b3b"),
+                border=ft.Border.all(2, "#2b2b3b"),
                 border_radius=12,
                 bgcolor="#0e0e14",
                 ink=True,
@@ -4099,7 +4027,7 @@ class WLEDApp:
                     ft.Icon(ft.Icons.ADD_CIRCLE_OUTLINE, size=32, color="#2b2b3b"),
                     ft.Text("ADD DEVICE", size=10, color="#2b2b3b", weight="bold"),
                 ], alignment="center", horizontal_alignment="center", spacing=6),
-                padding=ft.padding.symmetric(vertical=24),
+                padding=ft.Padding.symmetric(vertical=24),
             ),
         )
         self.device_list.controls.append(placeholder)
@@ -4311,7 +4239,7 @@ class WLEDApp:
                 name_field,
             ], tight=True, spacing=10, width=360)
             dlg.actions = [
-                ft.ElevatedButton("Add", bgcolor="cyan", color="black", on_click=_add),
+                ft.Button("Add", bgcolor="cyan", color="black", on_click=_add),
                 ft.TextButton("Cancel", on_click=lambda _: (setattr(dlg, "open", False), self.page.update())),
             ]
             try: dlg.update()
@@ -4327,7 +4255,7 @@ class WLEDApp:
                 ft.Text("Enter an IP address, local hostname, web URL, or browse to an EXE:", size=12, color="grey400"),
                 ft.Row([
                     field,
-                    ft.ElevatedButton(
+                    ft.Button(
                         "Browse EXE",
                         icon=ft.Icons.FOLDER_OPEN,
                         bgcolor="#1e1e2e",
@@ -4337,7 +4265,7 @@ class WLEDApp:
                     ),
                 ], spacing=8, vertical_alignment=ft.CrossAxisAlignment.CENTER),
                 ft.Row([
-                    ft.ElevatedButton(
+                    ft.Button(
                         "Add Winamp",
                         icon=ft.Icons.LIBRARY_MUSIC,
                         bgcolor="#1e1e2e",
@@ -4345,7 +4273,7 @@ class WLEDApp:
                         on_click=_quick_install_winamp,
                         style=ft.ButtonStyle(side=ft.BorderSide(1, "cyan")),
                     ),
-                    ft.ElevatedButton(
+                    ft.Button(
                         "Spotify.com",
                         icon=ft.Icons.LANGUAGE,
                         bgcolor="#1e1e2e",
@@ -4353,7 +4281,7 @@ class WLEDApp:
                         on_click=_quick_add_spotify,
                         style=ft.ButtonStyle(side=ft.BorderSide(1, "cyan")),
                     ),
-                    ft.ElevatedButton(
+                    ft.Button(
                         "Spotify App",
                         icon=ft.Icons.ALBUM,
                         bgcolor="#1e1e2e",
@@ -4365,7 +4293,7 @@ class WLEDApp:
                 status_text,
             ], tight=True, spacing=10, width=480),
             actions=[
-                ft.ElevatedButton("Probe", bgcolor="cyan", color="black", on_click=_probe),
+                ft.Button("Probe", bgcolor="cyan", color="black", on_click=_probe),
                 ft.TextButton("Cancel", on_click=_cancel),
             ]
         )
@@ -4448,8 +4376,13 @@ class WLEDApp:
         c["_is_active"] = bool(active)
         c["_glow_state"] = "on" if active else "offline"
         if not active:
-            c["glow"].border = ft.border.all(2, "#2b2b3b")
+            c["glow"].border = ft.Border.all(2, "#2b2b3b")
             c["glow"].bgcolor = "#121420"
+        self._ordered_dirty = True
+        try:
+            c["glow"].update()
+        except Exception:
+            pass
 
     def _is_winamp_target(self, path):
         try:
@@ -5132,11 +5065,7 @@ class WLEDApp:
         return False
 
     def _is_sa_audio_detected(self):
-        try:
-            _age = time.monotonic() - float(self._spec_last_audio_ts)
-            return (not bool(self._spec_idle_active)) and (_age <= 2.0)
-        except Exception:
-            return False
+        return self._sa.is_audio_detected() if self._sa else False
 
     def _should_run_spotify_media_listener(self):
         if time.monotonic() < float(getattr(self, "_spotify_media_listener_earliest_ts", 0.0)):
@@ -5335,7 +5264,7 @@ class WLEDApp:
         _engaged = bool(_web_open)
         c["_glow_state"] = "on" if _engaged else "off"
         if not _engaged:
-            c["glow"].border = ft.border.all(2, "#2b2b3b")
+            c["glow"].border = ft.Border.all(2, "#2b2b3b")
             c["glow"].bgcolor = "#121420"
         try:
             c["glow"].update()
@@ -5567,7 +5496,8 @@ class WLEDApp:
 
         if (not _opened) and allow_shared_fallback:
             try:
-                self.page.launch_url(target)
+                webbrowser.open(target, new=2)  # new=2 -> open in new tab if possible
+                #self.page.run_task(lambda: ft.UrlLauncher().launch_url(target))
                 _opened = True
             except Exception:
                 return False
@@ -5966,7 +5896,9 @@ class WLEDApp:
 
         # URL cards open in normal browser mode (no managed profile).
         try:
-            self.page.launch_url(target)
+            webbrowser.open(target, new=2)  # new=2 -> open in new tab if possible
+            #self.page.run_task(lambda: ft.UrlLauncher().launch_url(target))
+            #self.page.launch_url(target)
             self.custom_launch_state.pop(key, None)
             self._update_custom_card_launch_ui(key, False)
             prefix = "[Auto Start]" if auto else "[Web]"
@@ -6245,7 +6177,7 @@ class WLEDApp:
         info_slot = ft.Container(
             content=info_text,
             height=26,
-            alignment=ft.alignment.top_left,
+            alignment=ft.Alignment.TOP_LEFT,
         )
 
         edit_btn = ft.IconButton(ft.Icons.EDIT, icon_size=13, icon_color="grey500",
@@ -6262,11 +6194,11 @@ class WLEDApp:
             # Exe card — show program icon and launch/close button
             type_tag = ft.Container(
                 content=ft.Icon(ft.Icons.TERMINAL, size=14, color="green400"),
-                padding=ft.padding.symmetric(3, 5), border_radius=4,
-                bgcolor="#1e1e2a", border=ft.border.all(1, "#2b2b3b"),
+                padding=ft.Padding.symmetric(horizontal=3, vertical=5), border_radius=4,
+                bgcolor="#1e1e2a", border=ft.Border.all(1, "#2b2b3b"),
                 tooltip=url,
             )
-            action_btn = ft.ElevatedButton(
+            action_btn = ft.Button(
                 content=ft.Row([launch_btn_icon, launch_btn_text], spacing=4, tight=True),
                 bgcolor="#1a1a2e", color="white",
                 on_click=lambda _, k=key: self._toggle_custom_target(k),
@@ -6277,13 +6209,13 @@ class WLEDApp:
             _domain = url.replace("https://","").replace("http://","").split("/")[0]
             favicon_url = f"https://t2.gstatic.com/faviconV2?client=SOCIAL&type=FAVICON&fallback_opts=TYPE,SIZE,URL&url=https://{_domain}&size=64"
             type_tag = ft.Container(
-                content=ft.Image(src=favicon_url, width=16, height=16, fit=ft.ImageFit.CONTAIN,
+                content=ft.Image(src=favicon_url, width=16, height=16, fit=ft.BoxFit.CONTAIN,
                     error_content=ft.Icon(ft.Icons.LANGUAGE, size=14, color="grey500")),
-                padding=ft.padding.symmetric(3, 5), border_radius=4,
-                bgcolor="#1e1e2a", border=ft.border.all(1, "#2b2b3b"),
+                padding=ft.Padding.symmetric(horizontal=3, vertical=5), border_radius=4,
+                bgcolor="#1e1e2a", border=ft.Border.all(1, "#2b2b3b"),
                 tooltip=url,
             )
-            action_btn = ft.ElevatedButton(
+            action_btn = ft.Button(
                 content=ft.Row([launch_btn_icon, launch_btn_text], spacing=4, tight=True),
                 bgcolor="#1a1a2e", color="white",
                 on_click=lambda _, k=key: self._toggle_custom_target(k),
@@ -6304,10 +6236,10 @@ class WLEDApp:
         )
 
         compact_icon_btn_style = ft.ButtonStyle(
-            padding=ft.padding.symmetric(horizontal=1, vertical=0),
+            padding=ft.Padding.symmetric(horizontal=1, vertical=0),
         )
         compact_combo_btn_style = ft.ButtonStyle(
-            padding=ft.padding.symmetric(horizontal=2, vertical=0),
+            padding=ft.Padding.symmetric(horizontal=2, vertical=0),
         )
 
         winamp_controls = ft.Container(
@@ -6410,7 +6342,7 @@ class WLEDApp:
         # Match standard card layout exactly — 3 rows + drag handle
         card = ft.Container(
             data=key, bgcolor="#121420", border_radius=12,
-            padding=ft.padding.only(left=10, right=10, top=7, bottom=7),
+            padding=ft.Padding.only(left=10, right=10, top=7, bottom=7),
             content=ft.Column([
                 # ROW 1: favicon tag | name | ✏ | ✕ | spacer | OPEN/CLOSE
                 ft.Row([
@@ -6438,19 +6370,19 @@ class WLEDApp:
         )
 
         glow = ft.Container(content=card, border_radius=13,
-            border=ft.border.all(2, "#2b2b3b"), bgcolor="#121420", padding=2)
+            border=ft.Border.all(2, "#2b2b3b"), bgcolor="#121420", padding=2)
 
         # Drag handle — same as standard cards
         feedback = ft.Container(
             content=ft.Text(display_name, color="white", size=13, weight="bold"),
             bgcolor="#00f2ff22", border_radius=8, padding=10,
-            border=ft.border.all(1, "#00f2ff"))
+            border=ft.Border.all(1, "#00f2ff"))
         handle_draggable = ft.Draggable(
             group="cards", data=key,
             content=ft.Container(
                 content=ft.Icon(ft.Icons.DRAG_INDICATOR, size=20, color="grey500"),
                 tooltip="Drag to reorder",
-                padding=ft.padding.only(right=6, top=4, bottom=4),
+                padding=ft.Padding.only(right=6, top=4, bottom=4),
                 border_radius=6, ink=True,
             ),
             content_feedback=feedback,
@@ -6464,14 +6396,11 @@ class WLEDApp:
 
         drag_target = ft.DragTarget(
             group="cards", content=card_with_handle,
-            on_accept=lambda e, tgt=key: self.drag_card(self._parse_drag_src(e.data), tgt),
-            on_will_accept=lambda e, src=key: self._parse_drag_src(e.data) != src,
+            on_accept=lambda e, tgt=key: self.drag_card(e.src.data, tgt),
+            on_will_accept=lambda e, src=key: e.src.data != src,
         )
 
-        try:
-            _cur_w = self.page.window.width or 1200
-        except AttributeError:
-            _cur_w = getattr(self.page, 'window_width', 1200) or 1200
+        _cur_w = getattr(self, '_current_layout_w', None) or 1200
         _col_map = {1: 60, 2: 30, 3: 20, 4: 15, 5: 12}
         cell = ft.Container(content=drag_target, col=_col_map[self._cols_for_width(_cur_w)], data=key)
 
@@ -6577,7 +6506,7 @@ class WLEDApp:
             c["status"].value = "ONLINE" if online else "OFFLINE"
             c["status"].color = "cyan" if online else "red"
             if not c.get("_is_active"):
-                c["glow"].border = ft.border.all(2, "#2b2b3b" if online else "#5a0000")
+                c["glow"].border = ft.Border.all(2, "#2b2b3b" if online else "#5a0000")
                 c["glow"].bgcolor = "#121420" if online else "#1a0505"
             try: c["glow"].update(); c["status"].update()
             except: pass
@@ -6598,6 +6527,7 @@ class WLEDApp:
             cell = c.get("cell")
             if cell and cell in self.device_list.controls:
                 self.device_list.controls.remove(cell)
+                self._ordered_dirty = True
             self.cards.pop(key, None)
             self.custom_devices.pop(key, None)
             self.custom_launch_state.pop(key, None)
@@ -6618,7 +6548,7 @@ class WLEDApp:
             title=ft.Text("Remove device?"),
             content=ft.Text(f"Remove '{name}'?", size=13),
             actions=[
-                ft.ElevatedButton("Remove", bgcolor="red900", color="white", on_click=_confirm),
+                ft.Button("Remove", bgcolor="red900", color="white", on_click=_confirm),
                 ft.TextButton("Cancel", on_click=_cancel),
             ]
         )
@@ -6736,7 +6666,7 @@ class WLEDApp:
                 ),
             ),
             actions=[
-                ft.ElevatedButton("Save", bgcolor="cyan", color="black", on_click=_save),
+                ft.Button("Save", bgcolor="cyan", color="black", on_click=_save),
                 ft.TextButton("Cancel", on_click=_cancel),
             ]
         )
@@ -6777,7 +6707,7 @@ class WLEDApp:
                     field,
                 ], tight=True, spacing=10),
                 actions=[
-                    ft.ElevatedButton("Save", bgcolor="cyan", color="black", on_click=_save),
+                    ft.Button("Save", bgcolor="cyan", color="black", on_click=_save),
                     ft.TextButton("Cancel", on_click=_cancel),
                 ]
             )
@@ -6807,7 +6737,7 @@ class WLEDApp:
         if old is not None and old != idx and old in self.scene_btn_refs:
             for ref, _ in self.scene_btn_refs[old]:
                 try:
-                    ref.border = ft.border.all(1, "#2b2b3b")
+                    ref.border = ft.Border.all(1, "#2b2b3b")
                     ref.update()
                 except: pass
 
@@ -6817,6 +6747,7 @@ class WLEDApp:
                 try:
                     name_text.value = "LOADING..."
                     name_text.color = "grey400"
+                    name_text.update()
                     ref.update()
                 except: pass
 
@@ -6996,6 +6927,7 @@ class WLEDApp:
                             try:
                                 name_text.value = scene_name
                                 name_text.color = "#00f2ff"
+                                name_text.update()
                                 ref.update()
                             except: pass
                     return
@@ -7131,6 +7063,7 @@ class WLEDApp:
                             try:
                                 name_text.value = scene_name
                                 name_text.color = "#00f2ff"
+                                name_text.update()
                                 ref.update()
                             except:
                                 pass
@@ -7143,6 +7076,7 @@ class WLEDApp:
                         try:
                             name_text.value = result_text
                             name_text.color = result_color
+                            name_text.update()
                             ref.update()
                         except:
                             pass
@@ -7154,6 +7088,7 @@ class WLEDApp:
                         try:
                             name_text.value = scene_name
                             name_text.color = "#00f2ff"
+                            name_text.update()
                             ref.update()
                         except:
                             pass
@@ -7194,7 +7129,7 @@ class WLEDApp:
             title=ft.Text("Clear scene?"),
             content=ft.Text(f"Remove '{scene['name']}'?", size=13),
             actions=[
-                ft.ElevatedButton("Clear", bgcolor="red900", color="white", on_click=_confirm),
+                ft.Button("Clear", bgcolor="red900", color="white", on_click=_confirm),
                 ft.TextButton("Cancel", on_click=_cancel),
             ]
         )
@@ -7224,7 +7159,7 @@ class WLEDApp:
             title=ft.Text("Rename scene"),
             content=field,
             actions=[
-                ft.ElevatedButton("Save", bgcolor="cyan", color="black", on_click=_save),
+                ft.Button("Save", bgcolor="cyan", color="black", on_click=_save),
                 ft.TextButton("Cancel", on_click=_cancel),
             ]
         )
@@ -7249,7 +7184,7 @@ class WLEDApp:
                 ft.Text("The device will reappear if still on your network.", size=11, color="grey500"),
             ], tight=True, spacing=6),
             actions=[
-                ft.ElevatedButton("Remove", bgcolor="red900", color="white", on_click=_confirm),
+                ft.Button("Remove", bgcolor="red900", color="white", on_click=_confirm),
                 ft.TextButton("Cancel", on_click=_cancel),
             ]
         )
@@ -7266,6 +7201,7 @@ class WLEDApp:
         cell = self.cards[ip]["cell"]
         if cell in self.device_list.controls:
             self.device_list.controls.remove(cell)
+            self._ordered_dirty = True
         # Remove from all tracking dicts
         self.cards.pop(ip, None)
         self.devices.pop(ip, None)
@@ -7281,6 +7217,7 @@ class WLEDApp:
         self.ledfx_devices.discard(ip)
         self.poll_counters.pop(ip, None)
         self.live_ips.discard(ip)
+        self._ordered_dirty = True
         # MH bridge cleanup
         self.mh_live_ips.discard(ip)
         self._mh_stop_bulb_worker(ip)
@@ -7328,7 +7265,7 @@ class WLEDApp:
                 field,
             ], tight=True, spacing=10),
             actions=[
-                ft.ElevatedButton("Save", bgcolor="cyan", color="black", on_click=do_save),
+                ft.Button("Save", bgcolor="cyan", color="black", on_click=do_save),
                 ft.TextButton("Cancel", on_click=do_cancel),
             ]
         )
@@ -7391,7 +7328,7 @@ class WLEDApp:
                 status_text,
             ], tight=True, spacing=10, width=360),
             actions=[
-                ft.ElevatedButton("Save", bgcolor="cyan", color="black", on_click=_do_save),
+                ft.Button("Save", bgcolor="cyan", color="black", on_click=_do_save),
                 ft.TextButton("Cancel", on_click=_cancel),
             ],
         )
@@ -7403,15 +7340,7 @@ class WLEDApp:
 
     def show_anim_color_picker(self, target):
         """Color picker for title or border animation. target = 'title' or 'border'."""
-        COLORS = [
-            ("#FF0000","Red"),("#FF4400","Orange-Red"),("#FF8800","Orange"),
-            ("#FFCC00","Amber"),("#FFFF00","Yellow"),("#AAFF00","Lime"),
-            ("#00FF00","Green"),("#00FFAA","Mint"),("#00FFFF","Cyan"),
-            ("#0088FF","Sky"),("#0000FF","Blue"),("#4400FF","Indigo"),
-            ("#8800FF","Violet"),("#FF00FF","Magenta"),("#FF0088","Pink"),
-            ("#FF88AA","Rose"),("#FFFFFF","White"),("#AAAAAA","Warm White"),
-            ("#444444","Dim"),("#000000","Off"),
-        ]
+        COLORS = _SWATCH_COLORS
         def pick(hex_c, _dlg):
             _dlg.open = False
             self.page.update()
@@ -7422,7 +7351,7 @@ class WLEDApp:
             self.save_cache()
         swatches = [
             ft.Container(width=44, height=44, border_radius=8, bgcolor=hex_c,
-                border=ft.border.all(1,"#ffffff22"), tooltip=cname, ink=True,
+                border=ft.Border.all(1,"#ffffff22"), tooltip=cname, ink=True,
                 on_click=lambda _, h=hex_c, cn=cname: pick(h, dlg))
             for hex_c, cname in COLORS
         ]
@@ -7492,15 +7421,7 @@ class WLEDApp:
 
     def show_color_picker(self, ip):
         """Popup grid of common colors + send to device on tap."""
-        COLORS = [
-            ("#FF0000","Red"),("#FF4400","Orange-Red"),("#FF8800","Orange"),
-            ("#FFCC00","Amber"),("#FFFF00","Yellow"),("#AAFF00","Lime"),
-            ("#00FF00","Green"),("#00FFAA","Mint"),("#00FFFF","Cyan"),
-            ("#0088FF","Sky"),("#0000FF","Blue"),("#4400FF","Indigo"),
-            ("#8800FF","Violet"),("#FF00FF","Magenta"),("#FF0088","Pink"),
-            ("#FF88AA","Rose"),("#FFFFFF","White"),("#AAAAAA","Warm White"),
-            ("#444444","Dim"),("#000000","Off"),
-        ]
+        COLORS = _SWATCH_COLORS
         def send_color(hex_c, cname, _dlg):
             # Close immediately — send in background
             _dlg.open = False
@@ -7555,7 +7476,7 @@ class WLEDApp:
                 ft.Container(
                     width=44, height=44, border_radius=8,
                     bgcolor=hex_c,
-                    border=ft.border.all(1,"#ffffff22"),
+                    border=ft.Border.all(1,"#ffffff22"),
                     tooltip=cname,
                     ink=True,
                     on_click=lambda _, h=hex_c, cn=cname: send_color(h, cn, dlg),
@@ -7792,15 +7713,16 @@ class WLEDApp:
         type_tag = ft.Container(
             content=ft.Text("WLED" if is_wled else "MH", size=9, weight="bold", color="white"),
             bgcolor="blue900" if is_wled else "green900",
-            padding=ft.padding.symmetric(3,5), border_radius=4,
+            padding=ft.Padding.symmetric(horizontal=3, vertical=5), border_radius=4,
             ink=is_wled,
             tooltip="Open Web UI" if is_wled else None,
             on_click=(lambda _, i=ip: [
                 self.log(f"{self.cards.get(i,{}).get('name_label',type('',(),({}))()).value or i} — Web UI opened ({i})", color="grey400"),
-                self.page.launch_url(f"http://{i}")
+                webbrowser.open(f"http://{i}"),
+                #self.page.run_task(lambda: ft.UrlLauncher().launch_url(f"http://{i}"))
             ]) if is_wled else None,
         )
-        status     = ft.Text("OFFLINE", size=12, color="red", weight="bold")
+        status     = ft.Text("OFFLINE", size=10, color="red", weight="bold")
         fx_label   = ft.Text("---", size=11, color="#00ffff")
         info_text  = ft.Text("---", size=10, color="grey500")
         name_label = ft.Text(display_name, weight="bold", size=16)
@@ -7809,8 +7731,8 @@ class WLEDApp:
         _update_ver_text = ft.Text("", size=9, weight=ft.FontWeight.BOLD, color="black", text_align="center")
         update_btn = ft.Container(
             visible=False, bgcolor="yellow700", border_radius=5,
-            padding=ft.padding.symmetric(horizontal=8, vertical=4),
-            alignment=ft.alignment.center,
+            padding=ft.Padding.symmetric(horizontal=8, vertical=4),
+            alignment=ft.Alignment.CENTER,
             ink=True,
             tooltip="Flash latest firmware",
             on_click=lambda _, i=ip: threading.Thread(target=self.push_ota_update, args=(i,), daemon=True).start(),
@@ -7828,8 +7750,8 @@ class WLEDApp:
             border_radius=6,
             on_click=lambda _, i=ip: self.toggle_live_badge(i),
             bgcolor="#3a1a00",
-            border=ft.border.all(1, "#ff6600"),
-            padding=ft.padding.symmetric(horizontal=6, vertical=3),
+            border=ft.Border.all(1, "#ff6600"),
+            padding=ft.Padding.symmetric(horizontal=6, vertical=3),
             content=ft.Row([_live_icon, _live_text], spacing=3, tight=True),
         )
         power_switch = ft.Switch(
@@ -7853,7 +7775,7 @@ class WLEDApp:
         color_btn = ft.Container(
             width=54, height=54, border_radius=10,
             gradient=ft.LinearGradient(
-                begin=ft.alignment.top_left, end=ft.alignment.bottom_right,
+                begin=ft.Alignment.TOP_LEFT, end=ft.Alignment.BOTTOM_RIGHT,
                 colors=["#FF0000","#FF8800","#FFFF00","#00FF00","#00FFFF","#0000FF","#FF00FF","#FF0000"],
             ),
             tooltip="Pick color",
@@ -7868,7 +7790,7 @@ class WLEDApp:
             action_btn = ft.Container(
                 width=54, height=54, border_radius=10,
                 bgcolor="#1e2133",
-                border=ft.border.only(top=ft.border.BorderSide(1, "white10")),
+                border=ft.Border.only(top=ft.BorderSide(1, "white10")),
                 shadow=[ft.BoxShadow(blur_radius=10, color=ft.Colors.with_opacity(0.4, "black"))],
                 tooltip="Select preset",
                 ink=True,
@@ -7883,7 +7805,7 @@ class WLEDApp:
             action_btn = ft.Container(
                 width=54, height=54, border_radius=10,
                 bgcolor="#1e2133",
-                border=ft.border.only(top=ft.border.BorderSide(1, "white10")),
+                border=ft.Border.only(top=ft.BorderSide(1, "white10")),
                 shadow=[ft.BoxShadow(blur_radius=10, color=ft.Colors.with_opacity(0.4, "black"))],
                 tooltip="Light modes",
                 ink=True,
@@ -7903,11 +7825,11 @@ class WLEDApp:
                 width=62, height=26,
                 border_radius=6,
                 tooltip="Reboot device",
-                alignment=ft.alignment.center,
+                alignment=ft.Alignment.CENTER,
                 ink=True,
                 gradient=ft.LinearGradient(
-                    begin=ft.alignment.top_center,
-                    end=ft.alignment.bottom_center,
+                    begin=ft.Alignment.TOP_CENTER,
+                    end=ft.Alignment.BOTTOM_CENTER,
                     colors=["#6b0000", "#380000"],
                 ),
                 content=ft.Text("REBOOT", size=9, weight="bold", color="white"),
@@ -7922,11 +7844,11 @@ class WLEDApp:
                 width=62, height=26,
                 border_radius=6,
                 tooltip="Sanitize presets",
-                alignment=ft.alignment.center,
+                alignment=ft.Alignment.CENTER,
                 ink=True,
                 gradient=ft.LinearGradient(
-                    begin=ft.alignment.top_center,
-                    end=ft.alignment.bottom_center,
+                    begin=ft.Alignment.TOP_CENTER,
+                    end=ft.Alignment.BOTTOM_CENTER,
                     colors=["#887700", "#554400"],
                 ),
                 
@@ -7941,7 +7863,7 @@ class WLEDApp:
         # ── card layout ───────────────────────────────────────────────────────
         card = ft.Container(
             data=ip, bgcolor="#121420", border_radius=12,
-            padding=ft.padding.only(left=12, right=12, top=10, bottom=10),
+            padding=ft.Padding.only(left=12, right=12, top=10, bottom=10),
             content=ft.Column([
 
                 # ROW 1: NAME | tag | ✏ | ✕ | spacer | POWER label+switch
@@ -7979,28 +7901,28 @@ class WLEDApp:
                     update_btn,
                     live_badge,
                     bri_slider,
-                    ft.Container(content=bri_text, width=54, alignment=ft.alignment.center_right),
+                    ft.Container(content=bri_text, width=54, alignment=ft.Alignment.CENTER_RIGHT),
                 ], spacing=6, vertical_alignment="center"),
 
             ], spacing=6)
         )
 
         glow = ft.Container(content=card, border_radius=13,
-            border=ft.border.all(2, "#2b2b3b"), bgcolor="#121420", padding=2)
+            border=ft.Border.all(2, "#2b2b3b"), bgcolor="#121420", padding=2)
 
         # Only the drag handle is Draggable — not the whole card
         # This prevents sliders/switches from accidentally triggering drags
         feedback = ft.Container(
             content=ft.Text(display_name, color="white", size=13, weight="bold"),
             bgcolor="#00f2ff22", border_radius=8, padding=10,
-            border=ft.border.all(1, "#00f2ff"))
+            border=ft.Border.all(1, "#00f2ff"))
 
         handle_draggable = ft.Draggable(
             group="cards", data=ip,
             content=ft.Container(
                 content=ft.Icon(ft.Icons.DRAG_INDICATOR, size=20, color="grey500"),
                 tooltip="Drag to reorder",
-                padding=ft.padding.only(right=6, top=4, bottom=4),
+                padding=ft.Padding.only(right=6, top=4, bottom=4),
                 border_radius=6,
                 ink=True,
             ),
@@ -8018,14 +7940,11 @@ class WLEDApp:
 
         drag_target = ft.DragTarget(
             group="cards", content=card_with_handle,
-            on_accept=lambda e, tgt=ip: self.drag_card(self._parse_drag_src(e.data), tgt),
-            on_will_accept=lambda e, src=ip: self._parse_drag_src(e.data) != src,
+            on_accept=lambda e, tgt=ip: self.drag_card(e.src.data, tgt),
+            on_will_accept=lambda e, src=ip: e.src.data != src,
         )
         # Use current window width so newly discovered cards get the right column size
-        try:
-            _cur_w = self.page.window.width or 1200
-        except AttributeError:
-            _cur_w = getattr(self.page, 'window_width', 1200) or 1200
+        _cur_w = getattr(self, '_current_layout_w', None) or 1200
         _col_map = {1: 60, 2: 30, 3: 20, 4: 15, 5: 12}
         _cur_col = _col_map[self._cols_for_width(_cur_w)]
         cell = ft.Container(content=drag_target,
@@ -8060,19 +7979,20 @@ class WLEDApp:
         """Toggle merge mode on/off. While active, dropping a card onto another shows merge dialog."""
         self.merge_mode = not self.merge_mode
         if self.merge_mode:
-            self._merge_btn_icon.color = "orange400"
-            self._merge_btn_text.value = "CANCEL MERGE"
-            self._merge_btn_text.color = "orange400"
+            icon_color, label, text_color = "orange400", "CANCEL MERGE", "orange400"
             self.log("[Merge] Merge mode ON — drop a new card onto the old card to merge", color="orange400")
         else:
-            self._merge_btn_icon.color = "grey400"
-            self._merge_btn_text.value = "MERGE"
-            self._merge_btn_text.color = "grey400"
+            icon_color, label, text_color = "grey400", "MERGE", "grey400"
             self.log("[Merge] Merge mode cancelled")
-        try:
-            self._merge_btn_icon.update()
-            self._merge_btn_text.update()
-        except: pass
+        for icon, text in [(self._merge_btn_icon_wide, self._merge_btn_text_wide),
+                           (self._merge_btn_icon_narrow, self._merge_btn_text_narrow)]:
+            icon.color = icon_color
+            text.value = label
+            text.color = text_color
+            try:
+                icon.update()
+                text.update()
+            except: pass
 
     def _extract_mac(self, name, dev_type):
         """Extract 6-char MAC suffix from device name. Returns None if not parseable."""
@@ -8164,6 +8084,7 @@ class WLEDApp:
         discard_cell = self.cards[discard_ip].get("cell")
         if discard_cell and discard_cell in self.device_list.controls:
             self.device_list.controls.remove(discard_cell)
+            self._ordered_dirty = True
         # Move discard's IP data to keep card
         self._reassign_ip(keep_ip, discard_ip, self.devices.get(discard_ip, discard_ip))
         # Clean up old keep_ip remnants
@@ -8343,10 +8264,7 @@ class WLEDApp:
         return "#{:02x}{:02x}{:02x}".format(r, g, b)
 
     def _hue_to_hex(self, h):
-        """Convert hue 0-360 to a dim RGB hex colour suitable for a border glow."""
-        import colorsys
-        r, g, b = colorsys.hsv_to_rgb(h / 360.0, 0.85, 0.75)
-        return "#{:02x}{:02x}{:02x}".format(int(r * 255), int(g * 255), int(b * 255))
+        return _HUE_TABLE[int(h) % 360]
 
     def rainbow_loop(self):
         """Animate title characters and card borders at ~10fps.
@@ -8391,22 +8309,39 @@ class WLEDApp:
             # Build ordered list matching device_list visual order
             # Custom launcher cards join border animation only while active.
             # Offline WLED/MH cards stay red and are excluded.
-            _ordered = []
-            for ctrl in self.device_list.controls:
-                ip = getattr(ctrl, "data", None)
-                if ip and ip in self.cards:
-                    c = self.cards[ip]
-                    if (c.get("_is_custom") and c.get("_is_active")) or c.get("_glow_state") == "on" or ip in self.live_ips or ip in self.mh_live_ips:
-                        _ordered.append((ip, c))
+            if self._ordered_dirty or self._ordered_cache is None:
+                _ordered = []
+                for ctrl in self.device_list.controls:
+                    ip = getattr(ctrl, "data", None)
+                    if ip and ip in self.cards:
+                        c = self.cards[ip]
+                        if (c.get("_is_custom") and c.get("_is_active")) or c.get("_glow_state") == "on" or ip in self.live_ips or ip in self.mh_live_ips:
+                            _ordered.append((ip, c))
+                self._ordered_cache      = _ordered
+                self._live_ips_frozen    = frozenset(self.live_ips)
+                self._mh_live_ips_frozen = frozenset(self.mh_live_ips)
+                self._ordered_dirty = False
+            else:
+                _ordered = self._ordered_cache
             _card_count = len(_ordered)
             _any = False
 
+            # Solid effect: skip per-card work when color, count, and live sets are all unchanged
+            if ef == "solid":
+                _solid_sig = (border_color, _card_count,
+                              self._live_ips_frozen, self._mh_live_ips_frozen)
+                if _solid_sig == self._last_solid_border_sig:
+                    _card_count = 0  # suppress the block below without touching _ordered
+                else:
+                    self._last_solid_border_sig = _solid_sig
+            else:
+                self._last_solid_border_sig = None
+
             if _card_count > 0:
-                # Calculate grid dimensions from current window width
-                try:
-                    _win_w = self.page.window.width or 1200
-                except: _win_w = 1200
-                _cols = self._cols_for_width(_win_w)
+                if self._cached_cols is None:
+                    _win_w = getattr(self, '_current_layout_w', None) or 1200
+                    self._cached_cols = self._cols_for_width(_win_w)
+                _cols = self._cached_cols
                 _rows = max(1, (_card_count + _cols - 1) // _cols)
                 _cx = _cols / 2.0  # grid center col
                 _cy = _rows / 2.0  # grid center row
@@ -8447,7 +8382,6 @@ class WLEDApp:
                         _c = self._hue_to_hex((_border_hue + _ci * _spread) % 360)
                     elif ef == "orbit":
                         # Ripple from center — offset by distance from grid center
-                        import math
                         _dist = math.sqrt((_col - _cx) ** 2 + (_row - _cy) ** 2)
                         _max_dist = math.sqrt(_cx ** 2 + _cy ** 2)
                         _spread = 300 / max(_max_dist, 1)
@@ -8455,10 +8389,15 @@ class WLEDApp:
                     else:
                         _c = self._hue_to_hex(_border_hue)
 
-                    c["glow"].border = ft.border.all(2, _c)
+                    c["glow"].border = ft.Border.all(2, _c)
                     _any = True
 
             if _any:
+                self._list_update_needed = False
+                try: self.device_list.update()
+                except: pass
+            elif self._list_update_needed:
+                self._list_update_needed = False
                 try: self.device_list.update()
                 except: pass
 
@@ -8468,7 +8407,7 @@ class WLEDApp:
                 _sc = border_color if border_color else self._hue_to_hex(_border_hue)
                 for ref, _ in self.scene_btn_refs[active]:
                     try:
-                        ref.border = ft.border.all(1, _sc)
+                        ref.border = ft.Border.all(1, _sc)
                         ref.update()
                     except: pass
 
@@ -8478,29 +8417,18 @@ class WLEDApp:
                 _sc = border_color if border_color else self._hue_to_hex(_border_hue)
                 for ref, _nt in self.ledfx_scene_btn_refs[led_active]:
                     try:
-                        ref.border = ft.border.all(1, _sc)
+                        ref.border = ft.Border.all(1, _sc)
                         ref.update()
                     except:
                         pass
 
-            # Spectrum box border follows app border color while audio is active.
-            try:
-                _now = time.monotonic()
-                _spec_c = border_color if border_color else self._hue_to_hex(_border_hue)
-                _sampling_on = bool(getattr(self, "_spec_sampling_enabled", True))
-                if _sampling_on:
-                    self._spectrum_box.border = ft.border.all(2, _spec_c)
-                else:
-                    self._spectrum_box.border = ft.border.all(1, self._dim_hex(_spec_c, 0.55))
-                self._spectrum_box.update()
-            except Exception:
-                pass
 
             # ── Title animation ───────────────────────────────────────────────
             if hasattr(self, "_title_chars"):
                 tef = self.title_effect
-                _non_space = [c for c in self._title_chars if c.value != " "]
+                _non_space = self._title_non_space
                 _spread = 300 / max(len(_non_space) - 1, 1)
+                _title_dirty = True
                 if tef == "rainbow_wave":
                     _ni = 0
                     for _tc in self._title_chars:
@@ -8515,8 +8443,13 @@ class WLEDApp:
                     # Speed slider controls brightness — minimum 10% so text stays visible
                     _bri = max(0.25, self.title_speed / 20.0)
                     _c = self._dim_hex(self.title_color, _bri)
-                    for _tc in self._title_chars:
-                        _tc.color = _c
+                    _tsig = (self.title_color, _bri)
+                    if _tsig == self._last_title_solid_sig:
+                        _title_dirty = False
+                    else:
+                        self._last_title_solid_sig = _tsig
+                        for _tc in self._title_chars:
+                            _tc.color = _c
                 elif tef == "breathing":
                     self._breath_title += 0.05 * self.title_speed / 4.0 * self._breath_title_dir
                     if self._breath_title >= 1.0:
@@ -8531,2652 +8464,51 @@ class WLEDApp:
                     _c = self.title_color if self._strobe_title else "#000000"
                     for _tc in self._title_chars:
                         _tc.color = _c
-                try:
-                    self.header.update()
-                except: pass
+                if _title_dirty:
+                    try:
+                        self.header.update()
+                    except: pass
             time.sleep(0.1)
 
-    def _set_spectrum_render_mode(self, mode):
-        """Switch analyzer surface: 'grid' | 'graphics' | 'neon_vu'."""
-        _m = str(mode).lower()
-        _target = _m if _m in ("graphics", "neon_vu") else "grid"
-        if self._spec_render_mode == _target:
-            return
-
-        if _target == "neon_vu":
-            # Canvas-based Neon VU Meter — same box dimensions as graphics mode.
-            self._spectrum_box.padding = ft.padding.all(0)
-            self._spectrum_box.width   = 300
-            self._spectrum_box.height  = 62
-            self._spectrum_box.content = self._neon_vu_host
-        elif _target == "graphics":
-            self._spectrum_box.padding = ft.padding.all(0)
-            self._spectrum_box.width   = self._spec_box_graphics_size[0]
-            self._spectrum_box.height  = self._spec_box_graphics_size[1]
-            self._spectrum_box.content = self._spec_graphics_host
-            self._spec_graphics_ready  = False
-            self._spec_graphics_view_size = (0, 0)
-        else:
-            self._spectrum_box.padding = ft.padding.symmetric(horizontal=6, vertical=4)
-            self._spectrum_box.width   = self._spec_box_grid_size[0]
-            self._spectrum_box.height  = self._spec_box_grid_size[1]
-            self._spectrum_box.content = self._spec_grid_content
-
-        self._spec_render_mode = _target
-        try:
-            self._spectrum_box.update()
-        except Exception:
-            pass
-
-    def _sync_spec_quick_buttons(self):
-        try:
-            _on = "#ff9800"
-            _off = "grey500"
-            self._spec_settings_btn.icon_color = _on
-            self._spec_settings_btn.tooltip = "Spectrum settings"
-
-            if getattr(self, "_spec_sampling_enabled", True):
-                self._spec_sampling_btn.icon = ft.Icons.MIC
-                self._spec_sampling_btn.icon_color = _on
-                self._spec_sampling_btn.tooltip = "Sampling ON"
-                self._spec_sampling_btn.style = ft.ButtonStyle(
-                    bgcolor="transparent",
-                    shape=ft.RoundedRectangleBorder(radius=5),
-                    padding=ft.padding.all(1),
-                )
-            else:
-                self._spec_sampling_btn.icon = ft.Icons.MIC
-                self._spec_sampling_btn.icon_color = _off
-                self._spec_sampling_btn.tooltip = "Sampling OFF"
-                self._spec_sampling_btn.style = ft.ButtonStyle(
-                    bgcolor="transparent",
-                    shape=ft.RoundedRectangleBorder(radius=5),
-                    padding=ft.padding.all(1),
-                )
-
-            if getattr(self, "_spec_idle_enabled", True):
-                self._spec_idle_quick_btn.icon = ft.Icons.AUTO_AWESOME
-                self._spec_idle_quick_btn.icon_color = _on
-                self._spec_idle_quick_btn.tooltip = "Idle effects ON"
-                self._spec_idle_quick_btn.style = ft.ButtonStyle(
-                    bgcolor="transparent",
-                    shape=ft.RoundedRectangleBorder(radius=5),
-                    padding=ft.padding.all(1),
-                )
-            else:
-                self._spec_idle_quick_btn.icon = ft.Icons.AUTO_AWESOME
-                self._spec_idle_quick_btn.icon_color = _off
-                self._spec_idle_quick_btn.tooltip = "Idle effects OFF"
-                self._spec_idle_quick_btn.style = ft.ButtonStyle(
-                    bgcolor="transparent",
-                    shape=ft.RoundedRectangleBorder(radius=5),
-                    padding=ft.padding.all(1),
-                )
-
-            self._spec_sampling_btn.update()
-            self._spec_idle_quick_btn.update()
-            self._spec_settings_btn.update()
-        except Exception:
-            pass
-
-    def _clear_spectrum_display(self):
-        """Leave the analyzer visible but static (no active bars/animation)."""
-        try:
-            self._set_spectrum_render_mode("grid")
-            for _segs in self._spec_segments:
-                for _seg in _segs:
-                    _seg.bgcolor = "#101010"
-            self._spectrum_box.update()
-        except Exception:
-            pass
-
-    def _get_spec_render_interval(self):
-        try:
-            _fps = int(round(float(getattr(self, "_spec_target_fps", 25) or 25)))
-        except Exception:
-            _fps = 25
-        _fps = max(8, min(30, _fps))
-        return 1.0 / float(_fps)
-
-    def _reset_spec_analysis_state(self):
-        _count = max(6, min(int(self._spec_bands), int(getattr(self, "_spec_analysis_bands", self._spec_bands) or self._spec_bands)))
-        self._spec_bars = [0.0] * _count
-        self._spec_peaks = [0.0] * _count
-        self._spec_peak_hold = [0] * _count
-        self._spec_band_avg = [0.0] * _count
-
-    def _set_spec_analysis_bands(self, bands, restart_audio=True, reset_now=False):
-        try:
-            _new = int(round(float(bands)))
-        except Exception:
-            _new = int(self._spec_bands)
-        _new = max(6, min(int(self._spec_bands), _new))
-        _old = int(getattr(self, "_spec_analysis_bands", self._spec_bands) or self._spec_bands)
-        self._spec_analysis_bands = _new
-        if reset_now:
-            self._reset_spec_analysis_state()
-        if restart_audio and (_new != _old):
-            self._spec_source_changed = True
-            if self._spec_disabled:
-                self._spec_disabled = False
-                threading.Thread(target=self._audio_analyzer_loop, daemon=True).start()
-        return _new != _old
-
-    def _toggle_spec_sampling(self, _=None):
-        self._spec_sampling_enabled = not bool(getattr(self, "_spec_sampling_enabled", True))
-        self._spec_source_changed = True
-        if self._spec_disabled:
-            self._spec_disabled = False
-            threading.Thread(target=self._audio_analyzer_loop, daemon=True).start()
-        self._sync_spec_quick_buttons()
-        self.log(f"[Spectrum] Sampling {'ON' if self._spec_sampling_enabled else 'OFF'}", color="grey500")
-
-    def _toggle_spec_idle_quick(self, _=None):
-        self._spec_idle_enabled = not bool(getattr(self, "_spec_idle_enabled", True))
-        self._spec_idle_active = False
-        self._sync_spec_quick_buttons()
-        if (not self._spec_sampling_enabled) and (not self._spec_idle_enabled):
-            self._clear_spectrum_display()
-            self._spec_display_cleared = True
-        self.log(f"[Spectrum] Idle effects {'ON' if self._spec_idle_enabled else 'OFF'}", color="grey500")
-
-    def _ensure_spectrum_graphics_controls(self, width, height):
-        """Create/update reusable controls for non-grid spectrum graphics effects."""
-        _w = max(120, int(width))
-        _h = max(80, int(height))
-        _size = (_w, _h)
-        if self._spec_graphics_ready and self._spec_graphics_view_size == _size:
-            return
-
-        self._spec_graphics_layer.controls.clear()
-        self._spec_graphics_stars = []
-        self._spec_graphics_lines = []
-
-        _rng = random.Random(0x51A7)
-        _star_count = max(24, min(96, int((_w * _h) / 2200)))
-        for _ in range(_star_count):
-            _dot = ft.Container(
-                left=_rng.randint(0, max(0, _w - 3)),
-                top=_rng.randint(0, max(0, _h - 3)),
-                width=2,
-                height=2,
-                border_radius=1,
-                bgcolor="#6a6a6a",
-                opacity=0.45,
-            )
-            self._spec_graphics_stars.append(_dot)
-            self._spec_graphics_layer.controls.append(_dot)
-
-        for _ in range(18):
-            _txt = ft.Text(
-                "",
-                size=12,
-                color="#ffd76a",
-                text_align=ft.TextAlign.CENTER,
-                no_wrap=True,
-                weight=ft.FontWeight.W_600,
-            )
-            _slot = ft.Container(
-                content=_txt,
-                left=0,
-                top=0,
-                width=1,
-                height=1,
-                alignment=ft.alignment.center,
-                visible=False,
-            )
-            self._spec_graphics_lines.append((_slot, _txt))
-            self._spec_graphics_layer.controls.append(_slot)
-
-        self._spec_graphics_ready = True
-        self._spec_graphics_view_size = _size
-
-    def _render_spectrum(self):
-        if not self._spec_segments:
-            return
-
-        # ── Advance random modes (processed even if idle effect is about to render) ──
-        _mode = str(self._spec_mode or "classic").lower()
-        if _mode == "random":
-            _now = time.monotonic()
-            if _now >= float(self._spec_mode_random_next_ts):
-                self._advance_spectrum_random_mode()
-                self._spec_mode_random_next_ts = _now + max(1.0, float(self._spec_mode_random_cycle_seconds))
-            _mode = self._spec_mode_random_current
-        elif _mode == "random_song":
-            _now = time.monotonic()
-            # Trigger only once per song when silence timeout is reached
-            if self._spec_mode_song_switch_armed and ((_now - float(self._spec_last_audio_ts)) >= float(self._spec_mode_song_silence_seconds)):
-                self._advance_spectrum_random_mode()
-                self._spec_mode_song_switch_armed = False  # Locked until sound is detected again
-            _mode = self._spec_mode_random_current
-
-        if self._spec_idle_active:
-            _idle_fx = str(self._spec_idle_effect or "random").lower()
-            if _idle_fx == "random":
-                _now = time.monotonic()
-                if _now >= float(self._spec_idle_random_next_ts) and self._spec_idle_cycle_done:
-                    _choices = list(getattr(self, "_spec_idle_cycle_effects", []))
-                    if not _choices:
-                        _choices = ["pulse", "text", "pacman", "tetris", "invaders", "snake", "starwars"]
-                    if self._spec_idle_random_current in _choices and len(_choices) > 1:
-                        _choices = [x for x in _choices if x != self._spec_idle_random_current]
-                    self._spec_idle_random_current = random.choice(_choices)
-                    self._spec_idle_random_next_ts = _now + max(0.1, float(self._spec_idle_random_cycle_seconds))
-                    self._spec_idle_cycle_done = False
-                    self._spec_idle_phase = 0.0
-                    self._spec_idle_scroll = 0
-                _idle_fx = self._spec_idle_random_current
-
-            if _idle_fx == "starwars":
-                self._set_spectrum_render_mode("graphics")
-                self._render_spectrum_idle_starwars()
-                return
-
-            self._set_spectrum_render_mode("grid")
-            if _idle_fx == "text":
-                self._render_spectrum_idle_text()
-            elif _idle_fx == "pulse":
-                self._render_spectrum_idle_pulse()
-            elif _idle_fx == "pacman":
-                self._render_spectrum_idle_pacman()
-            elif _idle_fx == "tetris":
-                self._render_spectrum_idle_tetris()
-            elif _idle_fx == "invaders":
-                self._render_spectrum_idle_invaders()
-            elif _idle_fx == "snake":
-                self._render_spectrum_idle_snake()
-            else:
-                self._render_spectrum_idle_pulse()
-            return
-
-        # ── neon_vu must be checked BEFORE set_spectrum_render_mode("grid") ──
-        # Calling set_spectrum_render_mode("grid") triggers _spectrum_box.update(),
-        # which would flash the old pixel grid for one frame on every render tick.
-        if _mode in ("neon_drift", "retro_tech", "custom_vu", "neon_vu"):
-            if _mode == "neon_drift":
-                self._neon_vu_theme = "neon_drift"
-                _bg = self._spec_nvu_drift_bg
-            elif _mode == "retro_tech":
-                self._neon_vu_theme = "retro_tech"
-                _bg = self._spec_nvu_retro_bg
-            elif _mode == "custom_vu":
-                self._neon_vu_theme = "custom_vu"
-                _bg = self._spec_nvu_custom_bg
-            else: # legacy
-                _bg = self._spec_nvu_drift_bg if self._neon_vu_theme == "neon_drift" else self._spec_nvu_retro_bg
-
-            if self._neon_vu_bg_image:
-                _v = (_bg != "BLANK") and os.path.isfile(os.path.join(_VERSION_DIR, _bg))
-                _s = _bg if _v else ""
-                # If force_reload is true, append a timestamp to bypass Flet's internal image cache.
-                if getattr(self, "_spec_nvu_bg_force_reload", False):
-                    _s = f"{_s}?t={time.time()}" if _s else ""
-
-                if self._neon_vu_bg_image.src != _s or self._neon_vu_bg_image.visible != _v:
-                    self._spec_nvu_bg_force_reload = False
-                    self._neon_vu_bg_image.src = _s
-                    self._neon_vu_bg_image.visible = _v
-                    try: self._neon_vu_bg_image.update()
-                    except: pass
-
-            self._set_spectrum_render_mode("neon_vu")
-            self._render_spectrum_neon_vu()
-            return
-
-        self._set_spectrum_render_mode("grid")
-
-        if _mode == "vu":
-            self._render_spectrum_vu()
-        elif _mode == "cyber_city":
-            self._render_spectrum_cybercity()
-        else:
-            # Classic mode: vertical bars, left to right
-            self._render_spectrum_classic()
-
-        try:
-            self._spectrum_box.update()
-        except Exception:
-            pass
-
-    def _render_spectrum_cybercity(self):
-        """Cyber City mode: bands become glowing buildings with flickering windows."""
-        _analysis_count = max(1, len(self._spec_bars))
-        _bands = self._spec_bands
-        _levels = self._spec_levels
-        _now = time.monotonic()
-
-        for bi, segs in enumerate(self._spec_segments):
-            _src_i = min(_analysis_count - 1, int((bi * _analysis_count) / max(1, _bands)))
-            val = self._spec_bars[_src_i]
-            peak = self._spec_peaks[_src_i]
-            
-            fill_h = int(val * _levels)
-            peak_h = int(peak * (_levels - 1))
-            
-            for top_idx, seg in enumerate(segs):
-                y = _levels - 1 - top_idx # height from bottom
-                
-                if y == peak_h and peak_h > 0:
-                    seg.bgcolor = "#ff3030" # Neon Red helipad/beacon
-                elif y < peak_h:
-                    # Building facade logic: windows every 2nd pixel
-                    if (y % 2 == 0) and (bi % 2 == 0):
-                        if y < fill_h:
-                            # Below current volume: localized flickering
-                            _val = math.sin(_now * 3.5 + bi * 0.5 + y)
-                            if _val > -0.8:
-                                seg.bgcolor = "#00f2ff" # Active Cyan window
-                            else:
-                                seg.bgcolor = "#333333" # Unlit Grey window
-                        else:
-                            # Above current volume but below peak: static unlit window
-                            seg.bgcolor = "#333333"
-                    else:
-                        # Building shadow/dark facade
-                        seg.bgcolor = "#0a0a20"
-                else:
-                    seg.bgcolor = "#050505" # Night sky
-
-    def _advance_spectrum_random_mode(self):
-        _choices = list(getattr(self, "_spec_mode_cycle_choices", []))
-        if not _choices:
-            _choices = ["classic", "vu", "cyber_city", "neon_drift", "retro_tech", "custom_vu"]
-        if self._spec_mode_random_current in _choices and len(_choices) > 1:
-            _choices = [x for x in _choices if x != self._spec_mode_random_current]
-        self._spec_mode_random_current = random.choice(_choices)
-
-    def _render_spectrum_classic(self):
-        """Classic mode: vertical bars from bottom-up, left to right."""
-        _analysis_count = max(1, len(self._spec_bars))
-        for bi, segs in enumerate(self._spec_segments):
-            _src_i = min(_analysis_count - 1, int((bi * _analysis_count) / max(1, self._spec_bands)))
-            fill = int(max(0.0, min(1.0, self._spec_bars[_src_i])) * self._spec_levels)
-            peak = int(max(0.0, min(1.0, self._spec_peaks[_src_i])) * (self._spec_levels - 1))
-
-            for top_idx, seg in enumerate(segs):
-                lvl_from_bottom = self._spec_levels - 1 - top_idx
-                if lvl_from_bottom == peak:
-                    seg.bgcolor = "#ff2020"
-                elif lvl_from_bottom < fill:
-                    seg.bgcolor = self._spec_palette[lvl_from_bottom]
-                else:
-                    seg.bgcolor = "#101010"
-
-    def _render_spectrum_mirror(self):
-        """Mirror mode: uses all pixels, center-reflected spectrum layout."""
-        _center_col = self._spec_bands // 2
-        _max_height = self._spec_levels - 1
-        
-        for bi, segs in enumerate(self._spec_segments):
-            # Distance from center column determines which band's data to show
-            _dist = abs(bi - _center_col)
-            if _dist < self._spec_bands:
-                _idx = _dist
-                bar_val = max(0.0, min(1.0, self._spec_bars[_idx]))
-                peak_val = max(0.0, min(1.0, self._spec_peaks[_idx]))
-                
-                _bar_height = int(round(bar_val * _max_height))
-                _peak_height = int(round(peak_val * _max_height))
-                
-                for top_idx, seg in enumerate(segs):
-                    _from_bottom = self._spec_levels - 1 - top_idx
-                    
-                    if _from_bottom == _peak_height and _peak_height > 0:
-                        seg.bgcolor = "#ff2020"
-                    elif _from_bottom <= _bar_height and _bar_height > 0:
-                        seg.bgcolor = self._spec_palette[min(_from_bottom, len(self._spec_palette) - 1)]
-                    else:
-                        seg.bgcolor = "#101010"
-            else:
-                for seg in segs:
-                    seg.bgcolor = "#101010"
-
-    def _render_spectrum_vu(self):
-        """VU mode: two horizontal lanes (top=L, bottom=R) with right-side labels."""
-        _bg = "#101010"
-        _bands = max(1, self._spec_bands)
-
-        _meter_start = 0
-        _meter_end = max(_meter_start + 1, _bands - 3)  # rightmost 3 columns reserved for labels
-        _meter_width = max(1, _meter_end - _meter_start)
-
-        _l_fill = int(round(max(0.0, min(1.0, self._spec_vu_left)) * _meter_width))
-        _r_fill = int(round(max(0.0, min(1.0, self._spec_vu_right)) * _meter_width))
-        _l_peak = int(round(max(0.0, min(1.0, self._spec_vu_peak_left)) * _meter_width))
-        _r_peak = int(round(max(0.0, min(1.0, self._spec_vu_peak_right)) * _meter_width))
-
-        # Two lane layout across full height: upper lane for L, lower lane for R.
-        _top_lane_rows = list(range(2, min(self._spec_levels, 7)))
-        _bot_lane_rows = list(range(max(0, self._spec_levels - 7), self._spec_levels - 2))
-        _top_mid = int((min(_top_lane_rows) + max(_top_lane_rows)) / 2) if _top_lane_rows else 3
-        _bot_mid = int((min(_bot_lane_rows) + max(_bot_lane_rows)) / 2) if _bot_lane_rows else (self._spec_levels - 4)
-        _top_peak_rows = _top_lane_rows[:5] if len(_top_lane_rows) >= 5 else _top_lane_rows
-        _bot_peak_rows = _bot_lane_rows[-5:] if len(_bot_lane_rows) >= 5 else _bot_lane_rows
-
-        for bi, segs in enumerate(self._spec_segments):
-            for seg in segs:
-                seg.bgcolor = _bg
-
-            if bi < _meter_end:
-                _x = bi - _meter_start
-                _color_idx = int((_x / max(1, _meter_width - 1)) * (len(self._spec_palette) - 1))
-                _color = self._spec_palette[min(_color_idx, len(self._spec_palette) - 1)]
-
-                # Draw vertical dash lines in each lane so it reads like VU columns.
-                if _x < _l_fill:
-                    for _row in _top_lane_rows:
-                        segs[_row].bgcolor = _color
-                if _x < _r_fill:
-                    for _row in _bot_lane_rows:
-                        segs[_row].bgcolor = _color
-
-                if _x == _l_peak and _l_peak > 0:
-                    for _row in _top_peak_rows:
-                        if 0 <= _row < self._spec_levels:
-                            segs[_row].bgcolor = "#ff2020"
-                if _x == _r_peak and _r_peak > 0:
-                    for _row in _bot_peak_rows:
-                        if 0 <= _row < self._spec_levels:
-                            segs[_row].bgcolor = "#ff2020"
-            else:
-                # Compact right-side labels (3x5): L in upper section, R in lower section.
-                _label_start = max(0, _bands - 3)
-                _gx = bi - _label_start
-
-                _l_rows = ["100", "100", "100", "100", "111"]
-                _r_rows = ["110", "101", "110", "101", "101"]
-                _l_row0 = 1
-                _r_row0 = max(0, self._spec_levels - 6)
-
-                if 0 <= _gx < 3:
-                    for _ry in range(5):
-                        _row = _l_row0 + _ry
-                        if 0 <= _row < self._spec_levels and _l_rows[_ry][_gx] == "1":
-                            segs[_row].bgcolor = "#8a8a8a"
-                    for _ry in range(5):
-                        _row = _r_row0 + _ry
-                        if 0 <= _row < self._spec_levels and _r_rows[_ry][_gx] == "1":
-                            segs[_row].bgcolor = "#8a8a8a"
-
-    def _render_spectrum_neon_vu(self):
+    def _launch_sa(self, _=None):
+        """Launch SA.exe (or SA.py fallback) as an independent detached process.
+        Multiple instances are intentionally allowed so the user can run several
+        meters side-by-side.  WLEDCC does not track or own the child process.
         """
-        Neon VU Meter — high-performance dual arc gauge with glowing needles.
+        import subprocess
 
-        Rendered each frame via a single ft.canvas.Canvas update.
-        The background image and host container remain static; only the
-        canvas shapes list is rebuilt and pushed (O(n) for ~35 shapes).
+        # Resolve the folder that contains the running WLEDCC binary / script.
+        _here = os.path.dirname(
+            _sys.executable if getattr(_sys, "frozen", False)
+            else os.path.abspath(__file__)
+        )
 
-        Geometry (fits the existing 300 × 62 px spectrum header box)
-        ─────────────────────────────────────────────────────────────
-          Pivot:   (75, 80) for Left,  (225, 80) for Right
-                   — pivot sits 18 px *below* the canvas bottom edge.
-                   In screen coords (Y↓) sin(210°…330°) is negative,
-                   so all needle/arc points land *above* the pivot → inside canvas.
-          Radius:  62 px
-          Arc:     210° → 330°  (120° sweep, math/CCW from positive-X)
-                   210° maps to 0.0 signal (upper-left)
-                   330° maps to 1.0 signal (upper-right)
+        _exe = os.path.join(_here, "SA.exe")
+        _py  = os.path.join(_here, "SA.py")
 
-        Ballistics
-        ──────────
-          current = (raw × 0.30) + (prev × 0.70)
-          0.30 attack  → needle springs fast toward the signal peak
-          0.70 release → heavy inertia on the way down (classic VU feel)
-
-        Glow Effect
-        ───────────
-          Three cv.Line passes per needle, decreasing stroke_width and
-          increasing opacity — no MaskFilter dependency, works on all
-          current Flet / Skia back-ends.
-        """
-        if cv is None or self._neon_vu_canvas is None:
-            return
-
-        # ── Colour palette per theme ──────────────────────────────────────
-        _theme = getattr(self, "_neon_vu_theme", "neon_drift")
-        if _theme == "retro_tech":
-            _col_l   = "#FF7700"    # Left needle  — Vintage Orange
-            _col_r   = "#FF7700"    # Right needle — Vintage Orange
-            _arc_col = "#E0E0E0"    # Scale arc    — off-white
-        elif _theme == "custom_vu":
-            _col_l   = "#000000"    # Black needles
-            _col_r   = "#000000"
-            _arc_col = "transparent"
-        else:                       # "neon_drift" (default)
-            _col_l   = "#00FFFF"    # Left needle  — Cyan
-            _col_r   = "#00FFFF"    # Right needle — Cyan
-            _arc_col = "#6600FF"    # Scale arc    — futuristic indigo-purple
-
-        # ── Ballistics — weighted average (attack 0.30 / release 0.70) ───
-        _ATT, _REL = 0.30, 0.70
-        _raw_l = max(0.0, min(1.0, float(self._spec_vu_left  or 0.0)))
-        _raw_r = max(0.0, min(1.0, float(self._spec_vu_right or 0.0)))
-        self._neon_vu_left_smooth  = _raw_l * _ATT + self._neon_vu_left_smooth  * _REL
-        self._neon_vu_right_smooth = _raw_r * _ATT + self._neon_vu_right_smooth * _REL
-
-        # ── Geometry constants ────────────────────────────────────────────
-        _CX_L      = 75           # Left  meter pivot X (px)
-        _CX_R      = 225          # Right meter pivot X (px)
-        _CY        = 86           # Adjusted pivot Y to bring labels on-screen
-        _R         = 76           # Radius optimized for 300x62 header box
-        _ANG_START = 210.0        # 0.0 signal → upper-left  (degrees, math/CCW)
-        _ANG_END   = 330.0        # 1.0 signal → upper-right
-        _ANG_SPAN  = _ANG_END - _ANG_START   # 120°
-
-        def _ang(val):
-            """Map normalised 0.0–1.0 → arc angle in degrees."""
-            return _ANG_START + max(0.0, min(1.0, float(val))) * _ANG_SPAN
-
-        def _pt(cx, r, angle_deg):
-            """Canvas point at arc position: (cx + r·cos θ,  _CY + r·sin θ)."""
-            rad = math.radians(angle_deg)
-            return cx + r * math.cos(rad), _CY + r * math.sin(rad)
-
-        shapes = []
-        _is_retro = (_theme == "retro_tech")
-        _is_custom = (_theme == "custom_vu")
-
-        # ── Background HUD elements (Neon Drift only) ────────────────────
-        if not _is_retro and not _is_custom:
-            for _cx in (_CX_L, _CX_R):
-                # Subtle concentric radar rings for that HUD feel
-                for _rad_off in [22, 45, 68]:
-                    shapes.append(cv.Circle(
-                        x=float(_cx), y=float(_CY), radius=float(_rad_off),
-                        paint=ft.Paint(color=ft.Colors.with_opacity(0.12, "#00FFFF"), 
-                                     stroke_width=0.8, style=ft.PaintingStyle.STROKE)
-                    ))
-
-        # ── Scale labels (Numbers and L/R) ────────────────────────────────
-        if _is_retro:
-            _num_labels = [(-20, 0.0), (-10, 0.25), (-5, 0.5), (0, 0.75), ("+3", 1.0)]
-            for _cx, _side_label in [(_CX_L, "L"), (_CX_R, "R")]:
-                # Draw L/R
-                shapes.append(cv.Text(
-                    x=_cx, y=_CY - 42, text=_side_label,
-                    style=ft.TextStyle(size=10, weight=ft.FontWeight.BOLD, color="white60"),
-                    alignment=ft.alignment.center
-                ))
-                # Draw Scale Numbers
-                for _txt, _v in _num_labels:
-                    _lx, _ly = _pt(_cx, _R + 1, _ang(_v))
-                    shapes.append(cv.Text(
-                        x=_lx, y=_ly, text=str(_txt),
-                        style=ft.TextStyle(size=6.5, color="white38"),
-                        alignment=ft.alignment.center
-                    ))
-        elif not _is_custom:
-            # Neon digital HUD labels
-            _num_labels = [("-20", 0.0), ("-10", 0.25), ("-5", 0.5), ("0", 0.75), ("+3", 1.0)]
-            for _cx, _side_label in [(_CX_L, "L-CH"), (_CX_R, "R-CH")]:
-                # Glowing Cyan Channel ID
-                shapes.append(cv.Text(
-                    x=_cx, y=_CY - 44, text=_side_label,
-                    style=ft.TextStyle(size=9, weight=ft.FontWeight.BOLD, color="#00FFFF", italic=True),
-                    alignment=ft.alignment.center
-                ))
-                # Neon Magenta scale markers
-                for _txt, _v in _num_labels:
-                    _lx, _ly = _pt(_cx, _R + 1, _ang(_v))
-                    shapes.append(cv.Text(
-                        x=_lx, y=_ly, text=str(_txt),
-                        style=ft.TextStyle(size=6.2, color="#FF00FF", weight=ft.FontWeight.W_600),
-                        alignment=ft.alignment.center
-                    ))
-
-        # ── Arc gauge tracks ──────────────────────────────────────────────
-        if not _is_custom:
-            for _cx in (_CX_L, _CX_R):
-                if _is_retro:
-                    # Draw main black baseline arc for retro look
-                    shapes.append(cv.Circle(
-                        x=_cx, y=_CY, radius=_R - 5,
-                        paint=ft.Paint(color="white10", stroke_width=1, style=ft.PaintingStyle.STROKE)
-                    ))
-                    continue
-                # Neon HUD Arc: Thick indigo base glow with a sharp cyan rail
-                _pts_base = []
-                for _a in range(int(_ANG_START), int(_ANG_END) + 1, 5):
-                    px, py = _pt(_cx, _R - 5, _a)
-                    if _pts_base: _pts_base.append(cv.Path.LineTo(px, py))
-                    else: _pts_base.append(cv.Path.MoveTo(px, py))
-                shapes.append(cv.Path(
-                    elements=_pts_base,
-                    paint=ft.Paint(
-                        color=ft.Colors.with_opacity(0.35, _arc_col),
-                        stroke_width=5,
-                        style=ft.PaintingStyle.STROKE,
-                    ),
-                ))
-                # Split sharp rail: Cyan up to 0, Magenta above 0
-                _ang_zero = _ang(0.75)
-                # Cyan segment
-                _pts_c = []
-                for _a in range(int(_ANG_START), int(_ang_zero) + 1, 2):
-                    px, py = _pt(_cx, _R - 5, _a)
-                    if _pts_c: _pts_c.append(cv.Path.LineTo(px, py))
-                    else: _pts_c.append(cv.Path.MoveTo(px, py))
-                if _pts_c:
-                    shapes.append(cv.Path(
-                        elements=_pts_c,
-                        paint=ft.Paint(
-                            color=ft.Colors.with_opacity(0.85, "#00FFFF"),
-                            stroke_width=1.2,
-                            style=ft.PaintingStyle.STROKE,
-                        ),
-                    ))
-                # Magenta segment
-                _pts_m = []
-                for _a in range(int(_ang_zero), int(_ANG_END) + 1, 2):
-                    px, py = _pt(_cx, _R - 5, _a)
-                    if _pts_m: _pts_m.append(cv.Path.LineTo(px, py))
-                    else: _pts_m.append(cv.Path.MoveTo(px, py))
-                if _pts_m:
-                    shapes.append(cv.Path(
-                        elements=_pts_m,
-                        paint=ft.Paint(
-                            color=ft.Colors.with_opacity(0.85, "#FF00FF"),
-                            stroke_width=1.2,
-                            style=ft.PaintingStyle.STROKE,
-                        ),
-                    ))
-
-        # ── Scale tick marks / Value lines ────────────────────────────────
-        if not _is_custom:
-            for _cx in (_CX_L, _CX_R):
-                # Retro uses many ticks; Neon uses fewer, larger glowing blocks
-                _tick_count = 41 if _is_retro else 13
-                for _i in range(_tick_count):
-                    _v     = _i / float(_tick_count - 1)
-                    _a     = _ang(_v)
-                    
-                    if _is_retro:
-                        _major = (_i % 10 == 0)
-                        _tlen = 7 if _major else 4
-                        # Color code the lines based on value
-                        _tcol = "#00CC44" if _v < 0.65 else ("#FFCC00" if _v < 0.85 else "#FF2222")
-                        _topa = 0.8 if _major else 0.4
-                    else:
-                        _major = (_i % 3 == 0)
-                        _tlen  = 6 if _major else 4
-                        _tcol  = "#00FFFF" if _v < 0.75 else "#FF00FF"
-                        _topa = 0.8 if _major else 0.35
-
-                    _ix, _iy = _pt(_cx, _R - 5 - _tlen, _a)
-                    _ox, _oy = _pt(_cx, _R - 5,         _a)
-                    shapes.append(cv.Line(
-                        x1=_ix, y1=_iy, x2=_ox, y2=_oy,
-                        paint=ft.Paint(
-                            color=ft.Colors.with_opacity(_topa, _tcol),
-                            stroke_width=1.8 if _major else 1.0,
-                        ),
-                    ))
-
-        # ── Colour zones (Power Bars for Neon mode) ──────────────────────
-        if not _is_retro and not _is_custom:
-            _zone_defs = [
-                (0.00, 0.75, "#00FFFF", 0.30),   # Cyan Range
-                (0.75, 1.00, "#FF00FF", 0.40),   # Peak Magenta
-            ]
-            for _cx in (_CX_L, _CX_R):
-                for (_v0, _v1, _zcol, _zopa) in _zone_defs:
-                    _zpts = []
-                    _a0, _a1 = int(_ang(_v0)), int(_ang(_v1))
-                    for _a in range(_a0, _a1 + 1, 2):
-                        px, py = _pt(_cx, _R - 5, _a)
-                        if _zpts:
-                            _zpts.append(cv.Path.LineTo(px, py))
-                        else:
-                            _zpts.append(cv.Path.MoveTo(px, py))
-                    if _zpts:
-                        shapes.append(cv.Path(
-                            elements=_zpts,
-                            paint=ft.Paint(
-                                color=ft.Colors.with_opacity(_zopa, _zcol),
-                                stroke_width=4,
-                                style=ft.PaintingStyle.STROKE,
-                            ),
-                        ))
-
-        # ── Needles ───────────────────────────────────────────────────────
-        for _cx, _val, _col in (
-            (_CX_L, self._neon_vu_left_smooth,  _col_l),
-            (_CX_R, self._neon_vu_right_smooth, _col_r),
-        ):
-            _tip_x, _tip_y = _pt(_cx, _R - 8, _ang(_val))
-            _px, _py = float(_cx), float(_CY)
-
-            # Single sharp needle for all themes (Cyber HUD / Vintage precision look)
-            shapes.append(cv.Line(
-                x1=_px, y1=_py, x2=_tip_x, y2=_tip_y,
-                paint=ft.Paint(color=_col, stroke_width=1.25),
-            ))
-
-        # ── Pivot cap circles (drawn last, on top of needles) ─────────────
-        for _cx, _val, _col in (
-            (_CX_L, self._neon_vu_left_smooth,  _col_l),
-            (_CX_R, self._neon_vu_right_smooth, _col_r),
-        ):
-            # Bright core cap
-            shapes.append(cv.Circle(
-                x=float(_cx), y=float(_CY), radius=2.5,
-                paint=ft.Paint(color=_col, style=ft.PaintingStyle.FILL),
-            ))
-
-        # ── Single canvas update — only needle layer redrawn ──────────────
+        _args = [_exe] if os.path.isfile(_exe) else [_sys.executable, _py]
+        if self.debug_mode:
+            _args.append("--debug-mode")
         try:
-            self._neon_vu_canvas.shapes = shapes
-            self._neon_vu_canvas.update()
-        except Exception:
-            pass
-
-    def _build_spec_text_columns(self, text):
-        # 5x7 glyphs for idle marquee text.
-        _font = {
-            " ": ["00000", "00000", "00000", "00000", "00000", "00000", "00000"],
-            "A": ["01110", "10001", "10001", "11111", "10001", "10001", "10001"],
-            "C": ["01110", "10001", "10000", "10000", "10000", "10001", "01110"],
-            "E": ["11111", "10000", "10000", "11110", "10000", "10000", "11111"],
-            "L": ["10000", "10000", "10000", "10000", "10000", "10000", "11111"],
-            "M": ["10001", "11011", "10101", "10101", "10001", "10001", "10001"],
-            "N": ["10001", "11001", "10101", "10011", "10001", "10001", "10001"],
-            "P": ["11110", "10001", "10001", "11110", "10000", "10000", "10000"],
-            "R": ["11110", "10001", "10001", "11110", "10100", "10010", "10001"],
-            "S": ["01111", "10000", "10000", "01110", "00001", "00001", "11110"],
-            "T": ["11111", "00100", "00100", "00100", "00100", "00100", "00100"],
-            "U": ["10001", "10001", "10001", "10001", "10001", "10001", "01110"],
-            "Y": ["10001", "10001", "01010", "00100", "00100", "00100", "00100"],
-            "Z": ["11111", "00001", "00010", "00100", "01000", "10000", "11111"],
-            "D": ["11100", "10010", "10001", "10001", "10001", "10010", "11100"],
-            "F": ["11111", "10000", "10000", "11110", "10000", "10000", "10000"],
-            "G": ["01110", "10001", "10000", "10111", "10001", "10001", "01110"],
-            "H": ["10001", "10001", "10001", "11111", "10001", "10001", "10001"],
-            "I": ["11111", "00100", "00100", "00100", "00100", "00100", "11111"],
-            "O": ["01110", "10001", "10001", "10001", "10001", "10001", "01110"],
-            "W": ["10001", "10001", "10001", "10101", "10101", "11011", "10001"],
-            "X": ["10001", "10001", "01010", "00100", "01010", "10001", "10001"],
-            "+": ["00000", "00100", "00100", "11111", "00100", "00100", "00000"],
-            ".": ["00000", "00000", "00000", "00000", "00000", "00110", "00110"],
-        }
-        _rows = [""] * 7
-        for _ch in str(text).upper():
-            _glyph = _font.get(_ch, _font[" "])
-            for _r in range(7):
-                _rows[_r] += _glyph[_r] + "0"
-        _cols = []
-        for _x in range(len(_rows[0]) if _rows and _rows[0] else 0):
-            _col = [(_rows[_y][_x] == "1") for _y in range(7)]
-            _cols.append(_col)
-        return _cols
-
-    def _render_spectrum_idle_text(self):
-        if not self._spec_segments:
-            return
-
-        _cols = self._build_spec_text_columns(self._spec_idle_text)
-        if not _cols:
-            return
-
-        # Scroll text at a speed controlled by idle speed slider.
-        _spd = max(0.25, min(3.0, float(self._spec_idle_speed)))
-        _old_scroll = self._spec_idle_scroll
-        self._spec_idle_phase += 0.18 * _spd
-        while self._spec_idle_phase >= 1.0:
-            self._spec_idle_phase -= 1.0
-            self._spec_idle_scroll = (self._spec_idle_scroll + 1) % len(_cols)
-        if self._spec_idle_scroll < _old_scroll:
-            self._spec_idle_cycle_done = True
-
-        _y_off = max(0, (self._spec_levels - 7) // 2)
-        _bg = "#101010"
-        for bi, segs in enumerate(self._spec_segments):
-            _cx = (bi + self._spec_idle_scroll) % len(_cols)
-            _bits = _cols[_cx]
-            _color = self._spec_palette[(bi + int(self._spec_idle_scroll / 2)) % len(self._spec_palette)]
-            for top_idx, seg in enumerate(segs):
-                _y = top_idx - _y_off
-                if 0 <= _y < 7 and _bits[_y]:
-                    seg.bgcolor = _color
-                else:
-                    seg.bgcolor = _bg
-
-        try:
-            self._spectrum_box.update()
-        except Exception:
-            pass
-
-    def _render_spectrum_idle_pulse(self):
-        """Ambient idle effect: expanding pulse rings with soft glow."""
-        if not self._spec_segments:
-            return
-
-        _bg = "#101010"
-        _bands = max(1, self._spec_bands)
-        _levels = max(1, self._spec_levels)
-        _spd = max(0.25, min(3.0, float(self._spec_idle_speed)))
-
-        _old_p = self._spec_idle_phase
-        self._spec_idle_phase += 0.11 * _spd
-        if self._spec_idle_phase >= 1000.0:
-            self._spec_idle_phase = 0.0
-
-        _p = self._spec_idle_phase
-        _cx = (_bands - 1) / 2.0
-        _cy = (_levels - 1) / 2.0
-        # Let pulses travel fully off-screen, then recycle.
-        _max_dist = ((_cx * _cx) + (_cy * _cy)) ** 0.5 + 2.0
-        _spawn_gap = max(2.0, _max_dist * 0.65)  # second pulse starts before first exits
-        _cycle = _max_dist + _spawn_gap
-        _r1 = (_p * 0.9) % _cycle
-        _r2 = (_r1 - _spawn_gap) % _cycle
-
-        if (_p * 0.9 % _cycle) < (_old_p * 0.9 % _cycle):
-            self._spec_idle_cycle_done = True
-
-        for bi, segs in enumerate(self._spec_segments):
-            for top_idx, seg in enumerate(segs):
-                _dx = bi - _cx
-                _dy = top_idx - _cy
-                _d = (_dx * _dx + _dy * _dy) ** 0.5
-                _best = 999.0
-                for _r in (_r1, _r2):
-                    if _r <= _max_dist + 0.6:
-                        _best = min(_best, abs(_d - _r))
-
-                if _best < 0.55:
-                    _idx = (bi + int(_p * 9.0)) % len(self._spec_palette)
-                    seg.bgcolor = self._spec_palette[_idx]
-                elif _best < 1.2:
-                    seg.bgcolor = "#2a2a2a"
-                else:
-                    seg.bgcolor = _bg
-
-            # subtle star flicker
-            _spark_row = int((bi * 5 + int(_p * 17)) % _levels)
-            if ((bi + int(_p * 8)) % 13) == 0:
-                segs[_spark_row].bgcolor = "#b0b0b0"
-
-        try:
-            self._spectrum_box.update()
-        except Exception:
-            pass
-
-    def _render_spectrum_idle_pacman(self):
-        """Idle effect: Pac-Man chasing a ghost across the analyzer grid."""
-        if not self._spec_segments:
-            return
-
-        _bands = max(1, self._spec_bands)
-        _levels = max(1, self._spec_levels)
-        _spd = max(0.25, min(3.0, float(self._spec_idle_speed)))
-        _bg = "#101010"
-
-        # Horizontal track includes off-screen padding so sprites can enter/exit smoothly.
-        _track = _bands + 20
-        _old_p = self._spec_idle_phase
-        self._spec_idle_phase = (self._spec_idle_phase + (0.35 * _spd)) % float(_track)
-        if self._spec_idle_phase < _old_p:
-            self._spec_idle_cycle_done = True
-
-        _y0 = max(0, min(_levels - 5, (_levels // 2) - 2))
-        _pac_x = int(self._spec_idle_phase) - 6
-        _ghost_x = _pac_x + 10
-        if _ghost_x > _bands + 5:
-            _ghost_x -= _track
-
-        _pac_closed = [
-            "01110",
-            "11111",
-            "11111",
-            "11111",
-            "01110",
-        ]
-        _pac_open = [
-            "01110",
-            "11100",
-            "11000",
-            "11100",
-            "01110",
-        ]
-        _ghost = [
-            "01110",
-            "11111",
-            "10101",
-            "11111",
-            "10101",
-        ]
-        # Keep mouth cadence fixed so idle speed slider only affects chase speed.
-        _pac = _pac_open if (int(time.monotonic() * 5.0) % 2) else _pac_closed
-
-        def _set_px(_x, _y, _color):
-            if 0 <= _x < _bands and 0 <= _y < _levels:
-                self._spec_segments[_x][_y].bgcolor = _color
-
-        def _draw_mask(_mask, _x0, _y0_local, _color):
-            for _ry, _row in enumerate(_mask):
-                for _rx, _bit in enumerate(_row):
-                    if _bit == "1":
-                        _set_px(_x0 + _rx, _y0_local + _ry, _color)
-
-        try:
-            for _x in range(_bands):
-                for _y in range(_levels):
-                    self._spec_segments[_x][_y].bgcolor = _bg
-
-            _draw_mask(_pac, _pac_x, _y0, "#ffd400")
-            _draw_mask(_ghost, _ghost_x, _y0, "#ff4d6d")
-
-            # Ghost eyes
-            _set_px(_ghost_x + 1, _y0 + 1, "#c8f7ff")
-            _set_px(_ghost_x + 3, _y0 + 1, "#c8f7ff")
-        except Exception:
-            # Never allow an idle animation exception to stall rendering.
-            self._render_spectrum_idle_pulse()
-            return
-
-        try:
-            self._spectrum_box.update()
-        except Exception:
-            pass
-
-    def _render_spectrum_idle_tetris(self):
-        """Idle effect: classic Tetris-style playfield with falling tetromino."""
-        if not self._spec_segments:
-            return
-
-        _bands = max(1, self._spec_bands)
-        _levels = max(1, self._spec_levels)
-        _spd = max(0.25, min(3.0, float(self._spec_idle_speed)))
-        _bg = "#101010"
-        self._spec_idle_cycle_done = True  # Tetris is infinite/random
-
-        self._spec_idle_phase = (self._spec_idle_phase + (0.85 * _spd)) % 100000.0
-        _tick = int(self._spec_idle_phase)
-
-        _well_w = max(6, min(10, _bands - 2))
-        _well_h = _levels
-        _left = max(0, (_bands - _well_w) // 2)
-        _right = _left + _well_w - 1
-        _wall_l = _left - 1
-        _wall_r = _right + 1
-
-        _pieces = [
-            ([(0, 1), (1, 1), (2, 1), (3, 1)], "#4dd0e1"),
-            ([(1, 0), (2, 0), (1, 1), (2, 1)], "#ffd54f"),
-            ([(1, 0), (0, 1), (1, 1), (2, 1)], "#ba68c8"),
-            ([(0, 0), (0, 1), (1, 1), (2, 1)], "#ff8a65"),
-            ([(2, 0), (0, 1), (1, 1), (2, 1)], "#64b5f6"),
-            ([(1, 0), (2, 0), (0, 1), (1, 1)], "#81c784"),
-            ([(0, 0), (1, 0), (1, 1), (2, 1)], "#f06292"),
-        ]
-
-        def _set_px(_x, _y, _color):
-            if 0 <= _x < _bands and 0 <= _y < _levels:
-                self._spec_segments[_x][_y].bgcolor = _color
-
-        def _draw_piece(_coords, _x0, _y0, _color):
-            for _dx, _dy in _coords:
-                _set_px(_x0 + _dx, _y0 + _dy, _color)
-
-        try:
-            for _x in range(_bands):
-                for _y in range(_levels):
-                    self._spec_segments[_x][_y].bgcolor = _bg
-
-            # Draw the playfield well walls.
-            for _y in range(_well_h):
-                _set_px(_wall_l, _y, "#2f2f2f")
-                _set_px(_wall_r, _y, "#2f2f2f")
-
-            # Subtle well grid so blocks read as "cells".
-            for _wx in range(_well_w):
-                for _wy in range(_well_h):
-                    if ((_wx + _wy) % 2) == 0:
-                        _set_px(_left + _wx, _wy, "#121212")
-
-            # Static-ish stack profile near bottom for a classic in-progress board feel.
-            _stack_heights = []
-            for _wx in range(_well_w):
-                _h = 2 + int(((math.sin((_wx * 0.9) + (_tick * 0.08)) + 1.0) * 1.5))
-                _stack_heights.append(max(1, min(_well_h - 5, _h)))
-
-            _piece_cycle = _well_h + 7
-            _piece_idx = (_tick // _piece_cycle) % len(_pieces)
-            _piece_coords, _piece_color = _pieces[_piece_idx]
-            _piece_x = ((_tick // _piece_cycle) * 3) % max(1, (_well_w - 4))
-            _piece_y = -3 + (_tick % _piece_cycle)
-
-            # Keep a vertical drop lane more open so the active piece is visible longer.
-            for _dx, _ in _piece_coords:
-                _col = _piece_x + _dx
-                if 0 <= _col < _well_w:
-                    _stack_heights[_col] = max(1, _stack_heights[_col] - 2)
-
-            _stack_palette = ["#2aa198", "#d79921", "#6c71c4", "#859900", "#cb4b16", "#268bd2", "#d33682"]
-            for _wx in range(_well_w):
-                _h = _stack_heights[_wx]
-                for _n in range(_h):
-                    _yy = (_well_h - 1) - _n
-                    _set_px(_left + _wx, _yy, _stack_palette[(_wx + _n + (_tick // 3)) % len(_stack_palette)])
-
-            # Periodic fake line-clear flash for arcade flavor.
-            if (_tick % 40) >= 34:
-                _flash_y = _well_h - 1 - ((_tick // 2) % 2)
-                for _wx in range(_well_w):
-                    _set_px(_left + _wx, _flash_y, "#f0f0f0")
-
-            _draw_piece(_piece_coords, _left + _piece_x, _piece_y, _piece_color)
-        except Exception:
-            self._render_spectrum_idle_pulse()
-            return
-
-        try:
-            self._spectrum_box.update()
-        except Exception:
-            pass
-
-    def _render_spectrum_idle_invaders(self):
-        """Idle effect: space invader formation marching left and right."""
-        if not self._spec_segments:
-            return
-
-        _bands = max(1, self._spec_bands)
-        _levels = max(1, self._spec_levels)
-        _spd = max(0.25, min(3.0, float(self._spec_idle_speed)))
-        _bg = "#101010"
-
-        _old_p = self._spec_idle_phase
-        self._spec_idle_phase = (self._spec_idle_phase + (0.45 * _spd)) % 100000.0
-        _phase = self._spec_idle_phase
-
-        _invader_a = [
-            "00100100",
-            "01111110",
-            "11011011",
-            "11111111",
-            "01111110",
-            "01000010",
-        ]
-        _invader_b = [
-            "00100100",
-            "01111110",
-            "11011011",
-            "11111111",
-            "00111100",
-            "01100110",
-        ]
-
-        def _set_px(_x, _y, _color):
-            if 0 <= _x < _bands and 0 <= _y < _levels:
-                self._spec_segments[_x][_y].bgcolor = _color
-
-        def _draw_mask(_mask, _x0, _y0, _color):
-            for _ry, _row in enumerate(_mask):
-                for _rx, _bit in enumerate(_row):
-                    if _bit == "1":
-                        _set_px(_x0 + _rx, _y0 + _ry, _color)
-
-        try:
-            for _x in range(_bands):
-                for _y in range(_levels):
-                    self._spec_segments[_x][_y].bgcolor = _bg
-
-            _frame = int(_phase)
-            _wiggle = 1 if ((_frame // 2) % 2) else 0
-            _mask = _invader_a if ((_frame // 3) % 2) else _invader_b
-
-            _span = max(1, _bands - 26)
-            _step = _frame % (2 * _span)
-            _old_step = int(_old_p) % (2 * _span)
-
-            if _step < _old_step:
-                self._spec_idle_cycle_done = True
-
-            _offset = _step if _step < _span else (2 * _span - _step)
-            _x0 = max(0, min(_bands - 1, 1 + _offset))
-
-            for _i in range(3):
-                _draw_mask(_mask, _x0 + (_i * 9), 2 + _wiggle, "#8cff66")
-
-            _laser_x = _x0 + 12
-            _laser_top = 9 + (_frame % max(2, _levels - 9))
-            for _y in range(_laser_top, min(_levels, _laser_top + 4)):
-                _set_px(_laser_x, _y, "#ff5252")
-        except Exception:
-            self._render_spectrum_idle_pulse()
-            return
-
-        try:
-            self._spectrum_box.update()
-        except Exception:
-            pass
-
-    def _render_spectrum_idle_snake(self):
-        """Idle effect: classic snake slithering through a serpentine path."""
-        if not self._spec_segments:
-            return
-
-        _bands = max(1, self._spec_bands)
-        _levels = max(1, self._spec_levels)
-        _spd = max(0.25, min(3.0, float(self._spec_idle_speed)))
-        _bg = "#101010"
-
-        _old_p = int(self._spec_idle_phase)
-        self._spec_idle_phase = (self._spec_idle_phase + (1.05 * _spd)) % 100000.0
-        _phase = int(self._spec_idle_phase)
-
-        _path = []
-        for _y in range(_levels):
-            if (_y % 2) == 0:
-                for _x in range(_bands):
-                    _path.append((_x, _y))
-            else:
-                for _x in range(_bands - 1, -1, -1):
-                    _path.append((_x, _y))
-
-        def _set_px(_x, _y, _color):
-            if 0 <= _x < _bands and 0 <= _y < _levels:
-                self._spec_segments[_x][_y].bgcolor = _color
-
-        try:
-            for _x in range(_bands):
-                for _y in range(_levels):
-                    self._spec_segments[_x][_y].bgcolor = _bg
-
-            if not _path:
-                return
-
-            if (_phase % len(_path)) < (_old_p % len(_path)):
-                self._spec_idle_cycle_done = True
-
-            _head_idx = _phase % len(_path)
-            _len_snake = max(8, min(len(_path) // 2, _bands + 6))
-            for _i in range(_len_snake):
-                _idx = (_head_idx - _i) % len(_path)
-                _x, _y = _path[_idx]
-                if _i == 0:
-                    _c = "#d7ff8a"
-                else:
-                    _g = max(72, 255 - (_i * 9))
-                    _c = f"#00{_g:02x}28"
-                _set_px(_x, _y, _c)
-
-            _food_idx = (_head_idx + (_bands * 2 + 5)) % len(_path)
-            _fx, _fy = _path[_food_idx]
-            _set_px(_fx, _fy, "#ff6a3d")
-        except Exception:
-            self._render_spectrum_idle_pulse()
-            return
-
-        try:
-            self._spectrum_box.update()
-        except Exception:
-            pass
-
-    def _build_starwars_tape(self, bands, levels):
-        """Build vertical bitmap tape for Star Wars crawl.
-        Returns (tape, tape_title), each a list[vrows] of list[bands] booleans.
-        """
-        _line_h = 9
-        _font_h = 7
-        _crawl = [
-            ("", False),
-            ("", False),
-            ("STAR", True),
-            ("WARS", True),
-            ("", False),
-            ("A LONG", False),
-            ("TIME AGO", False),
-            ("IN A", False),
-            ("GALAXY", False),
-            ("FAR FAR", False),
-            ("AWAY...", False),
-            ("", False),
-            ("WLED", False),
-            ("COMMAND", False),
-            ("CENTER+", False),
-            ("", False),
-            ("A NEW", False),
-            ("HOPE FOR", False),
-            ("YOUR", False),
-            ("SMART", False),
-            ("LIGHTS", False),
-            ("", False),
-            ("", False),
-            ("", False),
-            ("", False),
-            ("", False),
-        ]
-
-        _prefix = levels
-        _total_vrows = _prefix + len(_crawl) * _line_h
-        _tape = [[False] * bands for _ in range(_total_vrows)]
-        _tape_title = [[False] * bands for _ in range(_total_vrows)]
-        _vr_base = _prefix
-
-        for _text, _is_title in _crawl:
-            _text = _text.strip()
-            if _text:
-                _cols = self._build_spec_text_columns(_text)
-                _tw = len(_cols)
-                _x0 = max(0, (bands - _tw) // 2)
-                for _cx, _cbits in enumerate(_cols):
-                    _vx = _x0 + _cx
-                    if _vx >= bands:
-                        break
-                    for _fy in range(min(_font_h, len(_cbits))):
-                        if _cbits[_fy]:
-                            _vr = _vr_base + _fy
-                            if 0 <= _vr < _total_vrows:
-                                _tape[_vr][_vx] = True
-                                if _is_title:
-                                    _tape_title[_vr][_vx] = True
-            _vr_base += _line_h
-
-        return _tape, _tape_title
-
-    def _render_spectrum_idle_starwars(self):
-        """Star Wars crawl using regular graphics controls (not the SA grid)."""
-        _w = int(self._spectrum_box.width or self._spec_box_graphics_size[0])
-        _h = int(self._spectrum_box.height or self._spec_box_graphics_size[1])
-        _w = max(120, _w)
-        _h = max(80, _h)
-
-        self._ensure_spectrum_graphics_controls(_w, _h)
-
-        _spd = max(0.25, min(3.0, float(self._spec_idle_speed)))
-        _lines = [
-            ("STAR WARS", True),
-            ("IN A LAND FAR AWAY...", False),
-            ("WLED COMMAND CENTER+", False),
-            ("A NEW HOPE", False),
-            ("FOR SMART LIGHT CONTROL", False),
-            ("MAY YOUR LIGHTS", False),
-            ("BE WITH YOU", False),
-        ]
-
-        _line_gap = 16
-        _start_y = _h - 28
-        _line_count = max(1, len(_lines))
-        # Restart immediately after the last line exits the top cutoff (-80).
-        _cycle_px = _start_y + ((_line_count - 1) * _line_gap) + 80
-        _old_p = self._spec_idle_phase
-        self._spec_idle_phase = (self._spec_idle_phase + (0.30 * _spd)) % float(max(1, _cycle_px))
-        if self._spec_idle_phase < _old_p:
-            self._spec_idle_cycle_done = True
-        _base_y = _start_y - self._spec_idle_phase
-
-        _now = time.monotonic()
-        for _i, _dot in enumerate(self._spec_graphics_stars):
-            _tw = int(_now * 3.4 + (_i * 1.23)) % 8
-            _alpha = (0.22, 0.35, 0.5, 0.7, 0.45, 0.3, 0.18, 0.08)[_tw]
-            _v = (120, 145, 180, 220, 160, 140, 115, 90)[_tw]
-            _dot.bgcolor = f"#{_v:02x}{_v:02x}{_v:02x}"
-            _dot.opacity = _alpha
-
-        for _idx, (_slot, _txt) in enumerate(self._spec_graphics_lines):
-            if _idx >= len(_lines):
-                _slot.visible = False
-                continue
-
-            _text, _is_title = _lines[_idx]
-            _y = _base_y + (_idx * _line_gap)
-            if (not _text) or _y < -80 or _y > (_h + 60):
-                _slot.visible = False
-                continue
-
-            _depth = max(0.0, min(1.0, _y / max(1.0, float(_h))))
-            _scale = 0.18 + ((_depth ** 1.18) * 1.30)
-            _base_fs = 30 if _is_title else 22
-            _font_size = max(8, int(_base_fs * _scale))
-
-            # Weighted width estimate prevents clipping on wide glyphs (W, M, etc.).
-            _char_units = 0.0
-            for _ch in _text:
-                if _ch == " ":
-                    _char_units += 0.42
-                elif _ch in "WM@#%&":
-                    _char_units += 1.0
-                elif _ch in "I|.,:;!'":
-                    _char_units += 0.40
-                else:
-                    _char_units += 0.72
-
-            _side_pad = max(14, int(_font_size * 0.95))
-            _est_w = max(30, int((_char_units * _font_size) + (_side_pad * 2)))
-            _est_h = max(14, int(_font_size * 1.75))
-
-            _slot.left = int((_w - _est_w) / 2)
-            _slot.top = int(_y)
-            _slot.width = _est_w
-            _slot.height = _est_h
-            _slot.visible = True
-
-            if _is_title:
-                _r = 255
-                _g = 140
-                _b = 20
-                _txt.weight = ft.FontWeight.BOLD
-            else:
-                _r = 255
-                _g = 214
-                _b = 80
-                _txt.weight = ft.FontWeight.W_600
-
-            _txt.value = _text
-            _txt.size = _font_size
-            _txt.color = f"#{_r:02x}{_g:02x}{_b:02x}"
-
-        try:
-            self._spectrum_box.update()
-        except Exception:
-            pass
-
-    def _refresh_spectrum_sources(self):
-        """Refresh available spectrum audio sources immediately."""
-        try:
-            import importlib
-            _sc = importlib.import_module("soundcard")
-            _all_mics = list(_sc.all_microphones(include_loopback=True))
-            _raw_sources = [(m.name, idx) for idx, m in enumerate(_all_mics)]
-            _rank = {n: i for i, n in enumerate(self._spec_source_order)}
-            self._spec_audio_sources = sorted(_raw_sources, key=lambda it: (_rank.get(it[0], 10**9), it[1]))
-
-            _new_order = []
-            for _name, _ in self._spec_audio_sources:
-                if _name not in _new_order:
-                    _new_order.append(_name)
-            self._spec_source_order = _new_order
-            return True
-        except Exception:
-            self._spec_audio_sources = []
-            return False
-
-    def _spec_profile_key(self, source_name=None):
-        _name = self._spec_selected_source if source_name is None else source_name
-        return "__default__" if not _name else str(_name)
-
-    def _save_spec_profile(self, source_name=None):
-        _key = self._spec_profile_key(source_name)
-        self._spec_profiles[_key] = {
-            "sensitivity": float(self._spec_sensitivity),
-            "reactivity": float(self._spec_reactivity),
-            "bar_decay": float(self._spec_bar_decay),
-            "peak_decay": float(self._spec_peak_decay),
-            "eq_gains": [float(v) for v in self._spec_eq_gains],
-        }
-
-    def _load_spec_profile(self, source_name=None):
-        _key = self._spec_profile_key(source_name)
-        _p = self._spec_profiles.get(_key, {}) if isinstance(self._spec_profiles, dict) else {}
-
-        def _clamp(v, lo, hi, default):
-            try:
-                return max(lo, min(hi, float(v)))
-            except Exception:
-                return default
-
-        self._spec_sensitivity = _clamp(_p.get("sensitivity", 0.85), 0.1, 1.5, 0.85)
-        self._spec_reactivity = _clamp(_p.get("reactivity", 3.0), 0.25, 3.0, 3.0)
-        self._spec_bar_decay = _clamp(_p.get("bar_decay", 2.0), 0.1, 5.0, 2.0)
-        self._spec_peak_decay = _clamp(_p.get("peak_decay", 1.0), 0.1, 5.0, 1.0)
-
-        _eq = _p.get("eq_gains", None)
-        if isinstance(_eq, list) and len(_eq) == len(self._spec_eq_freqs):
-            try:
-                self._spec_eq_gains = [max(0.25, min(3.0, float(v))) for v in _eq]
-            except Exception:
-                self._spec_eq_gains = [1.0] * len(self._spec_eq_freqs)
-        else:
-            self._spec_eq_gains = [1.0] * len(self._spec_eq_freqs)
-
-    def _pick_default_spectrum_source(self, _sc):
-        """Prefer loopback/output capture source; fall back to microphone only if needed."""
-        try:
-            _speaker = _sc.default_speaker()
-        except Exception:
-            _speaker = None
-
-        try:
-            _all_mics = list(_sc.all_microphones(include_loopback=True))
-        except Exception:
-            _all_mics = []
-
-        # 1) Exact API path: loopback mic by default speaker id
-        if _speaker is not None:
-            try:
-                _loop = _sc.get_microphone(id=_speaker.id, include_loopback=True)
-                if _loop is not None:
-                    return _loop, "output-loopback"
-            except Exception:
-                pass
-
-        # 2) Name heuristics: pick loopback-like devices first
-        _speaker_name = (_speaker.name.lower() if _speaker and getattr(_speaker, "name", None) else "")
-        for _m in _all_mics:
-            _n = str(getattr(_m, "name", "")).lower()
-            if "loopback" in _n or "stereo mix" in _n:
-                if _speaker_name and _speaker_name in _n:
-                    return _m, "output-loopback"
-        for _m in _all_mics:
-            _n = str(getattr(_m, "name", "")).lower()
-            if "loopback" in _n or "stereo mix" in _n:
-                return _m, "output-loopback"
-
-        # 3) Fallback input mic only as last resort
-        try:
-            _mic = _sc.default_microphone()
-            if _mic is not None:
-                return _mic, "input-microphone"
-        except Exception:
-            pass
-
-        return None, None
+            subprocess.Popen(_args, cwd=_here)
+            self.log(f"[SA] Launched {'SA.exe' if os.path.isfile(_exe) else 'SA.py'}", color="cyan")
+        except Exception as ex:
+            self.log(f"[SA] Launch failed: {ex}", color="red400")
+        # ── SA open-menu proxies (SpectrumController handles everything else) ──
 
     def _open_spectrum_source_selector(self, _=None):
-        try:
-            self._show_spectrum_source_selector()
-        except Exception as ex:
-            self.log(f"[Spectrum] Source selector failed: {ex}", color="orange400")
+        """Open the SA settings panel (delegates to SpectrumController)."""
+        if self._sa:
+            try:   self._sa._open_spectrum_source_selector()
+            except Exception as ex:
+                self.log(f"[SA] Settings error: {ex}", color="orange400")
 
     def _open_spectrum_idle_settings(self, _=None):
-        try:
-            self._show_spectrum_idle_settings()
-        except Exception as ex:
-            self.log(f"[Spectrum] Idle settings failed: {ex}", color="orange400")
-
-    def _show_spectrum_idle_settings(self):
-        """Show idle-effects + source controls in a dedicated dialog."""
-        self.log("[Spectrum] Idle settings opened", color="grey500")
-        self._refresh_spectrum_sources()
-
-        _idle_timeout_txt = ft.Text(f"{int(self._spec_idle_timeout)}s", size=12, color="#ff9800")
-        _idle_speed_txt = ft.Text(f"{self._spec_idle_speed:.2f}x", size=12, color="#ff9800")
-
-        _idle_options = [
-            ("pulse", "Pulse Field"),
-            ("text", "Marquee Text"),
-            ("pacman", "Pac-Man Chase"),
-            ("tetris", "Tetris Stack"),
-            ("invaders", "Space Invaders"),
-            ("snake", "Snake Crawl"),
-            ("starwars", "Star Wars Crawl"),
-        ]
-
-        def _ensure_idle_cycle_default():
-            if not isinstance(self._spec_idle_cycle_effects, list):
-                self._spec_idle_cycle_effects = [k for k, _ in _idle_options]
-            self._spec_idle_cycle_effects = [k for k in self._spec_idle_cycle_effects if any(k == o[0] for o in _idle_options)]
-            if not self._spec_idle_cycle_effects:
-                self._spec_idle_cycle_effects = [k for k, _ in _idle_options]
-
-        _ensure_idle_cycle_default()
-
-        def on_idle_timeout_change(e):
-            self._spec_idle_timeout = round(float(e.control.value), 1)
-            _idle_timeout_txt.value = f"{int(round(self._spec_idle_timeout))}s"
-            _idle_timeout_txt.update()
-
-        def on_idle_effect_change(e):
-            _fx = str(e.control.value or "random").lower()
-            self._spec_idle_effect = _fx if _fx in ("random", "pulse", "text", "pacman", "tetris", "invaders", "snake", "starwars") else "random"
-
-        def on_idle_speed_change(e):
-            self._spec_idle_speed = round(float(e.control.value), 2)
-            _idle_speed_txt.value = f"{self._spec_idle_speed:.2f}x"
-            _idle_speed_txt.update()
-
-        def on_cycle_fx_toggle(fx_key, enabled):
-            _ensure_idle_cycle_default()
-            if enabled:
-                if fx_key not in self._spec_idle_cycle_effects:
-                    self._spec_idle_cycle_effects.append(fx_key)
-            else:
-                self._spec_idle_cycle_effects = [x for x in self._spec_idle_cycle_effects if x != fx_key]
-                if not self._spec_idle_cycle_effects:
-                    # Keep at least one effect active.
-                    self._spec_idle_cycle_effects = [fx_key]
-
-        source_list = None
-
-        def on_source_selected(source_name):
-            self._save_spec_profile()
-            self._spec_selected_source = source_name if source_name != "Default" else None
-            if self._spec_selected_source:
-                self._spec_source_order = [self._spec_selected_source] + [n for n in self._spec_source_order if n != self._spec_selected_source]
-            self._load_spec_profile(self._spec_selected_source)
-            self._spec_source_changed = True
-            if self._spec_disabled:
-                self._spec_disabled = False
-                threading.Thread(target=self._audio_analyzer_loop, daemon=True).start()
-            self._refresh_spectrum_sources()
-            if source_list is not None:
-                source_list.controls = _build_source_buttons()
-                source_list.update()
-
-        def _build_source_buttons():
-            if self._spec_audio_sources:
-                _source_buttons = []
-                if self._spec_selected_source:
-                    _source_buttons.append(ft.TextButton(self._spec_selected_source, on_click=lambda _, n=self._spec_selected_source: on_source_selected(n), style=ft.ButtonStyle(color="#ff9800")))
-                    _source_buttons.append(ft.TextButton("Default", on_click=lambda _: on_source_selected("Default"), style=ft.ButtonStyle(color="grey500")))
-                    for name, _idx in self._spec_audio_sources:
-                        if name == self._spec_selected_source:
-                            continue
-                        _source_buttons.append(ft.TextButton(name, on_click=lambda _, n=name: on_source_selected(n), style=ft.ButtonStyle(color="grey500")))
-                else:
-                    _source_buttons.append(ft.TextButton("Default", on_click=lambda _: on_source_selected("Default"), style=ft.ButtonStyle(color="#ff9800")))
-                    for name, _idx in self._spec_audio_sources:
-                        _source_buttons.append(ft.TextButton(name, on_click=lambda _, n=name: on_source_selected(n), style=ft.ButtonStyle(color="grey500")))
-                return _source_buttons
-            return [
-                ft.Text("No compatible sources detected.", size=12, color="orange400"),
-                ft.Text("Tip: Enable Stereo Mix or play audio, then reopen this panel.", size=11, color="grey500"),
-            ]
-
-        _idle_effect_dd = ft.Dropdown(
-            width=180,
-            value=self._spec_idle_effect,
-            options=[
-                ft.dropdown.Option("random", "Random Cycle"),
-                ft.dropdown.Option("pulse", "Pulse Field"),
-                ft.dropdown.Option("text", "Marquee Text"),
-                ft.dropdown.Option("pacman", "Pac-Man Chase"),
-                ft.dropdown.Option("tetris", "Tetris Stack"),
-                ft.dropdown.Option("invaders", "Space Invaders"),
-                ft.dropdown.Option("snake", "Snake Crawl"),
-                ft.dropdown.Option("starwars", "Star Wars Crawl"),
-            ],
-            on_change=on_idle_effect_change,
-            text_size=12,
-            dense=True,
-        )
-
-        _cycle_checks = []
-        for _fx_key, _fx_label in _idle_options:
-            _cycle_checks.append(
-                ft.Checkbox(
-                    label=_fx_label,
-                    value=(_fx_key in self._spec_idle_cycle_effects),
-                    on_change=lambda e, k=_fx_key: on_cycle_fx_toggle(k, bool(e.control.value)),
-                    active_color="#ff9800",
-                )
-            )
-
-        _left_col_checks = [c for i, c in enumerate(_cycle_checks) if (i % 2) == 0]
-        _right_col_checks = [c for i, c in enumerate(_cycle_checks) if (i % 2) == 1]
-
-        _cycle_grid = ft.Row([
-            ft.Column(_left_col_checks, spacing=0, tight=True, expand=True),
-            ft.Column(_right_col_checks, spacing=0, tight=True, expand=True),
-        ], spacing=10, expand=True)
-
-        dlg = ft.AlertDialog(
-            title=ft.Text("Idle Effects Settings"),
-            content=ft.Column(
-                [
-                    ft.Row([
-                        ft.Container(content=_cycle_grid, expand=True),
-                        ft.Container(content=_idle_effect_dd, width=190, alignment=ft.alignment.top_right),
-                    ], spacing=8, vertical_alignment=ft.CrossAxisAlignment.START),
-                    ft.Row([
-                        ft.Text("Timeout:", size=12, color="grey400", width=62),
-                        _idle_timeout_txt,
-                        ft.Slider(min=2.0, max=30.0, value=self._spec_idle_timeout, divisions=28, active_color="#ff9800", on_change=on_idle_timeout_change, expand=True),
-                    ], spacing=8, vertical_alignment=ft.CrossAxisAlignment.CENTER),
-                    ft.Row([
-                        ft.Text("Idle Speed:", size=12, color="grey400", width=62),
-                        _idle_speed_txt,
-                        ft.Slider(min=0.25, max=3.0, value=self._spec_idle_speed, divisions=55, active_color="#ff9800", on_change=on_idle_speed_change, expand=True),
-                    ], spacing=8, vertical_alignment=ft.CrossAxisAlignment.CENTER),
-                    ft.Divider(height=1, color="grey800"),
-                    ft.Text("Sound Sources:", size=12, color="grey400"),
-                    (source_list := ft.Column(_build_source_buttons(), scroll="auto", tight=True, height=120)),
-                ],
-                tight=True,
-                scroll=ft.ScrollMode.AUTO,
-                width=430,
-                height=500,
-            ),
-            actions=[
-                ft.TextButton("Close", on_click=lambda _: self.page.close(dlg)),
-                ft.ElevatedButton("Save", on_click=lambda _: (self.save_cache(), self.page.close(dlg)), bgcolor="#1a1a2e", color="white"),
-            ],
-        )
-        try:
-            self.page.open(dlg)
-        except Exception:
-            self.page.dialog = dlg
-            dlg.open = True
-            self.page.update()
-
-    def _show_spectrum_source_selector(self):
-        """Show a dialog to select the audio source and sensitivity for spectrum analyzer."""
-        self.log("[Spectrum] Source selector opened", color="grey500")
-        self._refresh_spectrum_sources()
-
-        # Dialog runs in preview mode. Changes apply live, but are not written
-        # to JSON unless Save is clicked.
-        _spec_saved = False
-        if not self._spec_preview_pending:
-            self._spec_preview_snapshot = {
-                "selected_source": self._spec_selected_source,
-                "source_order": list(self._spec_source_order),
-                "profiles": json.loads(json.dumps(self._spec_profiles if isinstance(self._spec_profiles, dict) else {})),
-                "target_fps": int(self._spec_target_fps),
-                "analysis_bands": int(self._spec_analysis_bands),
-                "sensitivity": float(self._spec_sensitivity),
-                "reactivity": float(self._spec_reactivity),
-                "mode_song_timeout": float(self._spec_mode_song_silence_seconds),
-                "bar_decay": float(self._spec_bar_decay),
-                "peak_decay": float(self._spec_peak_decay),
-                "sample_rate": int(self._spec_sample_rate),
-                "sampling_enabled": bool(self._spec_sampling_enabled),
-                "mode": str(self._spec_mode),
-                "mode_cycle_choices": list(self._spec_mode_cycle_choices),
-                "idle_enabled": bool(self._spec_idle_enabled),
-                "idle_timeout": float(self._spec_idle_timeout),
-                "idle_effect": str(self._spec_idle_effect),
-                "idle_speed": float(self._spec_idle_speed),
-                "idle_cycle_effects": list(self._spec_idle_cycle_effects),
-                "eq_gains": [float(v) for v in self._spec_eq_gains],
-            }
-            self._spec_preview_pending = True
-
-        def _restore_preview_snapshot():
-            _snap = self._spec_preview_snapshot if isinstance(self._spec_preview_snapshot, dict) else None
-            if not _snap:
-                return
-            _current_selected = self._spec_selected_source
-            self._spec_selected_source = _snap.get("selected_source", None)
-            self._spec_source_order = list(_snap.get("source_order", []))
-            self._spec_profiles = json.loads(json.dumps(_snap.get("profiles", {})))
-            _prev_analysis_bands = int(getattr(self, "_spec_analysis_bands", self._spec_bands) or self._spec_bands)
-            try:
-                self._spec_target_fps = max(8, min(30, int(round(float(_snap.get("target_fps", 25))))))
-            except Exception:
-                self._spec_target_fps = 25
-            self._spec_mode_song_silence_seconds = float(_snap.get("mode_song_timeout", 2.0))
-            if _song_timeout_slider is not None:
-                _song_timeout_slider.value = float(self._spec_mode_song_silence_seconds)
-                _song_timeout_slider.update()
-            _song_timeout_txt.value = f"{self._spec_mode_song_silence_seconds:.1f}s"
-            _song_timeout_txt.update()
-            self._set_spec_analysis_bands(_snap.get("analysis_bands", self._spec_bands), restart_audio=False, reset_now=False)
-            self._spec_sensitivity = float(_snap.get("sensitivity", 0.85))
-            self._spec_reactivity = float(_snap.get("reactivity", 3.0))
-            self._spec_bar_decay = float(_snap.get("bar_decay", 2.0))
-            self._spec_peak_decay = float(_snap.get("peak_decay", 1.0))
-            _prev_sr = int(getattr(self, "_spec_sample_rate", 48000) or 48000)
-            _prev_sampling = bool(getattr(self, "_spec_sampling_enabled", True))
-            try:
-                _sr = int(_snap.get("sample_rate", 48000))
-            except Exception:
-                _sr = 48000
-            self._spec_sample_rate = _sr if _sr in (16000, 22050, 32000, 44100, 48000) else 48000
-            self._spec_sampling_enabled = bool(_snap.get("sampling_enabled", True))
-            _mode = str(_snap.get("mode", "classic")).lower()
-            self._spec_mode = _mode if _mode in ("classic", "vu", "cyber_city", "neon_drift", "retro_tech", "custom_vu", "random", "random_song", "neon_vu") else "classic"
-            self._spec_mode_cycle_choices = list(_snap.get("mode_cycle_choices", ["classic", "vu", "cyber_city", "neon_drift", "retro_tech", "custom_vu"]))
-            if self._spec_mode in ("random", "random_song"):
-                self._advance_spectrum_random_mode()
-                self._spec_mode_random_next_ts = time.monotonic() + max(1.0, float(self._spec_mode_random_cycle_seconds))
-                self._spec_mode_song_switch_armed = True
-            self._spec_idle_enabled = bool(_snap.get("idle_enabled", True))
-            self._spec_idle_timeout = float(_snap.get("idle_timeout", 2.0))
-            _idle_fx = str(_snap.get("idle_effect", "random")).lower()
-            self._spec_idle_effect = _idle_fx if _idle_fx in ("random", "pulse", "text", "pacman", "tetris", "invaders", "snake", "starwars") else "random"
-            try:
-                self._spec_idle_speed = max(0.25, min(3.0, float(_snap.get("idle_speed", 3.0))))
-            except Exception:
-                self._spec_idle_speed = 3.0
-            _idle_cycle = _snap.get("idle_cycle_effects", self._spec_idle_cycle_effects)
-            if isinstance(_idle_cycle, list):
-                _allowed = ["pulse", "text", "pacman", "tetris", "invaders", "snake", "starwars"]
-                self._spec_idle_cycle_effects = [x for x in _idle_cycle if isinstance(x, str) and x in _allowed]
-                if not self._spec_idle_cycle_effects:
-                    self._spec_idle_cycle_effects = list(_allowed)
-            self._spec_eq_gains = [float(v) for v in _snap.get("eq_gains", [1.0] * len(self._spec_eq_freqs))]
-            if (_current_selected != self._spec_selected_source) or (_prev_sr != self._spec_sample_rate) or (_prev_sampling != self._spec_sampling_enabled) or (_prev_analysis_bands != int(self._spec_analysis_bands)):
-                self._spec_source_changed = True
-                if self._spec_disabled:
-                    self._spec_disabled = False
-                    threading.Thread(target=self._audio_analyzer_loop, daemon=True).start()
-            self._sync_spec_quick_buttons()
-
-        def _revert_preview_and_close(_=None):
-            nonlocal _spec_saved
-            if not _spec_saved:
-                _restore_preview_snapshot()
-                self._spec_preview_pending = False
-                self._spec_preview_snapshot = None
-                self.log("[Spectrum] Preview changes discarded", color="grey500")
-            self.page.close(dlg)
-
-        def _close_keep_preview(_=None):
-            # Close behaves like click-away: keep temporary preview state.
-            if (not _spec_saved) and self._spec_preview_pending:
-                self.log("[Spectrum] Preview kept (not saved)", color="grey500")
-            self.page.close(dlg)
-
-        def _save_and_close(_=None):
-            nonlocal _spec_saved
-            self._save_spec_profile()
-            self.save_cache()
-            _spec_saved = True
-            self._spec_preview_pending = False
-            self._spec_preview_snapshot = None
-            self.log("[Spectrum] Settings saved", color="green400")
-            self.page.close(dlg)
-
-        def _dismiss_keep_preview(_=None):
-            # Click-away dismiss keeps temporary preview changes active.
-            if (not _spec_saved) and self._spec_preview_pending:
-                self.log("[Spectrum] Preview kept (not saved)", color="grey500")
-
-        source_list = None
-        _sens_slider = None
-        _react_slider = None
-        _song_timeout_slider = None
-        _bar_decay_slider = None
-        _peak_decay_slider = None
-
-        def on_source_selected(source_name):
-            nonlocal _active_eq_preset
-            # Persist current source profile before switching.
-            self._save_spec_profile()
-
-            self._spec_selected_source = source_name if source_name != "Default" else None
-
-            # Move selected source to top while preserving relative order of others.
-            if self._spec_selected_source:
-                self._spec_source_order = [self._spec_selected_source] + [
-                    n for n in self._spec_source_order if n != self._spec_selected_source
-                ]
-
-            # Load profile for the newly selected source/default.
-            self._load_spec_profile(self._spec_selected_source)
-
-            self._spec_source_changed = True
-            if self._spec_disabled:
-                self._spec_disabled = False
-                threading.Thread(target=self._audio_analyzer_loop, daemon=True).start()
-
-            # Refresh ordered source list and keep dialog open.
-            self._refresh_spectrum_sources()
-            if source_list is not None:
-                source_list.controls = _build_source_buttons()
-                source_list.update()
-
-            # Reflect loaded profile values in controls.
-            if _sens_slider is not None:
-                _sens_slider.value = max(_sens_slider.min, min(_sens_slider.max, float(self._spec_sensitivity)))
-                _sens_slider.update()
-            _sens_pct.value = f"{int(self._spec_sensitivity * 100)}%"
-            _sens_pct.update()
-            if _react_slider is not None:
-                _react_slider.value = max(_react_slider.min, min(_react_slider.max, float(self._spec_reactivity)))
-                _react_slider.update()
-            _react_pct.value = f"{self._spec_reactivity:.2f}x"
-            _react_pct.update()
-            if _bar_decay_slider is not None:
-                _bar_decay_slider.value = max(_bar_decay_slider.min, min(_bar_decay_slider.max, float(self._spec_bar_decay)))
-                _bar_decay_slider.update()
-            _bar_decay_pct.value = f"{self._spec_bar_decay:.2f}x"
-            _bar_decay_pct.update()
-            if _peak_decay_slider is not None:
-                _peak_decay_slider.value = max(_peak_decay_slider.min, min(_peak_decay_slider.max, float(self._spec_peak_decay)))
-                _peak_decay_slider.update()
-            _peak_decay_pct.value = f"{self._spec_peak_decay:.2f}x"
-            _peak_decay_pct.update()
-            for i, s in enumerate(_eq_sliders):
-                s.value = max(s.min, min(s.max, float(self._spec_eq_gains[i])))
-                s.update()
-                _eq_value_texts[i].value = f"{self._spec_eq_gains[i]:.2f}x"
-                _eq_value_texts[i].update()
-            _active_eq_preset = _detect_eq_preset_name()
-            _refresh_eq_preset_buttons()
-
-            self.log(f"[Spectrum] Switched to: {source_name}", color="grey500")
-
-        def _build_source_buttons():
-            # Create list of source buttons (always open dialog even if empty)
-            if self._spec_audio_sources:
-                _source_buttons = []
-
-                if self._spec_selected_source:
-                    _source_buttons.append(
-                        ft.TextButton(
-                            self._spec_selected_source,
-                            on_click=lambda _, n=self._spec_selected_source: on_source_selected(n),
-                            style=ft.ButtonStyle(color="#ff9800"),
-                        )
-                    )
-                    _source_buttons.append(
-                        ft.TextButton(
-                            "Default",
-                            on_click=lambda _: on_source_selected("Default"),
-                            style=ft.ButtonStyle(color="grey500"),
-                        )
-                    )
-
-                    for name, idx in self._spec_audio_sources:
-                        if name == self._spec_selected_source:
-                            continue
-                        _source_buttons.append(
-                            ft.TextButton(
-                                name,
-                                on_click=lambda _, n=name: on_source_selected(n),
-                                style=ft.ButtonStyle(color="grey500"),
-                            )
-                        )
-                else:
-                    _source_buttons.append(
-                        ft.TextButton(
-                            "Default",
-                            on_click=lambda _: on_source_selected("Default"),
-                            style=ft.ButtonStyle(color="#ff9800"),
-                        )
-                    )
-
-                    for name, idx in self._spec_audio_sources:
-                        _source_buttons.append(
-                            ft.TextButton(
-                                name,
-                                on_click=lambda _, n=name: on_source_selected(n),
-                                style=ft.ButtonStyle(color="grey500"),
-                            )
-                        )
-                return _source_buttons
-
-            return [
-                ft.Text("No compatible sources detected.", size=12, color="orange400"),
-                ft.Text("Tip: Enable Stereo Mix or play audio, then reopen this panel.", size=11, color="grey500"),
-            ]
-
-        _sens_pct = ft.Text(f"{int(self._spec_sensitivity * 100)}%", size=12, color="#ff9800")
-        _fps_txt = ft.Text(f"{int(self._spec_target_fps)} FPS", size=12, color="#ff9800")
-        _song_timeout_txt = ft.Text(f"{self._spec_mode_song_silence_seconds:.1f}s", size=12, color="#ff9800")
-        _bars_txt = ft.Text(f"{int(self._spec_analysis_bands)}", size=12, color="#ff9800")
-        _react_pct = ft.Text(f"{self._spec_reactivity:.2f}x", size=12, color="#ff9800")
-        _bar_decay_pct = ft.Text(f"{self._spec_bar_decay:.2f}x", size=12, color="#ff9800")
-        _peak_decay_pct = ft.Text(f"{self._spec_peak_decay:.2f}x", size=12, color="#ff9800")
-        _idle_timeout_txt = ft.Text(f"{int(self._spec_idle_timeout)}s", size=12, color="#ff9800")
-        _idle_speed_txt = ft.Text(f"{self._spec_idle_speed:.2f}x", size=12, color="#ff9800")
-
-        def on_target_fps_change(e):
-            self._spec_target_fps = max(8, min(30, int(round(float(e.control.value)))))
-            _fps_txt.value = f"{int(self._spec_target_fps)} FPS"
-            _fps_txt.update()
-
-        def on_analysis_bars_change(e):
-            _new_bars = max(6, min(int(self._spec_bands), int(round(float(e.control.value)))))
-            _bars_txt.value = f"{_new_bars}"
-            _bars_txt.update()
-            self._set_spec_analysis_bands(_new_bars, restart_audio=True, reset_now=False)
-
-        def on_song_timeout_change(e):
-            self._spec_mode_song_silence_seconds = round(float(e.control.value), 1)
-            _song_timeout_txt.value = f"{self._spec_mode_song_silence_seconds:.1f}s"
-            _song_timeout_txt.update()
-
-        def on_sensitivity_change(e):
-            self._spec_sensitivity = round(float(e.control.value), 2)
-            _sens_pct.value = f"{int(self._spec_sensitivity * 100)}%"
-            _sens_pct.update()
-            self._save_spec_profile()
-
-        def on_reactivity_change(e):
-            self._spec_reactivity = round(float(e.control.value), 2)
-            _react_pct.value = f"{self._spec_reactivity:.2f}x"
-            _react_pct.update()
-            self._save_spec_profile()
-
-        def on_bar_decay_change(e):
-            self._spec_bar_decay = round(float(e.control.value), 2)
-            _bar_decay_pct.value = f"{self._spec_bar_decay:.2f}x"
-            _bar_decay_pct.update()
-            self._save_spec_profile()
-
-        def on_peak_decay_change(e):
-            self._spec_peak_decay = round(float(e.control.value), 2)
-            _peak_decay_pct.value = f"{self._spec_peak_decay:.2f}x"
-            _peak_decay_pct.update()
-            self._save_spec_profile()
-
-        def on_mode_change(e):
-            _mode = str(e.control.value or "classic").lower()
-            self._spec_mode = _mode if _mode in ("classic", "vu", "cyber_city", "neon_drift", "retro_tech", "custom_vu", "random", "random_song") else "classic"
-            if _mode == "neon_drift": self._neon_vu_theme = "neon_drift"
-            elif _mode == "retro_tech": self._neon_vu_theme = "retro_tech"
-            elif _mode == "custom_vu": self._neon_vu_theme = "custom_vu"
-            if self._spec_mode in ("random", "random_song"):
-                self._advance_spectrum_random_mode()
-                self._spec_mode_random_next_ts = time.monotonic() + max(1.0, float(self._spec_mode_random_cycle_seconds))
-                self._spec_mode_song_switch_armed = True
-            # Background row visibility
-            _is_vu = _mode in ("neon_drift", "retro_tech", "custom_vu")
-            _bg_col.visible = _is_vu
-            if _is_vu:
-                if _mode == "neon_drift": _bg_dd.value = self._spec_nvu_drift_bg
-                elif _mode == "retro_tech": _bg_dd.value = self._spec_nvu_retro_bg
-                else: _bg_dd.value = self._spec_nvu_custom_bg
-            try: _bg_col.update()
-            except: pass
-
-        def on_bg_change(e):
-            self._spec_nvu_bg_force_reload = True
-            if self._spec_mode == "neon_drift":
-                self._spec_nvu_drift_bg = e.control.value
-            elif self._spec_mode == "retro_tech":
-                self._spec_nvu_retro_bg = e.control.value
-            elif self._spec_mode == "custom_vu":
-                self._spec_nvu_custom_bg = e.control.value
-            self._render_spectrum() # force update
-
-        _spec_options = [
-            ("classic", "Classic"),
-            ("vu", "VU (L/R)"),
-            ("cyber_city", "Cyber City"),
-            ("neon_drift", "Neon Drift"),
-            ("retro_tech", "Retro-Tech"),
-            ("custom_vu", "Custom VU"),
-        ]
-
-        def _ensure_mode_cycle_default():
-            if not isinstance(self._spec_mode_cycle_choices, list):
-                self._spec_mode_cycle_choices = [k for k, _ in _spec_options]
-            self._spec_mode_cycle_choices = [k for k in self._spec_mode_cycle_choices if any(k == o[0] for o in _spec_options)]
-            if not self._spec_mode_cycle_choices:
-                self._spec_mode_cycle_choices = [k for k, _ in _spec_options]
-
-        _ensure_mode_cycle_default()
-
-        def on_cycle_mode_toggle(mode_key, enabled):
-            _ensure_mode_cycle_default()
-            if enabled:
-                if mode_key not in self._spec_mode_cycle_choices:
-                    self._spec_mode_cycle_choices.append(mode_key)
-            else:
-                self._spec_mode_cycle_choices = [x for x in self._spec_mode_cycle_choices if x != mode_key]
-                if not self._spec_mode_cycle_choices:
-                    self._spec_mode_cycle_choices = [mode_key]
-
-        def on_idle_enabled_change(e):
-            self._spec_idle_enabled = bool(e.control.value)
-            self._sync_spec_quick_buttons()
-
-        def on_idle_timeout_change(e):
-            self._spec_idle_timeout = round(float(e.control.value), 1)
-            _idle_timeout_txt.value = f"{int(round(self._spec_idle_timeout))}s"
-            _idle_timeout_txt.update()
-
-        def on_idle_effect_change(e):
-            _fx = str(e.control.value or "random").lower()
-            self._spec_idle_effect = _fx if _fx in ("random", "aurora", "pulse", "text", "rainbow", "pacman", "tetris", "invaders", "snake", "starwars") else "random"
-
-        def on_idle_speed_change(e):
-            self._spec_idle_speed = round(float(e.control.value), 2)
-            _idle_speed_txt.value = f"{self._spec_idle_speed:.2f}x"
-            _idle_speed_txt.update()
-
-        def on_sample_rate_change(e):
-            _raw = str(e.control.value or "48000")
-            try:
-                _new_sr = int(_raw)
-            except Exception:
-                _new_sr = 48000
-            if _new_sr not in (16000, 22050, 32000, 44100, 48000):
-                _new_sr = 48000
-            if _new_sr != int(getattr(self, "_spec_sample_rate", 48000) or 48000):
-                self._spec_sample_rate = _new_sr
-                self._spec_source_changed = True
-                if self._spec_disabled:
-                    self._spec_disabled = False
-                    threading.Thread(target=self._audio_analyzer_loop, daemon=True).start()
-                self.log(f"[Spectrum] Sample rate set to {self._spec_sample_rate} Hz", color="grey500")
-
-        _sens_slider = ft.Slider(
-            min=0.1, max=1.5,
-            value=self._spec_sensitivity,
-            divisions=28,
-            active_color="#ff9800",
-            on_change=on_sensitivity_change,
-        )
-
-        _mode_dd = ft.Dropdown(
-            width=200,
-            value=self._spec_mode,
-            options=[
-                ft.dropdown.Option("classic",     "Classic (Fixed)"),
-                ft.dropdown.Option("vu",          "VU L/R (Fixed)"),
-                ft.dropdown.Option("cyber_city",  "Cyber City (Fixed)"),
-                ft.dropdown.Option("neon_drift",  "Neon Drift (Fixed)"),
-                ft.dropdown.Option("retro_tech",  "Retro-Tech (Fixed)"),
-                ft.dropdown.Option("custom_vu",   "Custom VU (Fixed)"),
-                ft.dropdown.Option("random",      "Random (1 min)"),
-                ft.dropdown.Option("random_song", "Random (Per Song)"),
-            ],
-            on_change=on_mode_change,
-            text_size=12,
-            dense=True,
-        )
-
-        _mode_cycle_checks = []
-        for _m_key, _m_label in _spec_options:
-            _mode_cycle_checks.append(
-                ft.Checkbox(
-                    label=_m_label,
-                    value=(_m_key in self._spec_mode_cycle_choices),
-                    on_change=lambda e, k=_m_key: on_cycle_mode_toggle(k, bool(e.control.value)),
-                    active_color="#ff9800",
-                    scale=0.9,
-                )
-            )
-
-        _m_left = [c for i, c in enumerate(_mode_cycle_checks) if i % 2 == 0]
-        _m_right = [c for i, c in enumerate(_mode_cycle_checks) if i % 2 == 1]
-
-        _mode_cycle_grid = ft.Row([
-            ft.Column(_m_left, spacing=0, tight=True, expand=True),
-            ft.Column(_m_right, spacing=0, tight=True, expand=True),
-        ], spacing=10, expand=True)
-
-        _jpg_names = sorted([os.path.basename(f) for f in glob.glob(os.path.join(_VERSION_DIR, "*.jpg"))])
-        if not _jpg_names:
-            _jpg_names = ["nebula space.jpg", "brushed_metal.jpg"]
-        _jpg_names.insert(0, "BLANK")
-
-        _bg_dd = ft.Dropdown(
-            width=200,
-            options=[ft.dropdown.Option(n) for n in _jpg_names],
-            value=(self._spec_nvu_drift_bg if self._spec_mode == "neon_drift" 
-                   else (self._spec_nvu_retro_bg if self._spec_mode == "retro_tech" 
-                         else self._spec_nvu_custom_bg)),
-            on_change=on_bg_change,
-            text_size=12,
-            dense=True,
-        )
-
-        _bg_col = ft.Column([
-            ft.Text("VU BG Image:", size=12, color="grey400"),
-            ft.Container(content=_bg_dd, width=200, alignment=ft.alignment.center_right),
-        ], spacing=2, tight=True,
-           visible=(self._spec_mode in ("neon_drift", "retro_tech", "custom_vu")))
-
-        sensitivity_section = ft.Column([
-            ft.Row([
-                ft.Text("FPS:", size=12, color="grey400"),
-                _fps_txt,
-                ft.Slider(
-                    min=8, max=30,
-                    value=float(self._spec_target_fps),
-                    divisions=22,
-                    active_color="#ff9800",
-                    on_change=on_target_fps_change,
-                    expand=True,
-                ),
-            ], spacing=8, vertical_alignment=ft.CrossAxisAlignment.CENTER),
-
-            ft.Row([
-                ft.Text("Bars:", size=12, color="grey400"),
-                _bars_txt,
-                ft.Slider(
-                    min=6, max=float(self._spec_bands),
-                    value=float(self._spec_analysis_bands),
-                    divisions=max(1, int(self._spec_bands) - 6),
-                    active_color="#ff9800",
-                    on_change=on_analysis_bars_change,
-                    expand=True,
-                ),
-            ], spacing=8, vertical_alignment=ft.CrossAxisAlignment.CENTER),
-            
-            ft.Row([
-                ft.Text("Sensitivity:", size=12, color="grey400"),
-                _sens_pct,
-                (_sens_slider := ft.Slider(
-                    min=0.1, max=1.5,
-                    value=self._spec_sensitivity,
-                    divisions=28,
-                    active_color="#ff9800",
-                    on_change=on_sensitivity_change,
-                    expand=True,
-                )),
-            ], spacing=8, vertical_alignment=ft.CrossAxisAlignment.CENTER),
-
-            ft.Row([
-                ft.Text("Reactivity:", size=12, color="grey400"),
-                _react_pct,
-                (_react_slider := ft.Slider(
-                    min=0.25, max=3.0,
-                    value=self._spec_reactivity,
-                    divisions=55,
-                    active_color="#ff9800",
-                    on_change=on_reactivity_change,
-                    expand=True,
-                )),
-            ], spacing=8, vertical_alignment=ft.CrossAxisAlignment.CENTER),
-            ft.Row([
-                ft.Text("Bar Decay:", size=12, color="grey400"),
-                _bar_decay_pct,
-                (_bar_decay_slider := ft.Slider(
-                    min=0.1, max=5.0,
-                    value=self._spec_bar_decay,
-                    divisions=49,
-                    active_color="#ff9800",
-                    on_change=on_bar_decay_change,
-                    expand=True,
-                )),
-            ], spacing=8, vertical_alignment=ft.CrossAxisAlignment.CENTER),
-            ft.Row([
-                ft.Text("Peak Decay:", size=12, color="grey400"),
-                _peak_decay_pct,
-                (_peak_decay_slider := ft.Slider(
-                    min=0.1, max=5.0,
-                    value=self._spec_peak_decay,
-                    divisions=49,
-                    active_color="#ff9800",
-                    on_change=on_peak_decay_change,
-                    expand=True,
-                )),
-            ], spacing=8, vertical_alignment=ft.CrossAxisAlignment.CENTER),
-            ft.Row([
-                ft.Text("Song Timeout:", size=12, color="grey400"),
-                _song_timeout_txt,
-                (_song_timeout_slider := ft.Slider(
-                    min=1.0, max=15.0,
-                    value=float(self._spec_mode_song_silence_seconds),
-                    divisions=28,
-                    active_color="#ff9800",
-                    on_change=on_song_timeout_change,
-                    expand=True,
-                )),
-            ], spacing=8, vertical_alignment=ft.CrossAxisAlignment.CENTER),
-            ft.Row([
-                ft.Column([
-                    ft.Text("Included in Random:", size=11, color="grey500", italic=True),
-                    _mode_cycle_grid,
-                ], spacing=2, tight=True, expand=True),
-                ft.Column([
-                    ft.Container(content=_mode_dd, width=200, alignment=ft.alignment.top_right),
-                    _bg_col,
-                ], spacing=4, tight=True),
-            ], spacing=8, vertical_alignment=ft.CrossAxisAlignment.START),
-            ft.Divider(height=1, color="grey800"),
-        ], spacing=0, tight=True)
-
-        _eq_labels = ["60Hz", "170Hz", "310Hz", "600Hz", "1k", "3k", "6k", "12k", "14k", "15k"]
-        _eq_value_texts = []
-        _eq_sliders = []
-        _eq_preset_btns = {}
-
-        _eq_presets = {
-            "Flat":  [1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00],
-            "Bass+": [2.20, 1.90, 1.50, 1.25, 1.05, 0.95, 0.90, 0.88, 0.88, 0.88],
-            "Smile": [1.70, 1.45, 1.15, 0.95, 0.85, 1.00, 1.20, 1.35, 1.40, 1.40],
-            "Vocal": [0.85, 0.90, 0.95, 1.10, 1.25, 1.35, 1.15, 0.95, 0.90, 0.90],
-        }
-
-        def _detect_eq_preset_name():
-            _cur = [round(float(v), 2) for v in self._spec_eq_gains]
-            for _name, _vals in _eq_presets.items():
-                if _cur == [round(float(x), 2) for x in _vals]:
-                    return _name
-            return None
-
-        _active_eq_preset = _detect_eq_preset_name()
-
-        def _refresh_eq_preset_buttons():
-            for _name, _btn in _eq_preset_btns.items():
-                _color = "#ff9800" if _name == _active_eq_preset else "grey400"
-                _btn.style = ft.ButtonStyle(color=_color, padding=ft.padding.symmetric(horizontal=6, vertical=2))
-                try:
-                    _btn.update()
-                except Exception:
-                    pass
-
-        def _apply_eq_preset(preset_name):
-            nonlocal _active_eq_preset
-            self._spec_eq_gains = list(_eq_presets.get(preset_name, _eq_presets["Flat"]))
-            for i, s in enumerate(_eq_sliders):
-                s.value = self._spec_eq_gains[i]
-                _eq_value_texts[i].value = f"{self._spec_eq_gains[i]:.2f}x"
-                _eq_value_texts[i].update()
-                s.update()
-            _active_eq_preset = preset_name if preset_name in _eq_presets else None
-            _refresh_eq_preset_buttons()
-            self._save_spec_profile()
-
-        def _on_eq_change(idx, e):
-            nonlocal _active_eq_preset
-            v = round(float(e.control.value), 2)
-            self._spec_eq_gains[idx] = v
-            _eq_value_texts[idx].value = f"{v:.2f}x"
-            _eq_value_texts[idx].update()
-            _active_eq_preset = _detect_eq_preset_name()
-            _refresh_eq_preset_buttons()
-            self._save_spec_profile()
-
-        _eq_rows = []
-        for i, lbl in enumerate(_eq_labels):
-            _txt = ft.Text(f"{self._spec_eq_gains[i]:.2f}x", size=11, color="#ff9800", width=42)
-            _eq_value_texts.append(_txt)
-            _s = ft.Slider(
-                min=0.25, max=3.0,
-                value=float(self._spec_eq_gains[i]),
-                divisions=55,
-                active_color="#ff9800",
-                on_change=lambda e, _i=i: _on_eq_change(_i, e),
-                expand=True,
-            )
-            _eq_sliders.append(_s)
-            _eq_rows.append(
-                ft.Row([
-                    ft.Text(lbl, size=11, color="grey400", width=38),
-                    _s,
-                    _txt,
-                ], spacing=6)
-            )
-
-        _eq_btn_flat = ft.TextButton("Flat", on_click=lambda _: _apply_eq_preset("Flat"), style=ft.ButtonStyle(color="grey400", padding=ft.padding.symmetric(horizontal=6, vertical=2)))
-        _eq_btn_bass = ft.TextButton("Bass+", on_click=lambda _: _apply_eq_preset("Bass+"), style=ft.ButtonStyle(color="grey400", padding=ft.padding.symmetric(horizontal=6, vertical=2)))
-        _eq_btn_smile = ft.TextButton("Smile", on_click=lambda _: _apply_eq_preset("Smile"), style=ft.ButtonStyle(color="grey400", padding=ft.padding.symmetric(horizontal=6, vertical=2)))
-        _eq_btn_vocal = ft.TextButton("Vocal", on_click=lambda _: _apply_eq_preset("Vocal"), style=ft.ButtonStyle(color="grey400", padding=ft.padding.symmetric(horizontal=6, vertical=2)))
-        _eq_preset_btns.update({
-            "Flat": _eq_btn_flat,
-            "Bass+": _eq_btn_bass,
-            "Smile": _eq_btn_smile,
-            "Vocal": _eq_btn_vocal,
-        })
-        _refresh_eq_preset_buttons()
-
-        eq_section = ft.Column([
-            ft.Row([
-                ft.Text("Visual EQ (UI only):", size=12, color="grey400"),
-                _eq_btn_flat,
-                _eq_btn_bass,
-                _eq_btn_smile,
-                _eq_btn_vocal,
-            ], spacing=2, wrap=True),
-            ft.Column(_eq_rows, spacing=0, tight=True),
-            ft.Divider(height=1, color="grey800"),
-        ], spacing=2, tight=True)
-
-        dlg = ft.AlertDialog(
-            title=ft.Text("Spectrum Analyzer Settings"),
-            on_dismiss=_dismiss_keep_preview,
-            content=ft.Column(
-                [
-                    sensitivity_section,
-                    eq_section,
-                ],
-                tight=True,
-                scroll=ft.ScrollMode.AUTO,
-                width=430,
-                height=460,
-            ),
-            actions=[
-                ft.TextButton("Undo", on_click=lambda _: (_revert_preview_and_close(), self._show_spectrum_source_selector())),
-                ft.TextButton("Close", on_click=_close_keep_preview),
-                ft.ElevatedButton("Save", on_click=_save_and_close, bgcolor="#1a1a2e", color="white"),
-            ],
-        )
-        try:
-            self.page.open(dlg)
-        except Exception:
-            self.page.dialog = dlg
-            dlg.open = True
-            self.page.update()
-
-    def _audio_analyzer_loop(self):
-        """Capture loopback audio and drive the header spectrum analyzer."""
-        time.sleep(1.0)
-        _current_device = None
-        _last_idle_only_render = 0.0
-        _was_sampling = bool(getattr(self, "_spec_sampling_enabled", True))
-
-        while self.running and not self._spec_disabled:
-            _now = time.monotonic()
-            _sampling = bool(getattr(self, "_spec_sampling_enabled", True))
-
-            # Transition: manually toggled OFF via MIC button — trigger idle immediately
-            if _was_sampling and not _sampling:
-                self._spec_idle_active = bool(getattr(self, "_spec_idle_enabled", True))
-                if self._spec_idle_active:
-                    self._spec_idle_phase = 0.0
-                    self._spec_idle_scroll = 0
-                    self._spec_idle_cycle_done = False
-                    if str(self._spec_idle_effect).lower() == "random":
-                        self._spec_idle_random_next_ts = _now
-                        self._spec_idle_cycle_done = True
-
-            # Transition: manually toggled ON via MIC button — restore audio mode
-            if not _was_sampling and _sampling:
-                self._spec_last_audio_ts = _now  # reset silence timer
-                self._spec_idle_active = False   # start in live audio mode
-
-            _was_sampling = _sampling
-
-            if not _sampling:
-                _render_interval = self._get_spec_render_interval()
-                self._spec_idle_active = bool(getattr(self, "_spec_idle_enabled", True))
-                if self._spec_idle_active:
-                    if _now - _last_idle_only_render >= _render_interval:
-                        self._render_spectrum()
-                        _last_idle_only_render = _now
-                    self._spec_display_cleared = False
-                else:
-                    if not self._spec_display_cleared:
-                        self._clear_spectrum_display()
-                        self._spec_display_cleared = True
-                time.sleep(_render_interval)
-                continue
-            else:
-                self._spec_display_cleared = False
-
-            try:
-                import importlib
-                _np = importlib.import_module("numpy")
-                if not self._spec_np_patch_applied and hasattr(_np, "frombuffer") and hasattr(_np, "fromstring"):
-                    _orig_fromstring = _np.fromstring
-
-                    def _compat_fromstring(string, dtype=float, count=-1, sep=''):
-                        # Route binary/buffer inputs to frombuffer to avoid NumPy fromstring warnings.
-                        if sep == '' and not isinstance(string, str):
-                            try:
-                                return _np.frombuffer(memoryview(string), dtype=dtype, count=count)
-                            except Exception:
-                                pass
-                        return _orig_fromstring(string, dtype=dtype, count=count, sep=sep)
-
-                    _np.fromstring = _compat_fromstring
-                    self._spec_np_patch_applied = True
-                _sc = importlib.import_module("soundcard")
-            except Exception:
-                if not self._spec_log_once:
-                    self._spec_log_once = True
-                    self.log("[Spectrum] Install 'numpy' and 'soundcard' for live PC audio analyzer", color="grey500")
-                time.sleep(2.0)
-                continue
-
-            try:
-                # Enumerate audio sources once, at startup
-                if not self._spec_audio_sources:
-                    try:
-                        self._refresh_spectrum_sources()
-                        if self._spec_audio_sources:
-                            self.log(f"[Spectrum] Found {len(self._spec_audio_sources)} audio source(s)", color="grey500")
-                    except Exception:
-                        # Fallback if enumerate fails
-                        self._spec_audio_sources = []
-
-                # Check if user selected a different source
-                if self._spec_source_changed or _current_device is None:
-                    _source_switch = self._spec_source_changed
-                    self._spec_source_changed = False
-                    self._spec_capture_channels = 2
-                    # Force fresh resolution on switch/start so source changes take effect immediately.
-                    _current_device = None
-                    if self._spec_selected_source and self._spec_audio_sources:
-                        # Find device by name
-                        for name, idx in self._spec_audio_sources:
-                            if name == self._spec_selected_source:
-                                try:
-                                    all_mics = list(_sc.all_microphones(include_loopback=True))
-                                    if idx < len(all_mics):
-                                        _current_device = all_mics[idx]
-                                        self.log(f"[Spectrum] Using source: {self._spec_selected_source}", color="grey500")
-                                        break
-                                except Exception:
-                                    pass
-                    
-                    # Fallback to default output loopback if source not found
-                    if _current_device is None:
-                        _current_device, _kind = self._pick_default_spectrum_source(_sc)
-                        self._spec_selected_source = None
-                        if _current_device:
-                            _tag = "output" if _kind == "output-loopback" else "input"
-                            self.log(f"[Spectrum] Using default {_tag} source: {_current_device.name}", color="grey500")
-
-                    # Re-evaluate normalization per source switch/start; do not carry old gain state.
-                    if _current_device is not None and (_source_switch or self._spec_gain != 1.0):
-                        self._spec_gain = 0.05  # low start so attack fires immediately for quiet sources
-                        self._reset_spec_analysis_state()
-                        self._spec_vu_gain = 0.18
-                        self._spec_vu_left = 0.0
-                        self._spec_vu_right = 0.0
-                        self._spec_vu_peak_left = 0.0
-                        self._spec_vu_peak_right = 0.0
-                        self._spec_idle_active = False
-                        self._spec_last_audio_ts = time.monotonic()
-
-                if _current_device is None:
-                    if not self._spec_no_audio_warned:
-                        self._spec_no_audio_warned = True
-                        self.log("[Spectrum] No microphone/loopback device found. Enable 'Stereo Mix' in Windows Sound Settings.", color="orange400")
-                    time.sleep(2.0)
-                    continue
-
-                _sr = int(getattr(self, "_spec_sample_rate", 48000) or 48000)
-                if _sr not in (16000, 22050, 32000, 44100, 48000):
-                    _sr = 48000
-
-                # Lower sample rates are intended for lower CPU machines.
-                # Keep FFT cost proportional to sample-rate tier.
-                _analysis_bands = max(6, min(int(self._spec_bands), int(getattr(self, "_spec_analysis_bands", self._spec_bands) or self._spec_bands)))
-                _n = 1024 if _sr >= 32000 else 512
-                _frame_n = max(_n, min(2048, int(_sr / 24)))
-                _freqs = _np.fft.rfftfreq(_n, d=1.0 / _sr)
-                _edges = _np.geomspace(40.0, 15000.0, _analysis_bands + 1)
-                _bins = []
-                for i in range(_analysis_bands):
-                    lo = int(_np.searchsorted(_freqs, _edges[i], side="left"))
-                    hi = int(_np.searchsorted(_freqs, _edges[i + 1], side="right"))
-                    if hi <= lo:
-                        hi = min(len(_freqs), lo + 1)
-                    _bins.append((lo, hi))
-
-                # Prepare log-frequency centers used for per-frame visual EQ interpolation.
-                _band_centers = _np.sqrt(_edges[:-1] * _edges[1:])
-                _band_centers_log = _np.log10(_band_centers)
-                _eq_freqs_log = _np.log10(_np.asarray(self._spec_eq_freqs, dtype=float))
-
-                import warnings as _warnings
-                _warnings.filterwarnings("ignore", message="data discontinuity", category=Warning)
-                with _current_device.recorder(samplerate=_sr, channels=int(self._spec_capture_channels), blocksize=_frame_n) as _rec:
-                    _last_render = 0.0
-                    while self.running and not self._spec_source_changed and not self._spec_disabled:
-                        _render_interval = self._get_spec_render_interval()
-                        _buf = _rec.record(numframes=_frame_n)
-                        _arr_raw = _np.asarray(_buf)
-                        if _arr_raw.size < _n:
-                            time.sleep(0.01)
-                            continue
-
-                        # Keep SA processing mono while also extracting true stereo L/R VU levels.
-                        if _arr_raw.ndim == 2 and _arr_raw.shape[1] >= 2:
-                            _left = _arr_raw[:, 0].reshape(-1)
-                            _right = _arr_raw[:, 1].reshape(-1)
-                            _arr = ((_left + _right) * 0.5).reshape(-1)
-                        else:
-                            _arr = _arr_raw.reshape(-1)
-                            _left = _arr
-                            _right = _arr
-
-                        _vu_n = min(_n, len(_left), len(_right))
-                        if _vu_n > 0:
-                            _l_lvl = float(_np.sqrt(_np.mean(_left[-_vu_n:] ** 2)))
-                            _r_lvl = float(_np.sqrt(_np.mean(_right[-_vu_n:] ** 2)))
-                        else:
-                            _l_lvl = 0.0
-                            _r_lvl = 0.0
-
-                        _arr = _arr[-_n:] * _np.hanning(_n)
-                        _spec = _np.abs(_np.fft.rfft(_arr))
-
-                        _vals = []
-                        for lo, hi in _bins:
-                            _vals.append(float(_spec[lo:hi].max()) if hi > lo else 0.0)
-
-                        _vals = _np.asarray(_vals)
-                        _vals = _np.log1p(_vals * 30.0)
-
-                        # Per-band adaptive floor: tracks each band's running average and
-                        # subtracts it so only deviations above the floor are displayed.
-                        # Fast attack (0.06) so rising noise floors are tracked within ~0.4s;
-                        # slow release (0.005) so transients/beats stay visible above the avg.
-                        _avg_arr = _np.asarray(self._spec_band_avg, dtype=float)
-                        if _avg_arr.size != _vals.size:
-                            self._spec_source_changed = True
-                            continue
-                        _rising = _vals > _avg_arr
-                        self._spec_band_avg = list(_np.where(
-                            _rising,
-                            _avg_arr * 0.94 + _vals * 0.06,
-                            _avg_arr * 0.995 + _vals * 0.005,
-                        ))
-                        _vals = _np.maximum(0.0, _vals - _avg_arr * 0.85)
-
-                        _mx = float(_vals.max()) if _vals.size else 0.0
-
-                        if _mx > 0:
-                            # Two-way AGC: fast attack to catch loud peaks, slow release to
-                            # normalize quiet sources (loopback audio is often low amplitude).
-                            if _mx > self._spec_gain:
-                                # Fast attack: handles loud bursts and initial normalization
-                                self._spec_gain = self._spec_gain * 0.85 + _mx * 0.15
-                            else:
-                                # Slow release: gain drifts toward current signal max so quiet
-                                # sources (speakers at low OS volume) still fill the bars.
-                                # Floor prevents silence from pumping the gain to zero.
-                                self._spec_gain = max(0.02, self._spec_gain * 0.993 + _mx * 0.007)
-                            _vals = _vals / max(self._spec_gain, 1e-6)
-
-                        # Recompute EQ curve live so slider moves affect the analyzer immediately.
-                        _eq_curve = _np.interp(
-                            _band_centers_log,
-                            _eq_freqs_log,
-                            _np.asarray(self._spec_eq_gains, dtype=float),
-                        )
-                        _vals = _vals * self._spec_sensitivity
-                        _vals = _vals * _eq_curve
-
-                        _now = time.monotonic()
-                        # 1. Reset main idle timer immediately on any sound above threshold
-                        if _mx > float(self._spec_idle_threshold):
-                            self._spec_last_audio_ts = _now
-
-                            # 2. Debounce logic for re-arming song-switch (requires ~150ms of audio)
-                            if _mx > float(self._spec_idle_threshold) * 1.25:
-                                self._spec_mode_song_debounce += 1
-                                if self._spec_mode_song_debounce >= 4:
-                                    self._spec_mode_song_switch_armed = True
-                            else:
-                                self._spec_mode_song_debounce = 0
-                        else:
-                            self._spec_mode_song_debounce = 0
-
-                        _idle_on = bool(self._spec_idle_enabled) and ((_now - self._spec_last_audio_ts) >= float(self._spec_idle_timeout))
-                        if _idle_on and not self._spec_idle_active:
-                            self._spec_idle_phase = 0.0
-                            self._spec_idle_scroll = 0
-                            self._spec_idle_cycle_done = False
-                            if str(self._spec_idle_effect).lower() == "random":
-                                self._spec_idle_random_next_ts = _now
-                                self._spec_idle_cycle_done = True
-
-                        self._spec_idle_active = _idle_on
-                        if _idle_on:
-                            if _now - _last_render >= _render_interval:
-                                self._render_spectrum()
-                                _last_render = _now
-                            continue
-
-                        _react = max(0.25, min(3.0, float(self._spec_reactivity)))
-                        _bar_dec = max(0.1, min(5.0, float(self._spec_bar_decay)))
-                        _peak_dec = max(0.1, min(5.0, float(self._spec_peak_decay)))
-                        _rise_lerp = min(0.98, 0.72 * _react)
-                        _fall_step = 0.04 * _bar_dec
-                        _peak_hold_frames = max(2, int(round(8 / _react)))
-                        _peak_drop = 0.02 * _peak_dec
-
-                        for i in range(_analysis_bands):
-                            tgt = float(max(0.0, min(1.0, _vals[i])))
-                            cur = self._spec_bars[i]
-                            if tgt >= cur:
-                                cur = cur + (tgt - cur) * _rise_lerp
-                            else:
-                                cur = max(0.0, cur - _fall_step)
-                            self._spec_bars[i] = cur
-
-                            if cur >= self._spec_peaks[i]:
-                                self._spec_peaks[i] = cur
-                                self._spec_peak_hold[i] = _peak_hold_frames
-                            else:
-                                if self._spec_peak_hold[i] > 0:
-                                    self._spec_peak_hold[i] -= 1
-                                else:
-                                    self._spec_peaks[i] = max(0.0, self._spec_peaks[i] - _peak_drop)
-
-                        # Stereo VU uses its own envelope and AGC so it does not pin at max,
-                        # while still respecting the shared sensitivity slider.
-                        _l_env = float(_np.log1p(_l_lvl * 18.0))
-                        _r_env = float(_np.log1p(_r_lvl * 18.0))
-                        _vu_env_max = max(_l_env, _r_env)
-                        if _vu_env_max > 0.0:
-                            if _vu_env_max > self._spec_vu_gain:
-                                self._spec_vu_gain = self._spec_vu_gain * 0.86 + _vu_env_max * 0.14
-                            else:
-                                self._spec_vu_gain = max(0.06, self._spec_vu_gain * 0.994 + _vu_env_max * 0.006)
-
-                        _vu_scale = 0.65 * (max(0.1, min(1.5, float(self._spec_sensitivity))) / 0.7)
-                        _vu_norm = max(self._spec_vu_gain, 1e-6)
-                        _l_tgt = float(max(0.0, min(1.0, (_l_env / _vu_norm) * _vu_scale)))
-                        _r_tgt = float(max(0.0, min(1.0, (_r_env / _vu_norm) * _vu_scale)))
-
-                        if _l_tgt >= self._spec_vu_left:
-                            self._spec_vu_left = self._spec_vu_left + (_l_tgt - self._spec_vu_left) * _rise_lerp
-                        else:
-                            self._spec_vu_left = max(0.0, self._spec_vu_left - _fall_step)
-
-                        if _r_tgt >= self._spec_vu_right:
-                            self._spec_vu_right = self._spec_vu_right + (_r_tgt - self._spec_vu_right) * _rise_lerp
-                        else:
-                            self._spec_vu_right = max(0.0, self._spec_vu_right - _fall_step)
-
-                        if self._spec_vu_left >= self._spec_vu_peak_left:
-                            self._spec_vu_peak_left = self._spec_vu_left
-                        else:
-                            self._spec_vu_peak_left = max(0.0, self._spec_vu_peak_left - _peak_drop)
-
-                        if self._spec_vu_right >= self._spec_vu_peak_right:
-                            self._spec_vu_peak_right = self._spec_vu_right
-                        else:
-                            self._spec_vu_peak_right = max(0.0, self._spec_vu_peak_right - _peak_drop)
-
-                        _now = time.monotonic()
-                        if _now - _last_render >= _render_interval:
-                            self._render_spectrum()
-                            _last_render = _now
+        """Open the SA idle-effects panel (delegates to SpectrumController)."""
+        if self._sa:
+            try:   self._sa._open_spectrum_idle_settings()
             except Exception as ex:
-                err_str = str(ex).lower()
-                if ("channel" in err_str or "channels" in err_str) and self._spec_capture_channels > 1:
-                    self._spec_capture_channels = 1
-                    self.log("[Spectrum] Selected source does not support stereo capture; using mono fallback.", color="grey500")
-                    time.sleep(0.4)
-                    continue
-                # Detect fatal/unrecoverable errors (numpy compatibility, etc.)
-                if "binary mode of fromstring is removed" in err_str:
-                    self._spec_disabled = True
-                    self.log("[Spectrum] Disabled: soundcard is incompatible with NumPy 2.x in this build. Use NumPy 1.26.4 for analyzer support.", color="orange400")
-                    return  # Exit audio loop — don't retry
-                
-                # Temporary errors: retry after delay
-                if self.running:
-                    self.log(f"[Spectrum] Audio loop error: {ex}", color="orange400")
-                _current_device = None
-                time.sleep(1.0)
+                self.log(f"[SA] Idle settings error: {ex}", color="orange400")
 
     def unified_poll_loop(self):
         """Unified polling loop for both WLED and LedFx devices.
@@ -11184,7 +8516,7 @@ class WLEDApp:
         - Collects results within a fixed window and logs a single summary line
         - Polls LedFx API every 3s when running to manage live state
         """
-        from concurrent.futures import ThreadPoolExecutor, as_completed
+        from concurrent.futures import ThreadPoolExecutor, as_completed, TimeoutError as FuturesTimeoutError
 
         _wled_round_start = time.time()
         _ledfx_last_poll  = 0
@@ -11243,7 +8575,7 @@ class WLEDApp:
                                         _ok.append(ip)
                                 except Exception:
                                     _fail.append(ip)
-                        except TimeoutError:
+                        except (TimeoutError, FuturesTimeoutError):
                             # Some devices didn't reply within POLL_WINDOW — mark them as failed
                             _done_ips = set(_ok + _fail)
                             for ip in _to_poll:
@@ -11429,6 +8761,7 @@ class WLEDApp:
                                     self._mh_set_card_unlive_ui(_mh_ip)
                             if not self.mh_live_ips - set(self.mh_live_grace_until.keys()):
                                 self.mh_live_ips.clear()
+                                self._ordered_dirty = True
 
                     _mhbridge_was_streaming = _mhbridge_streaming
 
@@ -11448,7 +8781,7 @@ class WLEDApp:
         self.refresh_all_statuses()
 
     def async_update_status(self, ip, is_online, new_name=None, is_on=None, fx_name=None, current_bri=None, ver=None, arch=None, rssi=None, is_live=False):
-        if ip in self.cards and self._is_locked(ip):
+        if ip in self.cards and (self._is_locked(ip) or ip in self._dragging):
           now = time.time()
           last = self._last_defer_log.get(ip, 0)
           if now - last > 1.0:
@@ -11458,7 +8791,7 @@ class WLEDApp:
             _disp = _nm.value if _nm else ip
             self.dbg(f"[Update] {_disp}, {ip} — ignoring remote updates (user input in progress)", color="orange400")
           return
-        if ip in self.cards and not self._is_locked(ip):
+        if ip in self.cards and not self._is_locked(ip) and ip not in self._dragging:
             c = self.cards[ip]
             if is_online:
                 # --- THE FIX: Reset state immediately to prevent log spam ---
@@ -11547,7 +8880,7 @@ class WLEDApp:
                         c["_glow_state"] = "on"
                     elif is_on is False:
                         c["glow"].bgcolor = "#121420"
-                        c["glow"].border = ft.border.all(2, "#2b2b3b")
+                        c["glow"].border = ft.Border.all(2, "#2b2b3b")
                         c["_glow_state"] = "off"
             else:
                 if c.get("_glow_state") not in ("offline",) and ip not in self.live_ips:
@@ -11557,14 +8890,11 @@ class WLEDApp:
                 c["status"].color = "red"
                 c["status"].visible = True
                 c["glow"].bgcolor = "#1a0505"
-                c["glow"].border = ft.border.all(2, "#5a0000")
+                c["glow"].border = ft.Border.all(2, "#5a0000")
                 c["_glow_state"] = "offline"
             
-            try: 
-                c["card"].update()
-                c["glow"].update()
-            except: 
-                pass
+            self._list_update_needed = True
+            self._ordered_dirty = True
 
     def _schedule_status_update(self, ip, is_online, new_name=None, is_on=None, fx_name=None, current_bri=None, ver=None, arch=None, rssi=None, is_live=False):
         """Thread-safe status updater for ping workers and UI thread callers."""
@@ -11857,6 +9187,12 @@ class WLEDApp:
 
         self.individual_brightness[ip] = v
 
+        # Keep Python value current so any container update (border loop race,
+        # poll update after lock expires) re-renders the slider at the right position
+        _c = self.cards.get(ip)
+        if _c:
+            _c["bri_slider"].value = v
+
         now = time.time()
 
         last = self._last_slider_ui.get(ip, 0)
@@ -11975,7 +9311,7 @@ class WLEDApp:
             if c["switch"].value is True:
                 self._lock_ui(ip)
                 self.brightness_queue.put((ip, nb))
-                
+
         self.save_cache() # Save master slider change and all staged individual levels
 
     def _lock_ui(self, ip, duration=1.5): self.locks[ip] = time.time() + duration
@@ -12062,84 +9398,21 @@ class WLEDApp:
         self.border_effect = c.get("border_effect", "color_loop")
         self.border_speed  = c.get("border_speed",  11.0)
         self.border_color  = c.get("border_color",  "#ff0000")
-        self._spec_selected_source = c.get("spec_audio_source", None)
-        _src_order = c.get("spec_source_order", [])
-        self._spec_source_order = [str(n) for n in _src_order if isinstance(n, str)] if isinstance(_src_order, list) else []
-
-        self._spec_profiles = {}
-        _raw_profiles = c.get("spec_profiles", {})
-        if isinstance(_raw_profiles, dict):
-            for _k, _v in _raw_profiles.items():
-                if not isinstance(_k, str) or not isinstance(_v, dict):
-                    continue
-                _sens = _v.get("sensitivity", 0.85)
-                _react = _v.get("reactivity", 3.0)
-                _bar = _v.get("bar_decay", 2.0)
-                _peak = _v.get("peak_decay", 1.0)
-                _eq = _v.get("eq_gains", [1.0] * len(self._spec_eq_freqs))
-                if not isinstance(_eq, list) or len(_eq) != len(self._spec_eq_freqs):
-                    _eq = [1.0] * len(self._spec_eq_freqs)
-                try:
-                    self._spec_profiles[_k] = {
-                        "sensitivity": _clamp(_sens, 0.1, 1.5, 0.85),
-                        "reactivity": _clamp(_react, 0.25, 3.0, 3.0),
-                        "bar_decay": _clamp(_bar, 0.1, 5.0, 2.0),
-                        "peak_decay": _clamp(_peak, 0.1, 5.0, 1.0),
-                        "eq_gains": [max(0.25, min(3.0, float(x))) for x in _eq],
-                    }
-                except Exception:
-                    continue
-
-        # Legacy fallback values (single global profile from older versions).
-        self._spec_sensitivity = _clamp(c.get("spec_sensitivity", 0.85), 0.1, 1.5, 0.85)
-        self._spec_reactivity = _clamp(c.get("spec_reactivity", 3.0), 0.25, 3.0, 3.0)
-        self._spec_bar_decay = _clamp(c.get("spec_bar_decay", 2.0), 0.1, 5.0, 2.0)
-        self._spec_peak_decay = _clamp(c.get("spec_peak_decay", 1.0), 0.1, 5.0, 1.0)
-        self._spec_target_fps = int(_clamp(c.get("spec_target_fps", 25), 8, 30, 25))
-        self._set_spec_analysis_bands(c.get("spec_analysis_bands", self._spec_bands), restart_audio=False, reset_now=True)
-        _sr = int(_clamp(c.get("spec_sample_rate", 48000), 8000, 96000, 48000))
-        self._spec_sample_rate = _sr if _sr in (16000, 22050, 32000, 44100, 48000) else 48000
-        self._spec_sampling_enabled = bool(c.get("spec_sampling_enabled", True))
-        _mode = str(c.get("spec_mode", "classic")).lower()
-        self._spec_mode_song_silence_seconds = _clamp(c.get("spec_mode_song_timeout", 2.0), 1.0, 15.0, 2.0)
-        if _mode == "neon_vu":
-            _mode = str(c.get("spec_neon_vu_theme", "neon_drift")).lower()
-        self._spec_mode = _mode if _mode in ("classic", "vu", "cyber_city", "neon_drift", "retro_tech", "custom_vu", "random", "random_song", "neon_vu") else "classic"
-        if self._spec_mode in ("random", "random_song"):
-            self._advance_spectrum_random_mode()
-            self._spec_mode_random_next_ts = time.monotonic() + max(1.0, float(self._spec_mode_random_cycle_seconds))
-            self._spec_mode_song_switch_armed = True
-        self._spec_nvu_drift_bg = c.get("spec_nvu_drift_bg", "nebula space.jpg")
-        self._spec_nvu_retro_bg = c.get("spec_nvu_retro_bg", "brushed metal.jpg")
-        self._spec_nvu_custom_bg = c.get("spec_nvu_custom_bg", "retro yellow.jpg")
-        # Restore Neon VU theme (persisted separately from the main mode key)
-        _nvu_theme = str(c.get("spec_neon_vu_theme", "neon_drift")).lower()
-        self._neon_vu_theme = _nvu_theme if _nvu_theme in ("neon_drift", "retro_tech", "custom_vu") else "neon_drift"
-        _m_cycle_saved = c.get("spec_mode_cycle_choices", self._spec_mode_cycle_choices)
-        if isinstance(_m_cycle_saved, list):
-            _allowed_m = ["classic", "vu", "cyber_city", "neon_drift", "retro_tech", "custom_vu"]
-            self._spec_mode_cycle_choices = [x for x in _m_cycle_saved if x in _allowed_m]
-            if not self._spec_mode_cycle_choices:
-                self._spec_mode_cycle_choices = list(_allowed_m)
-        self._spec_idle_enabled = bool(c.get("spec_idle_enabled", True))
-        self._spec_idle_timeout = _clamp(c.get("spec_idle_timeout", 2.0), 2.0, 30.0, 2.0)
-        _idle_fx = str(c.get("spec_idle_effect", "random")).lower()
-        self._spec_idle_effect = _idle_fx if _idle_fx in ("random", "pulse", "text", "pacman", "tetris", "invaders", "snake", "starwars") else "random"
-        self._spec_idle_speed = _clamp(c.get("spec_idle_speed", 3.0), 0.25, 3.0, 3.0)
-        _idle_cycle_saved = c.get("spec_idle_cycle_effects", self._spec_idle_cycle_effects)
-        if isinstance(_idle_cycle_saved, list):
-            _allowed = ["pulse", "text", "pacman", "tetris", "invaders", "snake", "starwars"]
-            self._spec_idle_cycle_effects = [x for x in _idle_cycle_saved if isinstance(x, str) and x in _allowed]
-            if not self._spec_idle_cycle_effects:
-                self._spec_idle_cycle_effects = list(_allowed)
-        _eq_saved = c.get("spec_eq_gains", self._spec_eq_gains)
-        if isinstance(_eq_saved, list) and len(_eq_saved) == len(self._spec_eq_freqs):
-            try:
-                self._spec_eq_gains = [max(0.25, min(3.0, float(v))) for v in _eq_saved]
-            except Exception:
-                self._spec_eq_gains = [1.0] * len(self._spec_eq_freqs)
-        else:
-            self._spec_eq_gains = [1.0] * len(self._spec_eq_freqs)
+        self._spec_selected_source = c.get("spec_audio_source", None)  # kept for _sa_legacy_config below
+        # ── Capture SA settings from old cache for one-time migration ─────────
+        # SpectrumController reads SA-config.json directly; this dict is only
+        # passed as legacy_config the first time (when SA-config.json is absent).
+        _spec_keys = [
+            "spec_audio_source", "spec_source_order", "spec_profiles",
+            "spec_sensitivity", "spec_reactivity", "spec_bar_decay", "spec_peak_decay",
+            "spec_target_fps", "spec_analysis_bands", "spec_sample_rate",
+            "spec_sampling_enabled", "spec_mode", "spec_neon_vu_theme",
+            "spec_mode_cycle_choices", "spec_mode_song_timeout",
+            "spec_nvu_drift_bg", "spec_nvu_retro_bg", "spec_nvu_custom_bg", "spec_nvu_hud_bg",
+            "spec_idle_enabled", "spec_idle_timeout", "spec_idle_effect",
+            "spec_idle_speed", "spec_idle_cycle_effects", "spec_eq_gains",
+        ]
+        self._sa_legacy_config = {k: c[k] for k in _spec_keys if k in c}
 
         self.debug_on_open = c.get("debug_on_open", False)
         self.log_auto_open = c.get("log_auto_open", False)
@@ -12156,14 +9429,6 @@ class WLEDApp:
         self.active_ledfx_scene_id = self.last_ledfx_scene_id
         self.last_wled_scene_idx = c.get("last_wled_scene_idx")
         self._pending_ledfx_scene_restore = bool(self.last_ledfx_scene_id and self.auto_restore_ledfx_scene)
-
-        # Ensure default profile exists, then load profile for current source.
-        if "__default__" not in self._spec_profiles:
-            self._save_spec_profile(None)
-
-        # Load active source profile after globals are initialized.
-        self._load_spec_profile(self._spec_selected_source)
-        self._sync_spec_quick_buttons()
 
         # Initialize unified polling device sets — only add actual WLED/MH devices, not custom launcher cards.
         self.wled_devices = set()
@@ -12381,30 +9646,6 @@ class WLEDApp:
             "border_effect": self.border_effect,
             "border_speed":  self.border_speed,
             "border_color":  self.border_color,
-            "spec_audio_source": self._spec_selected_source,
-            "spec_source_order": self._spec_source_order,
-            "spec_target_fps": int(self._spec_target_fps),
-            "spec_analysis_bands": int(self._spec_analysis_bands),
-            "spec_sample_rate": int(self._spec_sample_rate),
-            "spec_sampling_enabled": bool(self._spec_sampling_enabled),
-            "spec_sensitivity": self._spec_sensitivity,
-            "spec_reactivity": self._spec_reactivity,
-            "spec_bar_decay": self._spec_bar_decay,
-            "spec_peak_decay": self._spec_peak_decay,
-            "spec_mode": self._spec_mode,
-            "spec_neon_vu_theme": self._neon_vu_theme,
-            "spec_nvu_drift_bg": self._spec_nvu_drift_bg,
-            "spec_nvu_retro_bg": self._spec_nvu_retro_bg,
-            "spec_nvu_custom_bg": self._spec_nvu_custom_bg,
-            "spec_mode_cycle_choices": self._spec_mode_cycle_choices,
-            "spec_idle_enabled": self._spec_idle_enabled,
-            "spec_mode_song_timeout": self._spec_mode_song_silence_seconds,
-            "spec_idle_timeout": self._spec_idle_timeout,
-            "spec_idle_effect": self._spec_idle_effect,
-            "spec_idle_speed": self._spec_idle_speed,
-            "spec_idle_cycle_effects": self._spec_idle_cycle_effects,
-            "spec_eq_gains": self._spec_eq_gains,
-            "spec_profiles": self._spec_profiles,
             "debug_on_open": self.debug_on_open,
             "log_auto_open": self.log_auto_open,
             "unfocused_updates_enabled": self.unfocused_updates_enabled,
@@ -12791,6 +10032,7 @@ class WLEDApp:
         ni = idx + direction
         if 0 <= ni < len(self.device_list.controls):
             self.device_list.controls.insert(ni, self.device_list.controls.pop(idx))
+            self._ordered_dirty = True
             self.page.update(); self.save_cache()
 
     def _parse_drag_src(self, data):
@@ -12834,6 +10076,7 @@ class WLEDApp:
         _cname = _nm.value if _nm else ip
         self.dbg(f"[Live] {_cname}, {ip} — entered live mode", color="orange400")
         self.live_ips.add(ip)
+        self._ordered_dirty = True
         # Move device from WLED control to LedFx control
         #ppp -works -disabled to try pinging live devices to get remote status changes
         #also need to change set_card_unlive if adding this back in
@@ -12863,12 +10106,12 @@ class WLEDApp:
         
         # Dark purple background to make the border pop
         c["live_badge"].bgcolor = "#1a001a" 
-        c["live_badge"].border = ft.border.all(1, "#7b1fa2")
+        c["live_badge"].border = ft.Border.all(1, "#7b1fa2")
         
         c["live_badge"].tooltip = "LedFx has control — click to release back to WLED"
         c["status"].visible = False
         c["glow"].bgcolor = "#0a1a1a"
-        c["glow"].border = ft.border.all(2, self._hue_to_hex(self.rainbow_hue))
+        c["glow"].border = ft.Border.all(2, self._hue_to_hex(self.rainbow_hue))
         c["_glow_state"] = "on" 
         try: 
             c["card"].update()
@@ -12889,6 +10132,7 @@ class WLEDApp:
         _cname = _nm.value if _nm else ip
         self.dbg(f"[Live] {_cname}, {ip} — exited live mode", color="cyan")
         self.live_ips.discard(ip)
+        self._ordered_dirty = True
         self.lor2_ips.discard(ip)
         # Move device from LedFx control back to WLED control
         self.ledfx_devices.discard(ip)
@@ -12913,13 +10157,13 @@ class WLEDApp:
         c["live_icon"].color = "grey500"
         c["live_text"].color = "grey500"
         c["live_badge"].bgcolor = "#1e1e2a"
-        c["live_badge"].border = ft.border.all(1, "grey700")
+        c["live_badge"].border = ft.Border.all(1, "grey700")
         c["live_badge"].tooltip = "Click to re-activate in LedFx"
         c["status"].value = "CHECKING..."
         c["status"].color = "grey500"
         c["status"].visible = True
         c["glow"].bgcolor = "#121420"
-        c["glow"].border = ft.border.all(2, "#2b2b3b")
+        c["glow"].border = ft.Border.all(2, "#2b2b3b")
         c["_glow_state"] = "off"
         try: c["card"].update(); c["glow"].update()
         except: pass
@@ -13073,8 +10317,8 @@ class WLEDApp:
                 ft.Text(f"MERGE — '{tgt_label}' keeps its name and scenes. '{src_label}' card is removed.", size=12, color="grey400"),
             ], tight=True, spacing=8, width=400),
             actions=[
-                ft.ElevatedButton("REORDER", bgcolor="#1e1e2a", color="white", on_click=_do_reorder_from_dlg),
-                ft.ElevatedButton("MERGE", bgcolor="cyan", color="black", on_click=_do_merge),
+                ft.Button("REORDER", bgcolor="#1e1e2a", color="white", on_click=_do_reorder_from_dlg),
+                ft.Button("MERGE", bgcolor="cyan", color="black", on_click=_do_merge),
                 ft.TextButton("Cancel", on_click=_cancel),
             ]
         )
@@ -13126,7 +10370,7 @@ class WLEDApp:
                 ft.Text("Device will go offline for a few seconds then come back.", size=11, color="grey500"),
             ], tight=True, spacing=6),
             actions=[
-                ft.ElevatedButton("Reboot", bgcolor="red900", color="white", on_click=do_confirm),
+                ft.Button("Reboot", bgcolor="red900", color="white", on_click=do_confirm),
                 ft.TextButton("Cancel", on_click=do_cancel),
             ]
         )
@@ -13229,7 +10473,7 @@ class WLEDApp:
                 ft.Text("Click OK once the web UI is closed.", size=13, color="cyan"),
             ], tight=True, width=420, spacing=8),
             actions=[
-                ft.ElevatedButton("OK — Web UI is closed", bgcolor="cyan", color="black", on_click=do_confirm),
+                ft.Button("OK — Web UI is closed", bgcolor="cyan", color="black", on_click=do_confirm),
                 ft.TextButton("Cancel", on_click=do_cancel),
             ]
         )
@@ -13340,12 +10584,12 @@ class WLEDApp:
             if is_on:
                 # Rainbow loop will animate from here — set initial on-colour
                 c["glow"].bgcolor = "#0a1a1a"
-                c["glow"].border = ft.border.all(2, self._hue_to_hex(self.rainbow_hue))
+                c["glow"].border = ft.Border.all(2, self._hue_to_hex(self.rainbow_hue))
                 c["_glow_state"] = "on"
             else:
                 # Dim border immediately — rainbow loop will stop animating
                 c["glow"].bgcolor = "#121420"
-                c["glow"].border = ft.border.all(2, "#2b2b3b")
+                c["glow"].border = ft.Border.all(2, "#2b2b3b")
                 c["_glow_state"] = "off"
             c["card"].update()
             c["glow"].update()
@@ -13510,22 +10754,22 @@ class WLEDApp:
             self._title_combined_row.controls.clear()
             self._title_left_col.controls = [self._title_meta_row, self._title_anim_wrap]
             self._title_left_col.spacing = 2
-            self._title_anim_wrap.padding = ft.padding.only(top=12)
-            self._title_left_wrap.padding = ft.padding.only(bottom=0)
+            self._title_anim_wrap.padding = ft.Padding.only(top=12)
+            self._title_left_wrap.padding = ft.Padding.only(bottom=0)
         else:
             # Move controls back into a single row before restoring the wrapper.
             self._title_left_col.controls = [self._title_combined_row]
             self._title_combined_row.controls = [self._title_meta_row, self._title_anim_wrap]
             self._title_left_col.spacing = 0
-            self._title_anim_wrap.padding = ft.padding.only(top=0)
-            self._title_left_wrap.padding = ft.padding.only(bottom=0)
+            self._title_anim_wrap.padding = ft.Padding.only(top=0)
+            self._title_left_wrap.padding = ft.Padding.only(bottom=0)
 
         self._header_title_split = split
         try: self.header.update()
         except: pass
 
     def _apply_col_width(self, w):
-        """Update col on every card cell to match current window width."""
+        """Update col on every card cell (including placeholder) to match current window width."""
         col_map = {1: 60, 2: 30, 3: 20, 4: 15, 5: 12}
         col_val = col_map[self._cols_for_width(w)]
         changed = False
@@ -13534,44 +10778,65 @@ class WLEDApp:
             if cell and cell.col != col_val:
                 cell.col = col_val
                 changed = True
+        # Also update the placeholder card — it lives in device_list but not in self.cards
+        for ctrl in getattr(self, 'device_list', ft.ResponsiveRow()).controls:
+            if getattr(ctrl, 'data', None) == "__add_device__" and ctrl.col != col_val:
+                ctrl.col = col_val
+                changed = True
         if changed:
-            try: self.device_list.update()
+            # Changing child col values alone does NOT trigger a ResponsiveRow re-layout
+            # in Flet 0.84 — Flutter only rebuilds it when the window size changes or a
+            # property on the ResponsiveRow itself changes. Toggling run_spacing by a
+            # sub-pixel amount (visually imperceptible) forces the rebuild.
+            rs = self.device_list.run_spacing
+            self.device_list.run_spacing = 14.999 if (rs is None or rs >= 15) else 15.0
+            try: self.page.update()
             except: pass
 
     def _on_window_resize(self, e):
-        """Save window size and maximized state whenever it changes."""
+        w = getattr(e, 'width', None)
+        h = getattr(e, 'height', None)
+        if not (w and h and w > 100 and h > 100):
+            return
+        cols = self._cols_for_width(w)
+        self.log(f"[DBG-Resize] e.w={w:.0f} e.h={h:.0f} → {cols} cols", color="cyan")
+        # e.width is the authoritative real page width from Flutter.
+        # page.window.width returns the last value WE SET, not the OS size —
+        # never use it for layout calculations.
+        self._current_layout_w = w
         try:
-            win = self.page.window
-            w  = win.width
-            h  = win.height
-            mx = win.maximized
-        except AttributeError:
-            w  = self.page.window_width
-            h  = self.page.window_height
+            mx = self.page.window.maximized
+        except Exception:
             mx = getattr(self.page, 'window_maximized', False)
-        if w and h and w > 100 and h > 100:
-            self._win_max = bool(mx)
-            if not mx:
-                self._win_w = int(w)
-                self._win_h = int(h)
-            self.save_cache()
-            self._apply_col_width(w)
-            self._apply_header_layout(w)
-            self._apply_master_layout(w)
+        self._win_max = bool(mx)
+        if not mx:
+            self._win_w = int(w)
+            self._win_h = int(h)
+        self._cached_cols = None
+        self.save_cache()
+        self._apply_col_width(w)
+        self._apply_header_layout(w)
+        self._apply_master_layout(w)
 
 
     def handle_window_event(self, e):
-        if e.data in ["blur", "minimize"]:
+        # Flet 0.84: e.type is WindowEventType enum; older Flet used e.data string.
+        t = getattr(e, 'type', None)
+        event_name = t.value if hasattr(t, 'value') else str(getattr(e, 'data', '') or '')
+        if event_name in ("blur", "minimize"):
             self.is_focused = False
             if self.unfocused_updates_enabled:
                 self.log_unique("focus_state", "[Focus] App out of focus — background Log and UI updates still active.  (Configureable in Log Screen).", color="grey500")
             else:
                 self.log_unique("focus_state", "[Focus] App out of focus — Log and UI updates paused until focus returns.  (Configureable in Log Screen).", color="grey500")
-        elif e.data in ["focus", "restore"]:
+        elif event_name in ("focus", "restore"):
             self.is_focused = True
             self.log_unique("focus_state", "[Focus] App focused — Log and UI updates active", color="grey500")
-        elif e.data == "close":
+        elif event_name == "close":
             self._show_exit_dialog()
+        # NOTE: do NOT read page.window.width here for layout — it returns the
+        # last SET value, not the actual OS size. page.on_resize (e.width) is
+        # the only reliable source and handles all resize/maximize/restore cases.
 
     def cleanup(self, e):
         if self._cleanup_started:
@@ -13582,6 +10847,9 @@ class WLEDApp:
         except:
             pass
         self.running = False
+        if self._sa:
+            try:   self._sa.stop()
+            except Exception: pass
         self.brightness_queue.put(None)
         # Stop MH bridge and all bulb workers cleanly
         self._mh_stop_bridge()
@@ -14051,13 +11319,13 @@ class WLEDApp:
                 c["live_icon"].color = "#7b1fa2"
                 c["live_text"].color = "#7b1fa2"
                 lb.bgcolor = "#1a001a"
-                lb.border  = ft.border.all(1, "#7b1fa2")
+                lb.border  = ft.Border.all(1, "#7b1fa2")
                 lb.tooltip = "LedFx has control — click to release back to MagicHome"
             else:
                 c["live_icon"].color = "#e65100"
                 c["live_text"].color = "#e65100"
                 lb.bgcolor = "#1a0800"
-                lb.border  = ft.border.all(1, "#e65100")
+                lb.border  = ft.Border.all(1, "#e65100")
                 lb.tooltip = "LedFx sync problem — retrying power-on…"
             try: lb.update()
             except: pass
@@ -14079,6 +11347,7 @@ class WLEDApp:
         cname = name.value if name else ip
         self.log(f"[MH Live] {cname} — entering LedFx sync", color="purple")
         self.mh_live_ips.add(ip)
+        self._ordered_dirty = True
         # Grace period: suppress poll-loop auto-release for 12s while bridge connects
         self.mh_live_grace_until[ip] = time.time() + 12.0
         # Lock the same controls that WLED locks, plus power switch + brightness
@@ -14103,14 +11372,14 @@ class WLEDApp:
             c["live_icon"].color = "#7b1fa2"
             c["live_text"].color = "#7b1fa2"
             lb.bgcolor  = "#1a001a"
-            lb.border   = ft.border.all(1, "#7b1fa2")
+            lb.border   = ft.Border.all(1, "#7b1fa2")
             lb.tooltip  = "LedFx has control — click to release back to MagicHome"
             try: lb.update()
             except: pass
         # Mark glow as "on" so the border animation loop includes this card —
         # matches how WLED live cards glow even when their power switch is off
         c["glow"].bgcolor = "#0a1a1a"
-        c["glow"].border  = ft.border.all(2, self._hue_to_hex(self.rainbow_hue))
+        c["glow"].border  = ft.Border.all(2, self._hue_to_hex(self.rainbow_hue))
         c["_glow_state"]  = "on"
         c["status"].visible = False
         try: c["card"].update(); c["glow"].update()
@@ -14122,6 +11391,7 @@ class WLEDApp:
         if not c:
             return
         self.mh_live_ips.discard(ip)
+        self._ordered_dirty = True
         for key in ("color_btn", "action_btn", "switch", "bri_slider"):
             ctrl = c.get(key)
             if ctrl:
@@ -14136,7 +11406,7 @@ class WLEDApp:
                 c["live_icon"].color = "grey500"
                 c["live_text"].color = "grey500"
                 lb.bgcolor  = "#1e1e2a"
-                lb.border   = ft.border.all(1, "grey700")
+                lb.border   = ft.Border.all(1, "grey700")
                 lb.tooltip  = "Click to sync this MagicHome device with LedFx"
             else:
                 lb.visible = False
@@ -14149,11 +11419,11 @@ class WLEDApp:
         if is_on:
             c["_glow_state"] = "on"
             c["glow"].bgcolor = "#121420"
-            c["glow"].border  = ft.border.all(2, "#2b2b3b")
+            c["glow"].border  = ft.Border.all(2, "#2b2b3b")
         else:
             c["_glow_state"] = "off"
             c["glow"].bgcolor = "#121420"
-            c["glow"].border  = ft.border.all(2, "#2b2b3b")
+            c["glow"].border  = ft.Border.all(2, "#2b2b3b")
         c["status"].visible = True
         try: c["card"].update(); c["glow"].update()
         except: pass
@@ -14172,6 +11442,7 @@ class WLEDApp:
                 self._mh_stop_bulb_worker(i)
                 self._mh_restore_state(i) # Sets guard synchronously before discard
                 self.mh_live_ips.discard(i)
+                self._ordered_dirty = True
                 self.mh_live_grace_until.pop(i, None)
                 if not self.mh_live_ips:
                     self._mh_stop_bridge()
@@ -14221,5 +11492,4 @@ if __name__ == "__main__":
         _sys.exit(0)
     
     def main(page: ft.Page): WLEDApp(page)
-    if __name__ == "__main__":
-        ft.app(target=main)
+    ft.run(main)
