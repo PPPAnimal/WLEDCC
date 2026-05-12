@@ -1,5 +1,5 @@
 """ WLEDCC - WLED COMMAND CENTER
-    Copyright (C) 2026 Bill Sullivan (SullySSignS)
+    Copyright (C) 2026 PPPAnimal (SullySSignS)
 
     This program is free software: you can redistribute it and/or modify
     it under the terms of the GNU General Public License as published by
