@@ -10,7 +10,6 @@ import sys
 from PyInstaller.utils.hooks import collect_all, collect_submodules
 
 flet_datas, flet_binaries, flet_hiddenimports = collect_all('flet')
-flet_core_datas, flet_core_binaries, flet_core_hiddenimports = collect_all('flet_core')
 zeroconf_hiddenimports = collect_submodules('zeroconf')
 pil_datas, pil_binaries, pil_hiddenimports = collect_all('PIL')
 
@@ -18,13 +17,11 @@ _common_datas = [
     ('version.txt', '.'),
     ('*.jpg', '.'),
     *flet_datas,
-    *flet_core_datas,
     *pil_datas,
 ]
 
 _common_binaries = [
     *flet_binaries,
-    *flet_core_binaries,
     *pil_binaries,
 ]
 
@@ -36,7 +33,6 @@ a_wledcc = Analysis(
     datas=_common_datas,
     hiddenimports=[
         *flet_hiddenimports,
-        *flet_core_hiddenimports,
         *zeroconf_hiddenimports,
         *pil_hiddenimports,
         'zeroconf._utils.ipaddress',
@@ -102,7 +98,6 @@ a_sa = Analysis(
     datas=_common_datas,
     hiddenimports=[
         *flet_hiddenimports,
-        *flet_core_hiddenimports,
         *pil_hiddenimports,
         'threading',
         'json',

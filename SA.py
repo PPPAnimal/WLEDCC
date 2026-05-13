@@ -673,12 +673,12 @@ class SpectrumController:
         self._spec_gain             = 1.0
         self._spec_target_fps       = _SA_MAX_FPS
         self._spec_sensitivity      = 0.85
-        self._spec_reactivity       = 3.0
+        self._spec_reactivity       = 1.0
         self._spec_bar_decay        = 2.0
         self._spec_peak_decay       = 1.0
         self._spec_mode             = "classic"
-        self._spec_mode_random_enabled        = False
-        self._spec_mode_random_on_song        = False
+        self._spec_mode_random_enabled        = True
+        self._spec_mode_random_on_song        = True
         self._spec_mode_random_current        = "classic"
         self._spec_mode_random_cycle_seconds  = 60.0
         self._menu_rebuild_requested          = False
@@ -698,8 +698,8 @@ class SpectrumController:
         self._spec_nvu_cascade_bg   = "BLANK"
         self._spec_nvu_bg_contain   = {}
         self._spec_nvu_bg_force_reload = False
-        self._spec_bs_color_mode    = "gradient"  # active color mode (used by renderer)
-        self._spec_color_mode_per_mode = {"beat_saber": "gradient", "neon_cascade": "gradient", "rock_stage": "gradient", "hallucination": "loop"}
+        self._spec_bs_color_mode    = "random"  # active color mode (used by renderer)
+        self._spec_color_mode_per_mode = {"beat_saber": "random", "neon_cascade": "random", "rock_stage": "random", "hallucination": "random"}
         self._spec_display_hue      = 0.0          # 0-1 HSV hue of current render
         self._spec_capture_channels = 2
         self._spec_sample_rate      = 48000
@@ -724,7 +724,7 @@ class SpectrumController:
         self._sa_prev_smth_bass = 0.0
         self._sa_canvas_beat    = False
         self._spec_idle_enabled     = True
-        self._spec_idle_timeout     = 2.0
+        self._spec_idle_timeout     = 5.0
         self._spec_idle_effect      = "random"
         self._spec_idle_cycle_effects = ["pulse", "text", "pacman", "tetris",
                                         "invaders", "snake", "starwars"]
@@ -777,7 +777,7 @@ class SpectrumController:
         # ── Hallucination state ───────────────────────────────────────────
         self._spec_hallu_submode               = "mirror"
         self._spec_hallu_params_per_submode    = {
-            "mirror":   {"zoom": 0.90,   "rotDeg": 3.0,    "opacity": 0.92,   "beat_sens": 2.1,  "dim_thresh": 0.25},
+            "mirror":   {"zoom": 0.85,   "rotDeg": 10.0,   "opacity": 1.0,    "beat_sens": 2.0,  "dim_thresh": 0.25},
             "chroma":   {"maxSplit": 14, "trail": 0.18},
             "perlin":   {"noiseScale": 0.012, "evolveRate": 0.30},
             "slitscan": {"scanSpeed": 1.0},
@@ -794,9 +794,9 @@ class SpectrumController:
         self._spec_hallu_prev_frame            = None
         self._spec_hallu_aux                   = {}
         self._spec_hallu_bass_avg              = 0.0
-        self._spec_hallu_auto_rot              = False
-        self._spec_hallu_auto_spread           = False
-        self._spec_hallu_auto_blur             = False
+        self._spec_hallu_auto_rot              = True
+        self._spec_hallu_auto_spread           = True
+        self._spec_hallu_auto_blur             = True
 
         self._spec_hallu_excited             = False
         self._spec_hallu_excited_ts          = 0.0
@@ -904,7 +904,7 @@ class SpectrumController:
                 try:
                     self._spec_profiles[_k] = {
                         "sensitivity": _clamp(_v.get("sensitivity", 0.85), 0.1, 1.5, 0.85),
-                        "reactivity":  _clamp(_v.get("reactivity",  3.0),  0.25, 3.0, 3.0),
+                        "reactivity":  _clamp(_v.get("reactivity",  1.0),  0.25, 3.0, 1.0),
                         "bar_decay":   _clamp(_v.get("bar_decay",   2.0),  0.1, 5.0, 2.0),
                         "peak_decay":  _clamp(_v.get("peak_decay",  1.0),  0.1, 5.0, 1.0),
                         "eq_gains":    [max(0.25, min(3.0, float(x)))
@@ -914,7 +914,7 @@ class SpectrumController:
                     continue
 
         self._spec_sensitivity  = _clamp(c.get("spec_sensitivity",  0.85), 0.1, 1.5, 0.85)
-        self._spec_reactivity   = _clamp(c.get("spec_reactivity",   3.0),  0.25, 3.0, 3.0)
+        self._spec_reactivity   = _clamp(c.get("spec_reactivity",   1.0),  0.25, 3.0, 1.0)
         self._spec_bar_decay    = _clamp(c.get("spec_bar_decay",    2.0),  0.1, 5.0, 2.0)
         self._spec_peak_decay   = _clamp(c.get("spec_peak_decay",   1.0),  0.1, 5.0, 1.0)
         self._spec_target_fps   = int(_clamp(c.get("spec_target_fps", _SA_MAX_FPS), 8, _SA_MAX_FPS, _SA_MAX_FPS))
@@ -926,8 +926,8 @@ class SpectrumController:
         self._spec_mode_song_silence_seconds = _clamp(c.get("spec_mode_song_timeout", 2.0), 1.0, 15.0, 2.0)
 
         # Load global random-cycle flags (with migration from old "random"/"random_song" mode values)
-        self._spec_mode_random_enabled = bool(c.get("spec_mode_random_enabled", False))
-        self._spec_mode_random_on_song  = bool(c.get("spec_mode_random_on_song", False))
+        self._spec_mode_random_enabled = bool(c.get("spec_mode_random_enabled", True))
+        self._spec_mode_random_on_song  = bool(c.get("spec_mode_random_on_song", True))
         try: self._spec_mode_random_cycle_seconds = max(5.0, min(3600.0,
                 float(c.get("spec_mode_random_cycle_secs", 60.0))))
         except: pass
@@ -972,18 +972,18 @@ class SpectrumController:
         _cm_map = c.get("spec_color_mode_per_mode", {})
         if isinstance(_cm_map, dict) and _cm_map:
             for _mk in ("beat_saber", "neon_cascade", "rock_stage"):
-                _v = str(_cm_map.get(_mk, "gradient")).lower()
-                self._spec_color_mode_per_mode[_mk] = _v if _v in _valid_cm else "gradient"
-            _v = str(_cm_map.get("hallucination", "loop")).lower()
-            self._spec_color_mode_per_mode["hallucination"] = _v if _v in ("loop", "gradient", "random") else "loop"
+                _v = str(_cm_map.get(_mk, "random")).lower()
+                self._spec_color_mode_per_mode[_mk] = _v if _v in _valid_cm else "random"
+            _v = str(_cm_map.get("hallucination", "random")).lower()
+            self._spec_color_mode_per_mode["hallucination"] = _v if _v in ("loop", "gradient", "random") else "random"
         else:
             # migrate legacy single value
-            _cm = str(c.get("spec_bs_color_mode", "gradient")).lower()
-            _cm = _cm if _cm in _valid_cm else "gradient"
+            _cm = str(c.get("spec_bs_color_mode", "random")).lower()
+            _cm = _cm if _cm in _valid_cm else "random"
             for _mk in ("beat_saber", "neon_cascade", "rock_stage"):
                 self._spec_color_mode_per_mode[_mk] = _cm
         self._spec_bs_color_mode = self._spec_color_mode_per_mode.get(
-            self._spec_mode, self._spec_color_mode_per_mode.get("beat_saber", "gradient"))
+            self._spec_mode, self._spec_color_mode_per_mode.get("beat_saber", "random"))
 
         _nvu = str(c.get("spec_neon_vu_theme", "neon_drift")).lower()
         self._neon_vu_theme = _nvu if _nvu in ("neon_drift", "retro_tech", "custom_vu", "hud_reactor", "beat_saber", "neon_cascade", "rock_stage") else "neon_drift"
@@ -1003,7 +1003,7 @@ class SpectrumController:
         self._spec_hallu_base_kind = _hbk if _hbk in _valid_base else "waveform"
 
         self._spec_idle_enabled = bool(c.get("spec_idle_enabled", True))
-        self._spec_idle_timeout = _clamp(c.get("spec_idle_timeout", 2.0), 2.0, 30.0, 2.0)
+        self._spec_idle_timeout = _clamp(c.get("spec_idle_timeout", 5.0), 2.0, 30.0, 5.0)
         _idle_fx = str(c.get("spec_idle_effect", "random")).lower()
         self._spec_idle_effect  = _idle_fx if _idle_fx in (
             "random", "pulse", "text", "pacman", "tetris", "invaders", "snake", "starwars") else "random"
@@ -1045,13 +1045,13 @@ class SpectrumController:
             _h_base = dict(self._spec_mode_configs.get(_hallu_path, {}))
             _sub_params = dict(_hp.get(self._spec_hallu_submode, {})) if isinstance(_hp, dict) else {}
             _cm_map = c.get("spec_color_mode_per_mode", {})
-            _cm_h = str(_cm_map.get("hallucination", "loop") if isinstance(_cm_map, dict) else "loop").lower()
+            _cm_h = str(_cm_map.get("hallucination", "random") if isinstance(_cm_map, dict) else "random").lower()
             _valid_cm_h = ("loop", "gradient", "random")
             _h_base["extras"] = {
-                "color_mode":           _cm_h if _cm_h in _valid_cm_h else "loop",
-                "auto_rot":      bool(c.get("spec_hallu_auto_rot",       False)),
-                "auto_spread":   bool(c.get("spec_hallu_auto_spread",  False)),
-                "auto_blur":     bool(c.get("spec_hallu_auto_blur",    False)),
+                "color_mode":           _cm_h if _cm_h in _valid_cm_h else "random",
+                "auto_rot":      bool(c.get("spec_hallu_auto_rot",       True)),
+                "auto_spread":   bool(c.get("spec_hallu_auto_spread",  True)),
+                "auto_blur":     bool(c.get("spec_hallu_auto_blur",    True)),
 
                 "params":        _sub_params,
             }
@@ -1278,7 +1278,7 @@ class SpectrumController:
             try:   return max(lo, min(hi, float(v)))
             except: return d
         self._spec_sensitivity  = _c(_s.get("sensitivity",  0.85), 0.1, 1.5, 0.85)
-        self._spec_reactivity   = _c(_s.get("reactivity",   3.0),  0.25, 3.0, 3.0)
+        self._spec_reactivity   = _c(_s.get("reactivity",   1.0),  0.25, 3.0, 1.0)
         self._spec_bar_decay    = _c(_s.get("bar_decay",    2.0),  0.1, 5.0, 2.0)
         self._spec_peak_decay   = _c(_s.get("peak_decay",   1.0),  0.1, 5.0, 1.0)
         self._spec_target_fps   = int(_c(_s.get("target_fps", _SA_MAX_FPS), 8, _SA_MAX_FPS, _SA_MAX_FPS))
@@ -1297,14 +1297,14 @@ class SpectrumController:
             return
         if mode == "hallucination":
             _sub = self._spec_hallu_submode
-            _cm = str(_x.get("color_mode", "loop")).lower()
-            self._spec_color_mode_per_mode["hallucination"] = _cm if _cm in ("loop", "gradient", "random") else "loop"
-            self._spec_hallu_auto_rot       = bool(_x.get("auto_rot",       False))
-            self._spec_hallu_auto_spread    = bool(_x.get("auto_spread",    False))
-            self._spec_hallu_auto_blur      = bool(_x.get("auto_blur",      False))
+            _cm = str(_x.get("color_mode", "random")).lower()
+            self._spec_color_mode_per_mode["hallucination"] = _cm if _cm in ("loop", "gradient", "random") else "random"
+            self._spec_hallu_auto_rot       = bool(_x.get("auto_rot",       True))
+            self._spec_hallu_auto_spread    = bool(_x.get("auto_spread",    True))
+            self._spec_hallu_auto_blur      = bool(_x.get("auto_blur",      True))
 
             _defaults = {
-                "mirror":   {"zoom": 0.90,   "rotDeg": 3.0,    "opacity": 0.92,   "beat_sens": 2.1,  "dim_thresh": 0.25},
+                "mirror":   {"zoom": 0.85,   "rotDeg": 10.0,   "opacity": 1.0,    "beat_sens": 2.0,  "dim_thresh": 0.25},
                 "chroma":   {"maxSplit": 14, "trail": 0.18},
                 "perlin":   {"noiseScale": 0.012, "evolveRate": 0.30},
                 "slitscan": {"scanSpeed": 1.0},
@@ -1502,9 +1502,12 @@ class SpectrumController:
 
     # ── Logging / status ─────────────────────────────────────────────────────
 
-    def _status(self, msg, color="grey500"):
+    def _status(self, msg, color="grey500", debug_only=False):
         if self._log_fn:
-            try:   self._log_fn(f"[SA] {msg}", color)
+            try:
+                is_debug = self._debug_mode_fn() if self._debug_mode_fn else self._debug_mode
+                if not debug_only or is_debug:
+                    self._log_fn(f"[SA] {msg}", color)
             except Exception: pass
         else:
             print(f"[SA] {msg}")
@@ -1866,7 +1869,7 @@ class SpectrumController:
             try:   return max(lo, min(hi, float(v)))
             except: return d
         self._spec_sensitivity = _c(_p.get("sensitivity", 0.85), 0.1, 1.5, 0.85)
-        self._spec_reactivity  = _c(_p.get("reactivity",  3.0),  0.25, 3.0, 3.0)
+        self._spec_reactivity  = _c(_p.get("reactivity",  1.0),  0.25, 3.0, 1.0)
         self._spec_bar_decay   = _c(_p.get("bar_decay",   2.0),  0.1, 5.0, 2.0)
         self._spec_peak_decay  = _c(_p.get("peak_decay",  1.0),  0.1, 5.0, 1.0)
         _eq = _p.get("eq_gains", None)
@@ -2523,17 +2526,23 @@ class SpectrumController:
             except Exception:
                 pass
 
-        _m_zoom_init = float(self._spec_hallu_params_per_submode.get("mirror", {}).get("zoom", 0.94))
-        _m_rot_init  = float(self._spec_hallu_params_per_submode.get("mirror", {}).get("rotDeg", 0.0))
-        _m_op_init   = float(self._spec_hallu_params_per_submode.get("mirror", {}).get("opacity", 0.92))
+        _m_zoom_init = float(self._spec_hallu_params_per_submode.get("mirror", {}).get("zoom", 0.85))
+        _m_rot_init  = float(self._spec_hallu_params_per_submode.get("mirror", {}).get("rotDeg", 10.0))
+        _m_op_init   = float(self._spec_hallu_params_per_submode.get("mirror", {}).get("opacity", 1.0))
 
-        _m_zoom_lbl = ft.Text(f"{_m_zoom_init:.2f}",       size=11, color="#ff9800", width=42)
+        # Ghost Spread slider is reversed: right = more spread (lower zoom value).
+        # slider_val = 1.849 - zoom, so high slider → low zoom → more spread.
+        _m_zoom_slider_val = max(0.85, min(0.999, round(1.849 - _m_zoom_init, 3)))
+        _m_zoom_lbl = ft.Text(f"{int((0.999 - _m_zoom_init) / 0.149 * 100)}%", size=11, color="#ff9800", width=42)
         _m_rot_lbl  = ft.Text(f"{_m_rot_init:+.1f}°", size=11, color="#ff9800", width=42)
         _m_op_lbl   = ft.Text(f"{int(_m_op_init * 100)}%", size=11, color="#ff9800", width=42)
 
         def on_m_zoom(e):
             v = round(float(e.control.value), 3)
-            _mirror_param_set("zoom", v); _m_zoom_lbl.value = f"{v:.2f}"; _m_zoom_lbl.update()
+            zoom = max(0.85, min(0.999, round(1.849 - v, 3)))  # reversed: high slider = more spread
+            _mirror_param_set("zoom", zoom)
+            _m_zoom_lbl.value = f"{int((0.999 - zoom) / 0.149 * 100)}%"
+            _m_zoom_lbl.update()
         def on_m_rot(e):
             v = round(float(e.control.value), 2)
             _mirror_param_set("rotDeg", v); _m_rot_lbl.value = f"{v:+.1f}°"; _m_rot_lbl.update()
@@ -2541,7 +2550,7 @@ class SpectrumController:
             v = round(float(e.control.value), 3)
             _mirror_param_set("opacity", v); _m_op_lbl.value = f"{int(v * 100)}%"; _m_op_lbl.update()
 
-        _m_zoom_slider = ft.Slider(min=0.85, max=0.999, value=_m_zoom_init,
+        _m_zoom_slider = ft.Slider(min=0.85, max=0.999, value=_m_zoom_slider_val,
                                 divisions=149, on_change=on_m_zoom, width=160)
         _m_rot_slider  = ft.Slider(min=-10.0, max=10.0, value=_m_rot_init,
                                 divisions=80,  on_change=on_m_rot,  width=160)
@@ -3069,7 +3078,7 @@ class SpectrumController:
         _tab_sources = ft.Container(
             content=ft.Column([
                 ft.Row([ft.Text("Sample Rate:", size=12, color="grey400"),
-                        ft.Dropdown(width=100, value=str(int(self._spec_sample_rate)),
+                        ft.Dropdown(width=130, value=str(int(self._spec_sample_rate)),
                             options=[ft.dropdown.Option(str(r)) for r in (16000, 22050, 32000, 44100, 48000)],
                 on_select=on_sample_rate_change, text_size=12, dense=True)],
 
@@ -5092,9 +5101,9 @@ class SpectrumController:
         # Update status log on state change
         if self._spec_hallu_excited != self._spec_hallu_excited_prev:
             if self._spec_hallu_excited:
-                self._status("Hallucination: EXCITED", "cyan")
+                self._status("Hallucination: EXCITED", "cyan", debug_only=True)
             else:
-                self._status("Hallucination: Calm", "grey500")
+                self._status("Hallucination: Calm", "grey500", debug_only=True)
             self._spec_hallu_excited_prev = self._spec_hallu_excited
 
         # ── Color-mode tick: drive _spec_display_hue and gradient flag ──

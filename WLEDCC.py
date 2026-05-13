@@ -385,7 +385,7 @@ class WLEDApp:
         self.ledfx_devices = set()   # IPs controlled by LedFx (in live mode)
         self.poll_counters = {}      # ip -> consecutive poll count for adaptive backoff
 
-        self.save_logs_to_disk = False  # True = write UI log lines to session file
+        self.save_logs_to_disk = True   # True = write UI log lines to session file
 
         # Session log file is opened only when save_logs_to_disk is enabled
         self._log_fh = None
@@ -2772,7 +2772,7 @@ class WLEDApp:
                 #ft.Text("WLED COMMAND CENTER+ — USER MANUAL", weight="bold", size=14, color="#00f2ff"),
                 ft.TextButton(
                     content=ft.Text("by SullySSignS.ca", size=10, color="grey600"),
-                    on_click=lambda _: self.page.launch_url("https://www.sullyssigns.ca"),
+                    on_click=lambda _: webbrowser.open_new_tab("https://www.sullyssigns.ca"),
                     tooltip="Visit sullyssigns.ca",
                     style=ft.ButtonStyle(padding=ft.Padding.only(top=0, bottom=0)),
                 ),
@@ -3075,8 +3075,11 @@ class WLEDApp:
                 ft.PopupMenuItem(content=self.save_logs_to_disk_cb),
             ],
         )
-        def _on_log_drag(e: ft.DragUpdateEvent):
-            self._log_height = max(80, min(600, self._log_height + e.delta_y))
+        def _on_log_drag(e):
+            dy = getattr(e, 'delta_y', None)
+            if dy is None:
+                dy = getattr(e, 'primary_delta', 0) or 0
+            self._log_height = max(80, min(600, self._log_height + dy))
             self.log_scroll_container.height = self._log_height
             try: self.log_scroll_container.update()
             except: pass
@@ -3612,8 +3615,8 @@ class WLEDApp:
             except: pass
 
     def _fetch_ledfx_scenes(self):
-        """Fetch scenes from LedFx API. Retries up to 4 times if empty so LedFx has time to fully start."""
-        max_attempts = 4
+        """Fetch scenes from LedFx API. Retries up to 8 times if empty so LedFx has time to fully start."""
+        max_attempts = 8
         for attempt in range(max_attempts):
             if attempt > 0:
                 time.sleep(3)
@@ -3657,13 +3660,13 @@ class WLEDApp:
                 self.ledfx_scenes = names
                 self.ledfx_scene_virtuals = scene_virtuals
                 self.log(f"[LedFx] Fetched {len(names)} scene(s) from LedFx", color="grey500")
-                # Only call restore once we have scenes, or on final attempt, to avoid premature give-up.
-                if names or not self._pending_ledfx_scene_restore or attempt == max_attempts - 1:
+                # Retry whenever scenes are empty (LedFx may still be initializing).
+                if names or attempt == max_attempts - 1:
                     break
                 self.log(f"[LedFx] No scenes yet (attempt {attempt + 1}/{max_attempts}), retrying...", color="orange400")
             except Exception as e:
                 self.log(f"[LedFx] Could not fetch scenes: {e}", color="orange400")
-                if not self._pending_ledfx_scene_restore or attempt == max_attempts - 1:
+                if attempt == max_attempts - 1:
                     break
                 self.log(f"[LedFx] Retrying scene fetch ({attempt + 1}/{max_attempts})...", color="orange400")
         # Restore toggle button text and rebuild row regardless of success/failure
@@ -9391,7 +9394,7 @@ class WLEDApp:
         self.debug_on_open = c.get("debug_on_open", False)
         self.log_auto_open = c.get("log_auto_open", False)
         self.unfocused_updates_enabled = c.get("unfocused_updates_enabled", True)
-        self.save_logs_to_disk = c.get("save_logs_to_disk", False)
+        self.save_logs_to_disk = c.get("save_logs_to_disk", True)
         self.exit_remember_actions = c.get("exit_remember_actions", False)
         self.exit_auto_stop_ledfx = c.get("exit_auto_stop_ledfx", False)
         self.exit_auto_all_off = c.get("exit_auto_all_off", False)
