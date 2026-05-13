@@ -1,13 +1,26 @@
-# Hide all
+# Hide everything by default
 *
 
+# Source code
 !WLEDCC.py
 !SA.py
+
+# Project documentation
+!CLAUDE.md
+!LICENSE
+!Manual.txt
+
+# Build configuration
+!WLEDCCALL.spec
+!WLEDCC_setupALL.iss
+!NewBuilderALL.bat
 !version.txt
 !wledccicon.ico
-!README.md
-!Brushed Metal.jpg
-!Nebula Space.jpg
-!Planets Space.jpg
-!Retro Blue.jpg
-!Retro Yellow.jpg
+
+# Image assets (all shipped with installer)
+!BG*.jpg
+!Gauge*.jpg
+!Stage*.jpg
+
+# Git configuration
+!.gitignore
