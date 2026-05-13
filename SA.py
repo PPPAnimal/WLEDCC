@@ -504,6 +504,18 @@ _DATA_DIR    = os.path.join(os.environ.get("APPDATA", _VERSION_DIR), "WLEDCC")
 os.makedirs(_DATA_DIR, exist_ok=True)
 SA_CONFIG_FILE = os.path.join(_DATA_DIR, "SA-config.json")
 
+# ── Background image defaults per NVU mode ───────────────────────────────────
+_NVU_BG_DEFAULTS = {
+    "drift":   "BG Nebula Space.jpg",
+    "retro":   "BG Brushed Metal.jpg",
+    "custom":  "Gauge Yellow.jpg",
+    "hud":     "BLANK",
+    "rock":    "stage kiss.jpg",
+    "bs":      "stage metallica.jpg",
+    "cascade": "stage acdc2.jpg",
+}
+_NVU_CONTAIN_DEFAULTS = {"neon_cascade": True, "beat_saber": True}
+
 # Color modes available for random cycling, per visualizer mode
 _CM_RANDOM_POOL = {
     "beat_saber":   ("loop", "gradient"),
@@ -687,14 +699,14 @@ class SpectrumController:
         self._spec_mode_song_silence_seconds  = 2.0
         self._spec_mode_song_switch_armed     = True
         self._spec_mode_song_debounce         = 0
-        self._spec_nvu_drift_bg     = "BG Nebula Space.jpg"
-        self._spec_nvu_retro_bg     = "BG Brushed Metal.jpg"
-        self._spec_nvu_custom_bg    = "Gauge Yellow.jpg"
-        self._spec_nvu_hud_bg       = "BLANK"
-        self._spec_nvu_rock_bg      = "BLANK"
-        self._spec_nvu_bs_bg        = "BLANK"
-        self._spec_nvu_cascade_bg   = "BLANK"
-        self._spec_nvu_bg_contain   = {}
+        self._spec_nvu_drift_bg     = _NVU_BG_DEFAULTS["drift"]
+        self._spec_nvu_retro_bg     = _NVU_BG_DEFAULTS["retro"]
+        self._spec_nvu_custom_bg    = _NVU_BG_DEFAULTS["custom"]
+        self._spec_nvu_hud_bg       = _NVU_BG_DEFAULTS["hud"]
+        self._spec_nvu_rock_bg      = _NVU_BG_DEFAULTS["rock"]
+        self._spec_nvu_bs_bg        = _NVU_BG_DEFAULTS["bs"]
+        self._spec_nvu_cascade_bg   = _NVU_BG_DEFAULTS["cascade"]
+        self._spec_nvu_bg_contain   = dict(_NVU_CONTAIN_DEFAULTS)
         self._spec_nvu_bg_force_reload = False
         self._spec_bs_color_mode    = "random"  # active color mode (used by renderer)
         self._spec_color_mode_per_mode = {"beat_saber": "random", "neon_cascade": "random", "rock_stage": "random", "hallucination": "random"}
@@ -944,15 +956,15 @@ class SpectrumController:
                 "classic", "vu", "cyber_city", "beat_saber", "neon_drift", "retro_tech",
                 "custom_vu", "hud_reactor", "neon_cascade", "rock_stage", "hallucination") else "classic"
 
-        self._spec_nvu_drift_bg  = c.get("spec_nvu_drift_bg",  "BG Nebula Space.jpg")
-        self._spec_nvu_retro_bg  = c.get("spec_nvu_retro_bg",  "BG Brushed Metal.jpg")
-        self._spec_nvu_custom_bg = c.get("spec_nvu_custom_bg", "Gauge Yellow.jpg")
-        self._spec_nvu_hud_bg    = c.get("spec_nvu_hud_bg",    "BLANK")
-        self._spec_nvu_rock_bg   = c.get("spec_nvu_rock_bg",   "BLANK")
-        self._spec_nvu_bs_bg     = c.get("spec_nvu_bs_bg",     "BLANK")
-        self._spec_nvu_cascade_bg= c.get("spec_nvu_cascade_bg","BLANK")
-        _bc = c.get("spec_nvu_bg_contain", {})
-        self._spec_nvu_bg_contain = dict(_bc) if isinstance(_bc, dict) else {}
+        self._spec_nvu_drift_bg  = c.get("spec_nvu_drift_bg",  _NVU_BG_DEFAULTS["drift"])
+        self._spec_nvu_retro_bg  = c.get("spec_nvu_retro_bg",  _NVU_BG_DEFAULTS["retro"])
+        self._spec_nvu_custom_bg = c.get("spec_nvu_custom_bg", _NVU_BG_DEFAULTS["custom"])
+        self._spec_nvu_hud_bg    = c.get("spec_nvu_hud_bg",    _NVU_BG_DEFAULTS["hud"])
+        self._spec_nvu_rock_bg   = c.get("spec_nvu_rock_bg",   _NVU_BG_DEFAULTS["rock"])
+        self._spec_nvu_bs_bg     = c.get("spec_nvu_bs_bg",     _NVU_BG_DEFAULTS["bs"])
+        self._spec_nvu_cascade_bg= c.get("spec_nvu_cascade_bg",_NVU_BG_DEFAULTS["cascade"])
+        _bc = c.get("spec_nvu_bg_contain", _NVU_CONTAIN_DEFAULTS)
+        self._spec_nvu_bg_contain = dict(_bc) if isinstance(_bc, dict) else dict(_NVU_CONTAIN_DEFAULTS)
         _bg_rename = {
             "nebula space.jpg":  "BG Nebula Space.jpg",
             "brushed metal.jpg": "BG Brushed Metal.jpg",
@@ -6269,6 +6281,7 @@ class SpectrumApp:
                     _sc._spec_hallu_aux        = {}
                     _sc._spec_hallu_prev_frame = None
                 _sc._spec_mode = _sm
+                _sc._spec_mode_random_current = _sm
                 _sc._apply_per_mode_settings(_sm, restart_audio=False)
         except Exception:
             pass
