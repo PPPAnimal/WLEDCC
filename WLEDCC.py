@@ -119,6 +119,7 @@ DEFAULT_WINAMP_CARD_KEY = "__default_winamp__"
 SPOTIFY_DOWNLOADS_PAGE_URL = "https://www.spotify.com/download/windows/"
 SPOTIFY_SETUP_EXE_URL = "https://download.scdn.co/SpotifySetup.exe"
 DEFAULT_SPOTIFY_CARD_KEY = "__default_spotify__"
+DEFAULT_SPOTIFY_APP_CARD_KEY = "__default_spotify_app__"
 MAGIC_HOME_PORT = 5577
 MAGIC_HOME_DISCOVERY_PORT = 48899
 
@@ -267,8 +268,9 @@ class WLEDApp:
         self._spotify_play_state = {}  # key -> bool (best-effort playback state for spotify.com cards)
         self._spotify_keepalive_until = {}  # key -> monotonic ts to avoid UI state flapping on tab/title changes
         self._default_custom_cards_meta = {
-            DEFAULT_WINAMP_CARD_KEY: {"auto_created": False, "user_deleted": False},
+            DEFAULT_WINAMP_CARD_KEY: {"auto_created": False, "user_deleted": False, "path_scanned": False},
             DEFAULT_SPOTIFY_CARD_KEY: {"auto_created": False, "user_deleted": False},
+            DEFAULT_SPOTIFY_APP_CARD_KEY: {"auto_created": False, "user_deleted": False, "path_scanned": False},
         }
         self._spotify_media_listener_thread = None
         self._spotify_media_listener_stop = threading.Event()
@@ -415,7 +417,7 @@ class WLEDApp:
             self.log(self._cache_load_warning, color="red400")
         threading.Thread(target=self.fetch_latest_release, daemon=True).start()
         threading.Thread(target=self.check_wledcc_updates, daemon=True).start()
-        threading.Thread(target=self.check_ledfx_updates, daemon=True).start()
+
         threading.Thread(target=self.brightness_worker, daemon=True).start()
         threading.Thread(target=self.rainbow_loop, daemon=True).start()
         threading.Thread(target=self.ledfx_monitor_loop, daemon=True).start()
@@ -1114,6 +1116,10 @@ class WLEDApp:
             self._pending_ledfx_scene_restore = True
             self.log("[LedFx Auto] Last LedFx scene queued; will restore after LedFx scenes load", color="grey500")
 
+        if self.running:
+            self._first_run_path_scan()
+            self.check_ledfx_updates()
+
     def _restore_last_wled_scene_after_delay(self, delay=2.5, source="toggle"):
         """Restore saved WLED scene after UI settles."""
         time.sleep(delay)
@@ -1654,6 +1660,47 @@ class WLEDApp:
         except:
             pass
         
+    def _first_run_path_scan(self):
+        """Scan for Winamp and LedFx paths exactly once on first run. After that, wait for user to click launch."""
+        _save_needed = False
+
+        # Winamp: scan only if the card was seeded but never path-scanned
+        _wa_meta = self._default_custom_cards_meta.get(DEFAULT_WINAMP_CARD_KEY, {})
+        if not _wa_meta.get("path_scanned", False):
+            _wa_info = self.custom_devices.get(DEFAULT_WINAMP_CARD_KEY)
+            if isinstance(_wa_info, dict):
+                _found = self._find_winamp_locally()
+                if _found:
+                    self.custom_devices[DEFAULT_WINAMP_CARD_KEY]["url"] = _found
+                    self.log(f"[Winamp] Auto-located at: {_found}", color="green400")
+            _wa_meta["path_scanned"] = True
+            _save_needed = True
+
+        # Spotify App: scan only if the card was seeded but never path-scanned
+        _spa_meta = self._default_custom_cards_meta.get(DEFAULT_SPOTIFY_APP_CARD_KEY, {})
+        if not _spa_meta.get("path_scanned", False):
+            _spa_info = self.custom_devices.get(DEFAULT_SPOTIFY_APP_CARD_KEY)
+            if isinstance(_spa_info, dict):
+                _found = self._find_spotify_exe_locally()
+                if _found:
+                    self.custom_devices[DEFAULT_SPOTIFY_APP_CARD_KEY]["url"] = _found
+                    self.log(f"[Spotify] Auto-located at: {_found}", color="green400")
+            _spa_meta["path_scanned"] = True
+            _save_needed = True
+
+        # LedFx: scan only if path key was absent from cache (None = never set)
+        if not self.auto_start_ledfx_on_launch and self.ledfx_path is None:
+            _found = self._find_ledfx_locally()
+            if _found:
+                self.ledfx_path = _found
+                self.log(f"[LedFx] Auto-located at: {_found}", color="green400")
+            else:
+                self.ledfx_path = ""  # sentinel: scanned, not found — don't scan again
+            _save_needed = True
+
+        if _save_needed:
+            self.save_cache()
+
     def _find_ledfx_locally(self):
         """Search all internal fixed drives for ledfx.exe, ignoring USB/Removable."""
         possible_roots = []
@@ -2212,21 +2259,57 @@ class WLEDApp:
 
         threading.Thread(target=_start, daemon=True).start()
 
+    def _get_ledfx_exe_version(self):
+        """Read the real LedFx version from _internal/ledfx/consts.py (PyInstaller bundle layout)."""
+        if not self.ledfx_path or not os.path.exists(self.ledfx_path):
+            return None
+        _ledfx_dir = os.path.dirname(self.ledfx_path)
+        _consts = os.path.join(_ledfx_dir, "_internal", "ledfx", "consts.py")
+        if os.path.exists(_consts):
+            try:
+                import re
+                with open(_consts, "r", encoding="utf-8", errors="ignore") as _f:
+                    for _line in _f:
+                        _m = re.match(r'^\s*PROJECT_VERSION\s*=\s*["\']([^"\']+)["\']', _line)
+                        if _m:
+                            return _m.group(1).strip().lstrip("v")
+            except Exception:
+                pass
+        return None
+
     def check_ledfx_updates(self):
         try:
+            # Get real installed version: consts.py on disk first, API fallback if running
+            _real_ver = self._get_ledfx_exe_version()
+            if not _real_ver and self.is_ledfx_running():
+                try:
+                    _info = requests.get("http://localhost:8888/api/info", timeout=3).json()
+                    _real_ver = str(_info.get("version", "")).lstrip("v") or None
+                except Exception:
+                    pass
+            if _real_ver:
+                self.ledfx_current_ver = _real_ver
+                self.save_cache()
+
             resp = requests.get(LEDFX_RELEASES_URL, timeout=10).json()
             self.ledfx_latest_ver = resp.get("tag_name", "").replace("v", "")
             path_missing = not self.ledfx_path or not os.path.exists(self.ledfx_path)
-            needs_update = self.ledfx_latest_ver != self.ledfx_current_ver
-            if needs_update and not path_missing:
+            # Only flag an update if we actually know the real installed version
+            needs_update = bool(_real_ver) and (self._version_tuple(self.ledfx_latest_ver) > self._version_tuple(self.ledfx_current_ver))
+            if needs_update:
                 self.log(f"LedFx: installed v{self.ledfx_current_ver} → update available v{self.ledfx_latest_ver}", color="yellow700")
                 for _u in self._ledfx_update_btns:
                     _u.text = "UPDATE LEDFX"; _u.visible = True
-                self.page.update()
+                try: self.page.update()
+                except: pass
             else:
+                for _u in self._ledfx_update_btns:
+                    _u.visible = False
+                try: self.page.update()
+                except: pass
                 if path_missing:
                     self.log(f"LedFx: No path saved (latest: v{self.ledfx_latest_ver}) — use START LEDFX button, it will auto search path, prompt to install or browse to path")
-                else:
+                elif _real_ver:
                     self.log(f"LedFx: v{self.ledfx_current_ver} (up to date)")
         except: pass
 
@@ -3782,6 +3865,11 @@ class WLEDApp:
                 try: _t.update()
                 except: pass
             self.log("[Scene] Switched to WLED scenes", color="cyan")
+            # Release all LedFx-controlled devices so LedFx stops streaming and
+            # borders dim; scene restore re-activates them when switching back.
+            _to_release = list(self.live_ips) + [ip for ip in self.mh_live_ips]
+            for ip in _to_release:
+                self.toggle_live_badge(ip)
         self._rebuild_scene_rows_for_mode()
         if self._scene_mode == "wled":
             threading.Thread(target=lambda: self._restore_last_wled_scene_after_delay(delay=2.5, source="wled-toggle"), daemon=True).start()
@@ -4165,12 +4253,16 @@ class WLEDApp:
                 self.log("[Add] 'SPOTIFY.COM' card already exists", color="orange400")
 
         def _quick_add_spotify_app(_):
-            _key = "__default_spotify_app__"
+            _key = DEFAULT_SPOTIFY_APP_CARD_KEY
             _ensure_quick_custom_card(_key, "SPOTIFY APP", "Spotify.exe", _is_exe=True)
             dlg.open = False
             self.page.update()
             self.log("[Add] Spotify app quick action selected", color="cyan")
-            self._show_spotify_exe_setup_dialog(_key)
+            _found = self._find_spotify_exe_locally()
+            if _found:
+                self._set_spotify_exe_path_from_picker(_key, _found)
+            else:
+                self._show_spotify_exe_setup_dialog(_key)
 
         def _probe(_):
             val = field.value.strip()
@@ -6513,6 +6605,7 @@ class WLEDApp:
         _defaults = [
             (DEFAULT_WINAMP_CARD_KEY, "WINAMP", "winamp.exe", False, True),
             (DEFAULT_SPOTIFY_CARD_KEY, "SPOTIFY.COM", "https://open.spotify.com/", False, False),
+            (DEFAULT_SPOTIFY_APP_CARD_KEY, "SPOTIFY APP", "Spotify.exe", False, True),
         ]
 
         for _key, _name, _url, _is_local, _is_exe in _defaults:
@@ -9431,14 +9524,17 @@ class WLEDApp:
                 _v["auto_close_exit"] = False
         _raw_default_meta = c.get("default_custom_cards_meta", {})
         self._default_custom_cards_meta = {
-            DEFAULT_WINAMP_CARD_KEY: {"auto_created": False, "user_deleted": False},
+            DEFAULT_WINAMP_CARD_KEY: {"auto_created": False, "user_deleted": False, "path_scanned": False},
             DEFAULT_SPOTIFY_CARD_KEY: {"auto_created": False, "user_deleted": False},
+            DEFAULT_SPOTIFY_APP_CARD_KEY: {"auto_created": False, "user_deleted": False, "path_scanned": False},
         }
         if isinstance(_raw_default_meta, dict):
-            for _k in (DEFAULT_WINAMP_CARD_KEY, DEFAULT_SPOTIFY_CARD_KEY):
+            for _k in (DEFAULT_WINAMP_CARD_KEY, DEFAULT_SPOTIFY_CARD_KEY, DEFAULT_SPOTIFY_APP_CARD_KEY):
                 _v = _raw_default_meta.get(_k, {}) if isinstance(_raw_default_meta.get(_k, {}), dict) else {}
                 self._default_custom_cards_meta[_k]["auto_created"] = bool(_v.get("auto_created", False))
                 self._default_custom_cards_meta[_k]["user_deleted"] = bool(_v.get("user_deleted", False))
+                if _k in (DEFAULT_WINAMP_CARD_KEY, DEFAULT_SPOTIFY_APP_CARD_KEY):
+                    self._default_custom_cards_meta[_k]["path_scanned"] = bool(_v.get("path_scanned", False))
         self.card_ids = c.get("card_ids", {})
         self.card_id_to_ip = {cid: ip for ip, cid in self.card_ids.items()}
         self.device_macs = c.get("device_macs", {})
