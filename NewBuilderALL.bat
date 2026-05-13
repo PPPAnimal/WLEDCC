@@ -11,7 +11,7 @@ pip install requests
 pip install zeroconf
 
 echo Building executables...
-pyinstaller WLEDCCALL.spec
+pyinstaller --noconfirm WLEDCCALL.spec
 "D:\Program Files\Inno Setup 7\ISCC.exe" /DMyAppVersion=%VERSION% WLEDCC_setupALL.iss
 
 pause

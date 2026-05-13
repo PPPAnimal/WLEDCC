@@ -557,8 +557,6 @@ _MODE_HIERARCHY = [
             {"key": "mirror",   "label": "Recursive Mirror",       "base_layers": _HALLU_BASE_LAYERS},
             {"key": "chroma",   "label": "Chromatic Aberration",   "base_layers": _HALLU_BASE_LAYERS},
             {"key": "perlin",   "label": "Perlin Flow Fields",     "base_layers": _HALLU_BASE_LAYERS},
-            {"key": "slitscan", "label": "Slit-Scan / Time-Smear", "base_layers": _HALLU_BASE_LAYERS},
-            {"key": "reaction", "label": "Reaction-Diffusion",     "base_layers": _HALLU_BASE_LAYERS},
             {"key": "morph",    "label": "Geometry Morphing",      "base_layers": _HALLU_BASE_LAYERS},
         ],
     },
@@ -748,7 +746,8 @@ class SpectrumController:
         self._spec_selected_source  = None
         self._spec_profiles         = {}
         self._spec_source_changed   = False
-        self._config_dirty          = False
+        self._config_dirty               = False
+        self._sa_session_backup_written  = False
         self._menu_open             = False
         self._settings_save_btn     = None
         self._settings_dirty_label  = None
@@ -780,12 +779,10 @@ class SpectrumController:
             "mirror":   {"zoom": 0.85,   "rotDeg": 10.0,   "opacity": 1.0,    "beat_sens": 2.0,  "dim_thresh": 0.25},
             "chroma":   {"maxSplit": 14, "trail": 0.18},
             "perlin":   {"noiseScale": 0.012, "evolveRate": 0.30},
-            "slitscan": {"scanSpeed": 1.0},
-            "reaction": {"feed": 0.0367, "kill": 0.0649},
             "morph":    {"layers": 3, "jitter": 1.0},
         }
         self._spec_hallu_base_kind             = "waveform"
-        self._spec_hallu_random_cycle_choices  = ["mirror","chroma","perlin","slitscan","reaction","morph"]
+        self._spec_hallu_random_cycle_choices  = ["mirror","chroma","perlin","morph"]
         self._spec_hallu_random_cycle_seconds  = 60.0
         self._spec_hallu_random_current        = "mirror"
         self._spec_hallu_random_next_ts        = time.monotonic() + 60.0
@@ -995,7 +992,7 @@ class SpectrumController:
         )
 
         # ── Hallucination dropdown state (needed to compute config path) ─────
-        _valid_sub = ("mirror","chroma","perlin","slitscan","reaction","morph")
+        _valid_sub = ("mirror","chroma","perlin","morph")
         _hs = str(c.get("spec_hallu_submode", "mirror")).lower()
         self._spec_hallu_submode = "mirror" if _hs == "random" else (_hs if _hs in _valid_sub else "mirror")
         _hbk = str(c.get("spec_hallu_base_kind", "waveform")).lower()
@@ -1117,6 +1114,19 @@ class SpectrumController:
             }
             if win_pos:
                 c.update(win_pos)
+            if not self._sa_session_backup_written:
+                _ts  = time.strftime("%Y%m%d_%H%M%S")
+                _bak = os.path.join(_DATA_DIR, f"SA-config_backup_{_ts}.json")
+                try:
+                    with open(_bak, "w", encoding="utf-8") as _bf:
+                        json.dump(c, _bf, indent=2)
+                    self._sa_session_backup_written = True
+                    _existing = sorted(glob.glob(os.path.join(_DATA_DIR, "SA-config_backup_*.json")))
+                    while len(_existing) > 5:
+                        try: os.remove(_existing.pop(0))
+                        except: pass
+                except Exception:
+                    pass
             with open(SA_CONFIG_FILE, "w", encoding="utf-8") as f:
                 json.dump(c, f, indent=2)
             self._config_dirty = False
@@ -1307,8 +1317,6 @@ class SpectrumController:
                 "mirror":   {"zoom": 0.85,   "rotDeg": 10.0,   "opacity": 1.0,    "beat_sens": 2.0,  "dim_thresh": 0.25},
                 "chroma":   {"maxSplit": 14, "trail": 0.18},
                 "perlin":   {"noiseScale": 0.012, "evolveRate": 0.30},
-                "slitscan": {"scanSpeed": 1.0},
-                "reaction": {"feed": 0.0367, "kill": 0.0649},
                 "morph":    {"layers": 3, "jitter": 1.0},
             }
             _params = _x.get("params", {})
@@ -1414,7 +1422,7 @@ class SpectrumController:
             width=self._spec_box_grid_size[0],
             height=self._spec_box_grid_size[1],
             content=self._spec_grid_content,
-            tooltip="Click to open settings",
+            tooltip=ft.Tooltip(message="Click to open settings", prefer_below=False, wait_duration=700),
             ink=True,
             on_click=self._open_spectrum_source_selector,
         )
@@ -2467,7 +2475,7 @@ class SpectrumController:
         # ── Hallucination sub-mode dropdown ──────────────────────────────
         def on_hallu_submode_change(e):
             _sub = str(e.control.value or "mirror").lower()
-            _valid = ("mirror", "chroma", "perlin", "slitscan", "reaction", "morph")
+            _valid = ("mirror", "chroma", "perlin", "morph")
             self._capture_per_mode_settings("hallucination")
             self._spec_hallu_submode = _sub if _sub in _valid else "mirror"
             self._spec_hallu_prev_frame = None
@@ -2492,9 +2500,7 @@ class SpectrumController:
             ft.dropdown.Option("mirror",   "1. Recursive Mirror"),
             ft.dropdown.Option("chroma",   "2. Chromatic Aberration"),
             ft.dropdown.Option("perlin",   "3. Perlin Flow Fields"),
-            ft.dropdown.Option("slitscan", "4. Slit-Scan / Time-Smear"),
-            ft.dropdown.Option("reaction", "5. Reaction-Diffusion"),
-            ft.dropdown.Option("morph",    "6. Geometry Morphing"),
+            ft.dropdown.Option("morph",    "4. Geometry Morphing"),
         ]
         _valid_dd_sub = [o.key for o in _hallu_options]
         _hallu_dd_val = self._spec_hallu_submode if self._spec_hallu_submode in _valid_dd_sub else "mirror"
@@ -5119,8 +5125,6 @@ class SpectrumController:
             "mirror":   self._hallu_mirror,
             "chroma":   self._hallu_chroma,
             "perlin":   self._hallu_perlin,
-            "slitscan": self._hallu_slitscan,
-            "reaction": self._hallu_reaction,
             "morph":    self._hallu_morph,
         }.get(sub, self._hallu_mirror)
         try:
@@ -5769,95 +5773,6 @@ class SpectrumController:
             draw.ellipse([ix - r_px, iy - r_px, ix + r_px, iy + r_px], fill=col)
         return canvas
 
-    def _hallu_slitscan(self, W, H, bass, mid, treble, beat, peak, p):
-        """Slit-scan: copy fresh rows into the persistent canvas one at a time."""
-        try:
-            import numpy as np
-            fresh = np.array(self._draw_hallu_base(W, H, bass, mid, treble))
-            canvas = np.array(self._spec_hallu_prev_frame.copy())
-            scan = self._spec_hallu_aux.get("scan", 0)
-            step = max(1, int(float(p.get("scanSpeed", 1.0)) * (1 + bass * 7 + (3 if beat else 0))))
-            for s in range(step):
-                y = (scan + s) % H
-                canvas[y, :, :] = fresh[y, :, :]
-            self._spec_hallu_aux["scan"] = (scan + step) % H
-            return _PILImage.fromarray(canvas)
-        except ImportError:
-            return self._draw_hallu_base(W, H, bass, mid, treble)
-
-    def _hallu_reaction(self, W, H, bass, mid, treble, beat, peak, p):
-        """Gray-Scott reaction-diffusion."""
-        try:
-            import numpy as np
-        except ImportError:
-            return self._draw_hallu_base(W, H, bass, mid, treble)
-
-        gw = max(4, W // 3)
-        gh = max(4, H // 3)
-        feed = float(p.get("feed", 0.0367))
-        kill = float(p.get("kill", 0.0649))
-
-        aux = self._spec_hallu_aux
-        A = aux.get("A")
-        if A is None or A.shape != (gh, gw):
-            A = np.ones((gh, gw), dtype=np.float32)
-            B = np.zeros((gh, gw), dtype=np.float32)
-            for _ in range(5):
-                _sy = random.randint(2, gh - 3)
-                _sx = random.randint(2, gw - 3)
-                B[_sy-2:_sy+2, _sx-2:_sx+2] = 1.0
-            aux["A"] = A; aux["B"] = B
-        B = aux["B"]
-
-        if beat or bass > 0.45:
-            n_blobs = random.randint(2, 6) + (3 if beat else 0)
-            for _ in range(n_blobs):
-                bx = random.randint(2, gw - 3)
-                by = random.randint(2, gh - 3)
-                rb = random.randint(2, 5)
-                ys = slice(max(0, by-rb), min(gh, by+rb))
-                xs = slice(max(0, bx-rb), min(gw, bx+rb))
-                B[ys, xs] = np.maximum(B[ys, xs], 0.85 + np.random.rand(*B[ys, xs].shape) * 0.15)
-                A[ys, xs] = np.minimum(A[ys, xs], 0.15)
-
-        if treble > 0.2:
-            n_dust = int(treble * 12)
-            ys = np.random.randint(0, gh, n_dust)
-            xs = np.random.randint(0, gw, n_dust)
-            B[ys, xs] = np.maximum(B[ys, xs], 0.5 + treble * 0.4)
-
-        for _ in range(6):
-            lapA = (np.roll(A,1,0)+np.roll(A,-1,0)+np.roll(A,1,1)+np.roll(A,-1,1) - 4*A)
-            lapB = (np.roll(B,1,0)+np.roll(B,-1,0)+np.roll(B,1,1)+np.roll(B,-1,1) - 4*B)
-            ab2 = A * B * B
-            A = np.clip(A + 1.0*lapA - ab2 + feed*(1.0-A), 0, 1)
-            B = np.clip(B + 0.5*lapB + ab2 - (kill+feed)*B, 0, 1)
-        aux["A"] = A; aux["B"] = B
-
-        # Upscale B to canvas and colorize using vectorized HSV
-        h_val = self._spec_display_hue
-        B_up = np.repeat(np.repeat(B, 3, axis=0)[:H, :], 3, axis=1)[:H, :W]
-        if B_up.shape != (H, W):
-            padded = np.zeros((H, W), dtype=np.float32)
-            padded[:B_up.shape[0], :B_up.shape[1]] = B_up
-            B_up = padded
-
-        hues = (h_val + B_up * 0.33) % 1.0
-        sat  = np.full_like(B_up, 0.85)
-        val  = 0.10 + B_up * 0.55
-
-        h6 = hues * 6.0
-        hi = h6.astype(np.int32) % 6
-        f  = h6 - h6.astype(np.int32)
-        pv = val * (1 - sat);  qv = val * (1 - f*sat);  tv = val * (1 - (1-f)*sat)
-        ch = [val, qv, pv, pv, tv, val]
-        cg = [tv,  val, val, qv, pv, pv]
-        cb = [pv,  pv,  tv,  val, val, qv]
-        R = np.choose(hi, ch); G = np.choose(hi, cg); Bl = np.choose(hi, cb)
-        rgba = np.stack([(R*255).astype(np.uint8), (G*255).astype(np.uint8),
-                        (Bl*255).astype(np.uint8), np.full((H,W),255,dtype=np.uint8)], axis=-1)
-        return _PILImage.fromarray(rgba)
-
     def _hallu_morph(self, W, H, bass, mid, treble, beat, peak, p):
         """Geometry morphing: layered polygon rings with audio-driven vertex jitter."""
         aux = self._spec_hallu_aux
@@ -6381,14 +6296,17 @@ class SpectrumApp:
                 icon=ft.Icons.LOCK if _ar_locked else ft.Icons.LOCK_OPEN,
                 icon_size=11,
                 icon_color="#00c8ff" if _ar_locked else "#555555",
-                tooltip=("Auto aspect ratio ON — click to allow free resize"
-                        if _ar_locked else
-                        "Free resize ON — click to lock aspect ratio"),
+                tooltip=ft.Tooltip(
+                    message=("Auto aspect ratio ON — click to allow free resize"
+                            if _ar_locked else
+                            "Free resize ON — click to lock aspect ratio"),
+                    prefer_below=False,
+                ),
                 style=_ar_style,
                 on_click=self._toggle_aspect_lock,
             ),
             right=3, bottom=3,
-            opacity=0.75,
+            opacity=0.0,
         )
         # Wrapping Container captures hover for the whole SA area. Moving from
         # the display onto a button stays inside the container, so on_hover
@@ -6399,7 +6317,7 @@ class SpectrumApp:
                 self._aspect_btn],
                 expand=True,
             ),
-            on_hover=self._sc._on_sa_hover,
+            on_hover=self._on_sa_area_hover,
             expand=True,
         )
         self._root = ft.Column([
@@ -6597,6 +6515,14 @@ class SpectrumApp:
         except Exception:
             pass
 
+    def _on_sa_area_hover(self, e):
+        self._sc._on_sa_hover(e)
+        try:
+            self._aspect_btn.opacity = 1.0 if e.data else 0.0
+            self._aspect_btn.update()
+        except Exception:
+            pass
+
     def _toggle_aspect_lock(self, _=None):
         self._aspect_lock = not self._aspect_lock
         self._sc._aspect_lock = self._aspect_lock
@@ -6604,11 +6530,11 @@ class SpectrumApp:
         if self._aspect_lock:
             btn.icon       = ft.Icons.LOCK
             btn.icon_color = "#00c8ff"
-            btn.tooltip    = "Auto aspect ratio ON — click to allow free resize"
+            btn.tooltip    = ft.Tooltip(message="Auto aspect ratio ON — click to allow free resize", prefer_below=False)
         else:
             btn.icon       = ft.Icons.LOCK_OPEN
             btn.icon_color = "#555555"
-            btn.tooltip    = "Free resize ON — click to lock aspect ratio"
+            btn.tooltip    = ft.Tooltip(message="Free resize ON — click to lock aspect ratio", prefer_below=False)
         try:   self._aspect_btn.update()
         except Exception: pass
         if self._aspect_lock:

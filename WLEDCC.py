@@ -864,6 +864,13 @@ class WLEDApp:
         except Exception as ex:
             self.log(f"[Log] Could not open folder: {ex}", color="red400")
 
+    def open_app_folder(self, e):
+        """Open the program directory in Windows Explorer."""
+        try:
+            os.startfile(_VERSION_DIR)
+        except Exception as ex:
+            self.log(f"[App] Could not open program folder: {ex}", color="red400")
+
     def _open_log(self):
         if not self.log_container.visible:
             self.log_container.visible = True
@@ -899,19 +906,22 @@ class WLEDApp:
                 _was_running = False
             _first_check = False
             _txt = "STOP LEDFX" if is_running else "START LEDFX"
-            _bg  = "red800"   if is_running else "purple700"
+            _grad_colors = ["#c62828", "#4a0000"] if is_running else ["#8e24aa", "#4a148c"]
             if not self._ledfx_launching:  # dont overwrite STARTING... text
                 for _bt in self._ledfx_btn_texts:
                     _bt.value = _txt
-                for _b in self._ledfx_btns:
-                    _b.bgcolor = _bg
+                for _bc in self._ledfx_btn_conts:
+                    _bc.gradient = ft.LinearGradient(
+                        begin=ft.Alignment.TOP_CENTER, end=ft.Alignment.BOTTOM_CENTER,
+                        colors=_grad_colors,
+                    )
                 for _u in self._ledfx_ui_btns:
                     _u.visible = is_running
                 for _t in self._scene_toggle_btns:
                     _t.visible = is_running
                 if self.running:
-                    for _b in self._ledfx_btns:
-                        try: _b.update()
+                    for _bc in self._ledfx_btn_conts:
+                        try: _bc.update()
                         except: pass
                     for _u in self._ledfx_ui_btns:
                         try: _u.update()
@@ -2154,8 +2164,13 @@ class WLEDApp:
         for _bt in self._ledfx_btn_texts:
             _bt.value = "STARTING..."
         for _b in self._ledfx_btns:
-            _b.disabled = True; _b.bgcolor = "orange800"
-            try: _b.update()
+            _b.on_tap = None
+        for _bc in self._ledfx_btn_conts:
+            _bc.gradient = ft.LinearGradient(
+                begin=ft.Alignment.TOP_CENTER, end=ft.Alignment.BOTTOM_CENTER,
+                colors=["#e65100", "#bf360c"],
+            )
+            try: _bc.update()
             except: pass
         self.log("[LedFx] Launching background process...")
 
@@ -2170,8 +2185,8 @@ class WLEDApp:
                 remaining = 30 - i
                 for _bt in self._ledfx_btn_texts:
                     _bt.value = f"STARTING... ({remaining}s)"
-                for _b in self._ledfx_btns:
-                    try: _b.update()
+                for _bc in self._ledfx_btn_conts:
+                    try: _bc.update()
                     except: pass
                 try:
                     requests.get("http://localhost:8888", timeout=1)
@@ -2186,8 +2201,13 @@ class WLEDApp:
             for _bt in self._ledfx_btn_texts:
                 _bt.value = "STOP LEDFX"
             for _b in self._ledfx_btns:
-                _b.bgcolor = "red800"; _b.disabled = False
-                try: _b.update()
+                _b.on_tap = self.toggle_ledfx
+            for _bc in self._ledfx_btn_conts:
+                _bc.gradient = ft.LinearGradient(
+                    begin=ft.Alignment.TOP_CENTER, end=ft.Alignment.BOTTOM_CENTER,
+                    colors=["#c62828", "#4a0000"],
+                )
+                try: _bc.update()
                 except: pass
 
         threading.Thread(target=_start, daemon=True).start()
@@ -3006,32 +3026,43 @@ class WLEDApp:
             height=self._log_height, bgcolor="#050507", border_radius=6,
             border=ft.Border.all(1, "#2b2b3b"), padding=6,
         )
+        _lbs = ft.ButtonStyle(
+            bgcolor="#1a1a28",
+            padding=ft.Padding.symmetric(horizontal=7, vertical=3),
+            shape=ft.RoundedRectangleBorder(radius=4),
+        )
         self.autoscroll_btn = ft.TextButton(
             content=ft.Text("AUTO-SCROLL: ON", size=9, color="cyan", weight="bold"),
             on_click=self.toggle_autoscroll,
-            style=ft.ButtonStyle(padding=ft.Padding.symmetric(horizontal=6, vertical=2))
+            style=_lbs,
         )
         self.copy_log_btn = ft.TextButton(
             content=ft.Text("COPY LOG", size=9, color="grey400", weight="bold"),
             on_click=self.copy_log,
-            style=ft.ButtonStyle(padding=ft.Padding.symmetric(horizontal=6, vertical=2))
+            style=_lbs,
         )
         self.clear_log_btn = ft.TextButton(
             content=ft.Text("CLEAR LOG", size=9, color="grey400", weight="bold"),
             on_click=self.clear_log,
-            style=ft.ButtonStyle(padding=ft.Padding.symmetric(horizontal=6, vertical=2))
+            style=_lbs,
         )
         self.open_folder_btn = ft.TextButton(
-            content=ft.Text("OPEN FOLDER", size=9, color="grey400", weight="bold"),
+            content=ft.Text("LOG FOLDER", size=9, color="grey400", weight="bold"),
             on_click=self.open_log_folder,
-            tooltip=f"Open data folder in Explorer:\n{LOG_DIR}",
-            style=ft.ButtonStyle(padding=ft.Padding.symmetric(horizontal=6, vertical=2))
+            tooltip=f"Open log/data folder in Explorer:\n{LOG_DIR}",
+            style=_lbs,
+        )
+        self.app_folder_btn = ft.TextButton(
+            content=ft.Text("APP FOLDER", size=9, color="grey400", weight="bold"),
+            on_click=self.open_app_folder,
+            tooltip=f"Open program directory in Explorer:\n{_VERSION_DIR}",
+            style=_lbs,
         )
         self._debug_btn_text = ft.Text("DEBUG: OFF", size=9, color="grey400", weight="bold")
         self.debug_btn = ft.TextButton(
             content=self._debug_btn_text,
             on_click=self.toggle_debug,
-            style=ft.ButtonStyle(padding=ft.Padding.symmetric(horizontal=6, vertical=2))
+            style=_lbs,
         )
         self.debug_on_open_cb = ft.Checkbox(
             label="DBG on open",
@@ -3100,7 +3131,7 @@ class WLEDApp:
         self.log_container = ft.Container(
             content=ft.Column([
                 ft.Row([
-                    ft.Row([ft.Text("DEBUG CONSOLE", size=10, weight="bold", color="grey600"), self.autoscroll_btn, self.copy_log_btn, self.clear_log_btn, self.open_folder_btn, self.debug_btn, self.log_options_btn], spacing=6, vertical_alignment=ft.CrossAxisAlignment.CENTER),
+                    ft.Row([ft.Text("DEBUG CONSOLE", size=10, weight="bold", color="grey600"), self.autoscroll_btn, self.copy_log_btn, self.clear_log_btn, self.open_folder_btn, self.app_folder_btn, self.debug_btn, self.log_options_btn], spacing=6, vertical_alignment=ft.CrossAxisAlignment.CENTER),
                     ft.IconButton(ft.Icons.CLOSE, icon_size=14, on_click=self.toggle_logs)
                 ], alignment="spaceBetween"),
                 ft.Row([self.log_scroll_container], expand=True),
@@ -3127,8 +3158,26 @@ class WLEDApp:
         # Use child ft.Text refs so .value updates from background threads repaint correctly
         self._ledfx_btn_text_wide   = ft.Text("START LEDFX", color="white")
         self._ledfx_btn_text_narrow = ft.Text("START LEDFX", color="white")
-        self.ledfx_btn_wide   = ft.Button(content=ft.Row([ft.Icon(ft.Icons.EQUALIZER, color="white"), self._ledfx_btn_text_wide],  spacing=4, tight=True), bgcolor="purple700", on_click=self.toggle_ledfx, height=36)
-        self.ledfx_btn_narrow = ft.Button(content=ft.Row([ft.Icon(ft.Icons.EQUALIZER, color="white"), self._ledfx_btn_text_narrow], spacing=4, tight=True), bgcolor="purple700", on_click=self.toggle_ledfx, height=36)
+        _ledfx_grad_start = ft.LinearGradient(begin=ft.Alignment.TOP_CENTER, end=ft.Alignment.BOTTOM_CENTER, colors=["#8e24aa", "#4a148c"])
+        self._ledfx_btn_cont_wide = ft.Container(
+            height=36, border_radius=6, ink=True, alignment=ft.Alignment.CENTER,
+            padding=ft.Padding.symmetric(horizontal=14), gradient=_ledfx_grad_start,
+            content=ft.Row([ft.Icon(ft.Icons.EQUALIZER, color="white"), self._ledfx_btn_text_wide], spacing=4, tight=True),
+        )
+        self.ledfx_btn_wide = ft.GestureDetector(
+            on_tap=self.toggle_ledfx, mouse_cursor=ft.MouseCursor.CLICK,
+            content=self._ledfx_btn_cont_wide,
+        )
+        self._ledfx_btn_cont_narrow = ft.Container(
+            height=36, border_radius=6, ink=True, alignment=ft.Alignment.CENTER,
+            padding=ft.Padding.symmetric(horizontal=14),
+            gradient=ft.LinearGradient(begin=ft.Alignment.TOP_CENTER, end=ft.Alignment.BOTTOM_CENTER, colors=["#8e24aa", "#4a148c"]),
+            content=ft.Row([ft.Icon(ft.Icons.EQUALIZER, color="white"), self._ledfx_btn_text_narrow], spacing=4, tight=True),
+        )
+        self.ledfx_btn_narrow = ft.GestureDetector(
+            on_tap=self.toggle_ledfx, mouse_cursor=ft.MouseCursor.CLICK,
+            content=self._ledfx_btn_cont_narrow,
+        )
         self.ledfx_ui_btn_wide   = ft.Button(content=ft.Row([ft.Icon(ft.Icons.OPEN_IN_BROWSER, color="white"), ft.Text("LEDFX UI", color="white")], spacing=4, tight=True), bgcolor="purple900", visible=False, on_click=lambda _: webbrowser.open_new_tab("http://localhost:8888/#/devices"), height=36)
         self.ledfx_ui_btn_narrow = ft.Button(content=ft.Row([ft.Icon(ft.Icons.OPEN_IN_BROWSER, color="white"), ft.Text("LEDFX UI", color="white")], spacing=4, tight=True), bgcolor="purple900", visible=False, on_click=lambda _: webbrowser.open_new_tab("http://localhost:8888/#/devices"), height=36)
         self._scene_toggle_text_wide   = ft.Text("LEDFX SCENES", color="white")
@@ -3158,6 +3207,7 @@ class WLEDApp:
         )
         # Convenience lists for broadcasting state to both layouts at once
         self._ledfx_btns        = [self.ledfx_btn_wide,          self.ledfx_btn_narrow]
+        self._ledfx_btn_conts   = [self._ledfx_btn_cont_wide,    self._ledfx_btn_cont_narrow]
         self._ledfx_btn_texts   = [self._ledfx_btn_text_wide,    self._ledfx_btn_text_narrow]
         self._ledfx_ui_btns     = [self.ledfx_ui_btn_wide,       self.ledfx_ui_btn_narrow]
         self._scene_toggle_btns = [self.scene_toggle_btn_wide,   self.scene_toggle_btn_narrow]
@@ -3369,8 +3419,34 @@ class WLEDApp:
         self._slider_actual_width = 999  # estimated in _should_use_narrow from window width
 
         # Controls that are truly shared (buttons, not rendered in the tree twice simultaneously)
-        _all_off  = ft.Button("ALL OFF", on_click=lambda _: self.broadcast_power(False), bgcolor="red900", color="white", height=36)
-        _all_on   = ft.Button("ALL ON",  on_click=lambda _: self.broadcast_power(True),  bgcolor="green900", color="white", height=36)
+        _all_off = ft.GestureDetector(
+            on_tap=lambda _: self.broadcast_power(False),
+            mouse_cursor=ft.MouseCursor.CLICK,
+            content=ft.Container(
+                height=36, border_radius=6, ink=True,
+                alignment=ft.Alignment.CENTER,
+                padding=ft.Padding.symmetric(horizontal=14),
+                gradient=ft.LinearGradient(
+                    begin=ft.Alignment.TOP_CENTER, end=ft.Alignment.BOTTOM_CENTER,
+                    colors=["#c62828", "#4a0000"],
+                ),
+                content=ft.Text("ALL OFF", size=12, weight="bold", color="white"),
+            ),
+        )
+        _all_on = ft.GestureDetector(
+            on_tap=lambda _: self.broadcast_power(True),
+            mouse_cursor=ft.MouseCursor.CLICK,
+            content=ft.Container(
+                height=36, border_radius=6, ink=True,
+                alignment=ft.Alignment.CENTER,
+                padding=ft.Padding.symmetric(horizontal=14),
+                gradient=ft.LinearGradient(
+                    begin=ft.Alignment.TOP_CENTER, end=ft.Alignment.BOTTOM_CENTER,
+                    colors=["#2e7d32", "#0d3312"],
+                ),
+                content=ft.Text("ALL ON", size=12, weight="bold", color="white"),
+            ),
+        )
         _log_btn  = ft.TextButton(
             content=ft.Row([ft.Icon(ft.Icons.TERMINAL, size=16, color="grey400"), ft.Text("OPEN LOG", size=10, color="grey400")], spacing=4, tight=True),
             on_click=self.toggle_logs, style=ft.ButtonStyle(padding=ft.Padding.symmetric(horizontal=8, vertical=6)))
@@ -8369,14 +8445,14 @@ class WLEDApp:
                     c["glow"].border = ft.Border.all(2, _c)
                     _any = True
 
+            _dirty = []
+
             if _any:
                 self._list_update_needed = False
-                try: self.device_list.update()
-                except: pass
+                _dirty.append(self.device_list)
             elif self._list_update_needed:
                 self._list_update_needed = False
-                try: self.device_list.update()
-                except: pass
+                _dirty.append(self.device_list)
 
             # Animate active scene button border
             active = self.active_scene_idx
@@ -8385,7 +8461,7 @@ class WLEDApp:
                 for ref, _ in self.scene_btn_refs[active]:
                     try:
                         ref.border = ft.Border.all(1, _sc)
-                        ref.update()
+                        _dirty.append(ref)
                     except: pass
 
             # Animate active LedFx scene button border
@@ -8395,10 +8471,8 @@ class WLEDApp:
                 for ref, _nt in self.ledfx_scene_btn_refs[led_active]:
                     try:
                         ref.border = ft.Border.all(1, _sc)
-                        ref.update()
-                    except:
-                        pass
-
+                        _dirty.append(ref)
+                    except: pass
 
             # ── Title animation ───────────────────────────────────────────────
             if hasattr(self, "_title_chars"):
@@ -8442,9 +8516,16 @@ class WLEDApp:
                     for _tc in self._title_chars:
                         _tc.color = _c
                 if _title_dirty:
-                    try:
-                        self.header.update()
-                    except: pass
+                    _dirty.append(self.header)
+
+            if _dirty:
+                _batch = list(_dirty)
+                async def _flush(_b=_batch):
+                    for ctrl in _b:
+                        try: ctrl.update()
+                        except: pass
+                self.page.run_task(_flush)
+
             time.sleep(0.1)
 
     def _launch_sa(self, _=None):
