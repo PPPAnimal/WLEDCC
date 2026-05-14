@@ -2866,6 +2866,31 @@ class WLEDApp:
                 prev = l.rstrip()
             return controls
 
+        def _load_manual():
+            path = os.path.join(_VERSION_DIR, "Manual.txt")
+            controls = []
+            try:
+                file_lines = open(path, encoding="utf-8").read().splitlines()
+            except FileNotFoundError:
+                return [ft.Text("Manual not found.", color="grey300")]
+            sec_title, sec_color, sec_lines = None, "#00f2ff", []
+            def flush():
+                if sec_title is not None:
+                    controls.extend(_section(sec_title, sec_color, *sec_lines))
+            for raw in file_lines:
+                if raw.startswith("## "):
+                    flush(); sec_lines = []
+                    parts = raw[3:].split(" | ", 1)
+                    sec_title = parts[0].strip()
+                    sec_color = parts[1].strip() if len(parts) > 1 else "#00f2ff"
+                elif raw.strip() == "---":
+                    flush(); sec_title = None; sec_lines = []
+                    controls.append(ft.Divider())
+                elif sec_title is not None:
+                    sec_lines.append(raw)
+            flush()
+            return controls
+
         manual_content = ft.Column(
             scroll=ft.ScrollMode.AUTO,
             width=520,
@@ -2880,206 +2905,13 @@ class WLEDApp:
                     style=ft.ButtonStyle(padding=ft.Padding.only(top=0, bottom=0)),
                 ),
                 ft.Divider(),
-
-                *_section("NEW FEATURES Added in V4.7.0", "#ff9800",
-                    "Added Music Reactive support for Magic Home Devices, not supported in LEDFX",
-                    "If Magic Home devices exist, and LEDFX running, WLEDCC automatically creates a MHBridge device registration in LEDFX.",
-                    "MHBridge is set to one pixel, and streams its effect data to WLEDCC.",  
-                    "WLEDCC then converts this to Magic Home codes and streams that to the controllers.",
-                    "Set this MHBridge Device to any LEDFX effect giving MagicHome devices music reactive effect support not found native in LEDFX.",
-                    "",
-                    "Full Debug logs are always written to file now, even if debug mode is turned off for console window.",
-                    "",
-                    "Added STAR WARS idle effect.",
-                    "",
-                    "Added Many new VU meters and ability to make your own custom ones.",
-                    "",
-                    "Added timer so both VU meters and Idle effects can be controlled separately.",
-                    "",                   
+                ft.TextButton(
+                    content=ft.Text("Release Notes / Changelog ↗", size=10, color="grey500"),
+                    on_click=lambda _: os.startfile(os.path.join(_VERSION_DIR, "CHANGELOG.md")),
+                    tooltip="Open full changelog",
+                    style=ft.ButtonStyle(padding=ft.Padding.only(top=0, bottom=4)),
                 ),
-
-                *_section("WHAT IS THIS PROGRAM?", "#00f2ff",
-                    "WLED COMMAND CENTER+ lets you control all your WLED, LEDFX, MagicHome, and",
-                    "custom devices from one place. Control Winamp/Spotify while chilling to a",
-                    "30 band Spectrum Analyzer and L/R VU meter.  Devices are auto-discovered on startup.",
-                    "It checks for new firmware for all your Devices and provides one click ",
-                    "automatic installs.  All settings, names, scenes and card order are saved",
-					"and restored between sessions.  Reboot slow devices, Sanitize Presets,",
-					"record/play presets/scenes for WLED and LEDFX.  Access WLED and LEDFX",
-					"WED UI's right from inside this program.  Make custom Cards for your",
-					"favorite WEB SITES, Program EXE's, etc and all from one screen.",
-                    "Setup automatic actions — like starting/stopping LEDFX or turning lights on/off. ",
-                    "Even Auto start and close for your favorite music apps or WEB SITES ",
-                    "with custom CARDS on the main screen including Pre/Play/Pause/Next controls.",
-					"Truely a ALL-IN-ONE Control Center for your music room.",
-                ),
-				
-                *_section("SA AND VU METERS", "cyan",
-                    "MIC ICON - click to turn ON/OFF.",
-					"HAMBURGER ICON - Open Spectrum Analyzer Settings.",
-                    "Control FPS, Reactivity, select Meter to show and more.",
-					"Some meter modes allow custom backgrounds.  Select them from dropdown below.",
-					"You can even put your own jpg image files in app folder and load those.",
-					"CUSTOM VU - this mode only shows needles but allows you to load jpg for BG image.",
-                    "Set meters to be fixed, or change randomly when song ends or timer 1 min.",
-				),	
-
-				*_section("APP NAME BAR", "cyan",
-                    "SLIDERS - Use to control SPEED or BRIGHTNESS for APP NAME and CARDS.",
-					"LEFT CONTROLS - APP NAME.", \
-                    "RIGHT CONTROLS - Device CARDS.",
-					"COLOR PICKERS - changes color for solid or breathing effects.",
-					"EFFECT PICKERS - changes effects - rainbow, solid, wave, etc.",
-					"SCAN — Refreshes device status and looks for newly found devices.",
-                    "Use this after a router reboot or when a device changes IP.",
-				),	
-
-                *_section("TOP BAR — GLOBAL CONTROLS", "cyan",
-                    "ALL OFF / ALL ON — One-click control to toggle every light in the house.",
-                    "OPEN LOG — Opens a message panel at the TOP of the app.",
-					"AUTO-SCROLL ON/OFF keeps window focused on recent messages.",
-                    "COPY LOG copies the text.",
-					"CLEAR LOG clears the messages.",
-					"only clears the screen, logs still saved to file.",
-					"OPEN FOLDER opens to saved logs and config folder.",
-                    "DEBUG ON/OFF shows extra troubleshooting details.",
-					"DBG / AUTO OPEN check boxs to have log auto open in DEBUG mode.",
-					"CLOSE LOG hides this window.",
-					"While window is open, use grab bar botton center to size it.",
-					"MANUAL — Opens this guide.",
-                    "MERGE — attempts to fix duplicate cards.  Use this if device appears twice.",
-					"keeps ID so device is linked to scenes/presets still.  (WIP).",
-                    "click MERGE, then drag the new card onto the old one.",
-                    "Click MERGE again to cancel.",
-                    "MASTER BRIGHTNESS — Dim or brighten all lights at once while keeping",
-					"their brightness levels relative to each other. (WIP).",
-                    "SCENES — Your saved scene buttons live here. See SCENES below.",
-                    "START LEDFX / STOP LEDFX — Starts or stops LedFx service.",
-					"Prompts for INSTALL/UPDATE/BROWSE for path if not found.",
-                    "LEDFX UI — Opens the LedFx web UI when LedFx is running.",
-                ),
-
-                *_section("DEVICE CARDS", "cyan",
-                    "Each device gets its own card showing name, type badge, IP,",
-                    "firmware version, chip type, WiFi signal, current effect and more.",
-                    "Cards glow rainbow when on, dim when off, red when offline.",
-                    "WLED cards show a cyan WLED badge. Click it to open WLED's WEB UI.",
-					"MAGICHOME cards show a green MH badge.",
-                    "DRAG HANDLE (⠿) — Left edge of card. Drag to reorder.",
-                    "MERGE mode, dropping onto another card offers Reorder or Merge.",
-                    "RENAME — Pencil icon. Give the device a friendly name.",
-                    "REMOVE — Red X removes a dead or unwanted card. If the device",
-                    "is still on the network it will reappear automatically on next scan.",
-                    "POWER SWITCH — Toggles device on or off.",
-                    "BRIGHTNESS SLIDER — Adjusts brightness in color mode, or controls",
-                    "effect speed in MagicHome effect mode.",
-                    "COLOR — Rainbow button opens a color picker.",
-                    "PRESET / MODES — Opens saved presets (WLED) or built-in effects (MH)",
-                ),
-
-                *_section("WLED-ONLY CONTROLS", "#00f2ff",
-                    "OPEN WEB UI — Click the WLED badge to open the full WLED web UI.",
-                    "SANITIZE — Strips brightness from saved presets so switching presets",
-                    "no longer changes your brightness unexpectedly.",
-                    "Close the WLED web UI before running to avoid corrupt presets.",
-                    "UPDATE — Appears when newer firmware is available. One click, downloads,",
-                    "UnZips, and flashes the correct stable build for your device.",
-                    "LIVE BADGES — Appear on all WLED cards whenever LedFx is running.",
-                    "PURPLE badge — LedFx currently has control of this device.",
-					"GREY badge, WLED has control.",
-					"click badges to toggle LEDFX/WLED control.",
-					"Color and preset controls are locked during LEDFX control.",
-					"Power/brightness still work.",
-					"Off devices that LEDFX takes control of, keep power switch off, ",
-					"so once LEDFX releases control, device returns to off automatically.",
-					"Cards that were ON before LEDFX took control, stay on after.",
-                    "Badges hide automatically when LedFx service is stopped.",
-                ),
-
-                *_section("MAGICHOME NOTES", "#00ff88",
-                    "MagicHome devices support color and built-in effects only.",
-                    "UNTIL NOW!  LEDFX support just added, giving you music reactive effects",
-                    "on MH devices for the first time.  Registers a MHBridge device in LEDFX ",
-                    "that streams effect data to WLEDCC, which converts it to MH codes and sends them",
-                    "to your MH devices.  Edit this MHBridge device in LEDFX to set effects.",
-                    "Your milage may vary.  Adjust device FPS and effect decay speed for best results.",
-                    "COLOR PICKER changes switch back to static mode automatically.",
-                    "EFFECTS PICKER lets you select from 21 built-in patterns.",
-                    "BRIGHTNESS SLIDER — works in static color mode. In effect mode, slider = speed.",
-                    "POWER ON VIA SLIDER — If the device is off and you move the brightness",
-                    "slider or pic a color, the device powers on automatically.",
-                ),
-
-                *_section("SCENES", "cyan",
-                    "Scene buttons sit in the master bar. You always see your saved scenes",
-                    "plus one ADD button. There is no limit — record as many as you need.",
-                    "Each scene stores the full state of every device — on/off, brightness,",
-                    "color, effect, and active WLED preset. Scenes use a stable internal ID",
-                    "so they survive device IP changes and renames.",
-                    "ADD SCENE (+) — Click empty slot to snapshot all devices now.",
-                    "Name the scene and press Enter or Save.",
-					"EDIT — Right hamburger icon opens the scene editor.",
-                    "Check a box to include a device. Uncheck it to ignore that device.",
-                    "Use the refresh button beside a device to re-save only that device's",
-                    "current state without recording the whole scene again.",					
-                    "ACTIVATE — Click the scene name to play this scene.",
-                    "RENAME — Left pencil icon on scene button to change its name.",
-                    "CLEAR — X icon deletes the scene slot.",
-                    "Scenes are saved to disk and survive restarts.",
-                ),
-
-                *_section("LEDFX AUDIO SYNC", "purple",
-					"Turn your lights into a visualizer that react to your computer's audio.",
-					"If path not found, clicking start prompts you to install",
-					"or browse to path where you have it installed.",
-					"Install downloads and installs automatically when clicked.",
-                    "START LEDFX — Launches LedFx service. Adds Purple LIVE badge to Card.",
-                    "STOP LEDFX — Shuts down LedFx. Unlocks WLED controls.  Removes badge.",
-                    "LEDFX UI — Opens the LedFx web interface in your browser. Only",
-                    "visible while LedFx is running, beside the STOP LEDFX button.",
-                    "LIVE MODE — While LedFx runs, all WLED cards show a LIVE badge.",
-                    "This lets you see which lights LedFx is controlling right now.",
-                    "PURPLE LIVE badge — LedFx is actively controlling this device.",
-                    "Click to release it back to WLED. Badge turns grey.",
-                    "GREY LIVE badge — LedFx is running but not controlling this device.",
-                    "Click it to have LedFx control it. Badge turns purple.",
-                    "All badges hide when LedFx is stopped.",
-                ),
-
-             *_section("ADDING CUSTOM DEVICES", "cyan",
-					"This allows you to add custom cards to launch almost anything.",
-                    "ADD DEVICE card is always last in the grid.",
-                    "Click it and enter IP address, web URL or path to program files.",
-                    "IP ADDRESS — app probes for WLED, then TCP on port 80.",
-                    "If WLED found: adds a full WLED card automatically.",
-                    "HOSTNAME (e.g. house.local) — creates a launcher card.",
-                    "URL (e.g. spotify.com) — launches URL in browser.",
-                    "EXE - browse to your favorite program exe and it adds a launch button.",
-                ),
-				
-                *_section("CLOSING THE APP", "cyan",
-                    "When you click the X to close the app, a closing popup appears first.",
-                    "STOP LEDFX — Stops LedFx before you leave the app.",
-                    "ALL OFF — Turns all lights off before you leave the app.",
-                    "CLOSE App — Exits the app.",
-                    "CANCEL — Closes the popup and returns to the app.",
-                    "CHECK BOXES — allow you to set LedFX to shut down when app closes.",
-                    "Set lights to turn off on app close.",
-                    "Auto load last scene when app opens.",
-                ),
-
-                *_section("TROUBLESHOOTING & NETWORK", "cyan",
-					"The app automatically scans for devices on first start up.",
-					"Run it again anytime by clicking SCAN button, top right of screen.",
-					"MOVED DEVICES — If a light stops responding because your router gave it",
-					"a new address, click SCAN. The app will usually find it and update",
-					"your existing card automatically.",
-					"DUPLICATE CARDS — If a device appears twice, click MERGE and drag",
-					"the 'new' card onto your 'old' card. This keeps your custom names",
-					"and scenes intact while updating the connection info. (WIP)",
-				),
-
-
+                *_load_manual(),
 
                 ft.Container(height=10),
                 ft.TextButton(

@@ -41,6 +41,7 @@ Source: "dist\WLEDCC_Shared\*"; DestDir: "{app}"; Flags: ignoreversion recursesu
 Source: "version.txt"; DestDir: "{app}"; Flags: ignoreversion
 Source: "LICENSE"; DestDir: "{app}"; Flags: ignoreversion
 Source: "Manual.txt"; DestDir: "{app}"; Flags: ignoreversion
+Source: "CHANGELOG.md"; DestDir: "{app}"; Flags: ignoreversion
 Source: "wledccicon.ico"; DestDir: "{app}"; Flags: ignoreversion
 Source: "*.jpg"; DestDir: "{app}"; Flags: ignoreversion
 
