@@ -738,7 +738,7 @@ class SpectrumController:
         self._spec_idle_effect      = "random"
         self._spec_idle_cycle_effects = ["pulse", "text", "pacman", "tetris",
                                         "invaders", "snake", "starwars"]
-        self._spec_idle_speed       = 2.0
+        self._spec_idle_speed       = 1.0
         self._spec_idle_random_current        = "pulse"
         self._spec_idle_random_cycle_seconds  = 10.0
         self._spec_idle_random_next_ts        = time.monotonic() + 10.0
@@ -4668,9 +4668,28 @@ class SpectrumController:
                     seg.bgcolor = self._spec_palette[(bi + int(_p * 9.0)) % len(self._spec_palette)]
                 elif _best < 1.2: seg.bgcolor = "#2a2a2a"
                 else:             seg.bgcolor = _bg
-            _sr = int((bi * 5 + int(_p * 17)) % _levels)
-            if ((bi + int(_p * 8)) % 13) == 0:
-                segs[_sr].bgcolor = "#b0b0b0"
+
+        # 8 drifting stars that move outward from centre
+        _gkey = (_bands, _levels)
+        if not hasattr(self, '_pul_key') or self._pul_key != _gkey:
+            _rng = random.Random(13)
+            _max_r = ((_cx**2 + _cy**2)**0.5) + 1.5
+            self._pul_stars = [
+                [_rng.uniform(0, 6.2832), _rng.uniform(min(5.0, _max_r * 0.35), _max_r), _rng.uniform(0.36, 2.7)]
+                for _ in range(8)
+            ]
+            self._pul_key = _gkey
+        _max_r = ((_cx**2 + _cy**2)**0.5) + 1.5
+        for _st in self._pul_stars:
+            _st[1] += _st[2] * 0.18 * _spd
+            if _st[1] > _max_r:
+                _st[1] = min(5.0, _max_r * 0.35)
+                _st[0] = random.uniform(0, 6.2832)
+            _bx = int(round(_cx + math.cos(_st[0]) * _st[1]))
+            _by = int(round(_cy + math.sin(_st[0]) * _st[1]))
+            if 0 <= _bx < _bands and 0 <= _by < _levels:
+                self._spec_segments[_bx][_by].bgcolor = "#b0b0b0"
+
         try: self._spectrum_box.update()
         except: pass
 
@@ -4783,7 +4802,7 @@ class SpectrumController:
         _spd    = max(0.25, min(3.0, float(self._spec_idle_speed)))
         _bg     = "#101010"
         _old_p  = self._spec_idle_phase
-        self._spec_idle_phase = (self._spec_idle_phase + 0.45 * _spd) % 100000.0
+        self._spec_idle_phase = (self._spec_idle_phase + 0.22 * _spd) % 100000.0
         _phase  = self._spec_idle_phase
 
         _inv_a = ["00100100","01111110","11011011","11111111","01111110","01000010"]
@@ -4821,53 +4840,65 @@ class SpectrumController:
         _bands  = max(1, self._spec_bands); _levels = max(1, self._spec_levels)
         _spd    = max(0.25, min(3.0, float(self._spec_idle_speed)))
         _bg     = "#101010"
-        _old_p  = int(self._spec_idle_phase)
-        self._spec_idle_phase = (self._spec_idle_phase + 1.05 * _spd) % 100000.0
-        _phase  = int(self._spec_idle_phase)
+        _slen   = max(4, _bands - 2)
 
-        # Serpentine boustrophedon path covers the full grid
-        _path = []
-        for _y in range(_levels):
-            if (_y % 2) == 0:
-                for _x in range(_bands): _path.append((_x, _y))
-            else:
-                for _x in range(_bands - 1, -1, -1): _path.append((_x, _y))
+        # reset state when grid size changes or on first run
+        _gkey = (_bands, _levels)
+        if not hasattr(self, '_sk_gkey') or self._sk_gkey != _gkey:
+            import random as _r
+            self._sk_gkey  = _gkey
+            self._sk_x, self._sk_y   = 0, _r.randint(0, _levels - 1)
+            self._sk_dx, self._sk_dy = 1, 0
+            self._sk_body  = [(0, self._sk_y)] * _slen
+            self._sk_food  = (_r.randint(0, _bands - 1), _r.randint(0, _levels - 1))
+            self._sk_tick  = 0.0
 
-        _plen = len(_path)
-        if not _plen: return
-        _snake_len = max(8, min(_plen // 4, _bands + 6))
-        _head_idx  = _phase % _plen
-        _old_idx   = _old_p % _plen
-        if _head_idx < _old_idx: self._spec_idle_cycle_done = True
+        self._sk_tick += 0.55 * _spd
+        _steps = max(1, int(self._sk_tick))
+        self._sk_tick -= _steps
 
-        # Two food targets at 1/3 and 2/3 along the path
-        _f1 = _plen // 3
-        _f2 = 2 * _plen // 3
-        # food1 visible before eating it OR after eating food2 (respawned)
-        _show_f1 = _head_idx < _f1 or _head_idx >= _f2
-        # food2 visible until snake passes it
-        _show_f2 = _head_idx < _f2
+        import random as _r
+        for _ in range(_steps):
+            _hx, _hy         = self._sk_x, self._sk_y
+            _dx, _dy         = self._sk_dx, self._sk_dy
+            _fx, _fy         = self._sk_food
+            _nx, _ny         = _hx + _dx, _hy + _dy
 
-        _snake_set = {(_head_idx - _si) % _plen for _si in range(_snake_len)}
-        _set_px = self._set_px
+            if _dx != 0:                               # moving horizontally
+                if _nx < 0 or _nx >= _bands:           # hit side wall
+                    _nx = _hx
+                    if _hy == _fy:                     # already on food row → turn toward food
+                        _dx = 1 if _fx > _hx else -1; _dy = 0
+                    else:                              # turn toward food row
+                        _dx = 0; _dy = 1 if _fy > _hy else -1
+                    _nx, _ny = _hx + _dx, _hy + _dy
+            else:                                      # moving vertically
+                if _ny == _fy or _hy == _fy:           # reached food row → turn toward food
+                    _ny = _fy
+                    _dx = 1 if _fx >= _hx else -1; _dy = 0
+                    _nx = _hx + _dx
+                elif _ny < 0 or _ny >= _levels:        # hit top/bottom → turn toward food
+                    _ny = _hy
+                    _dx = 1 if _fx >= _hx else -1; _dy = 0
+                    _nx = _hx + _dx
+
+            self._sk_x = max(0, min(_bands - 1, _nx))
+            self._sk_y = max(0, min(_levels - 1, _ny))
+            self._sk_dx, self._sk_dy = _dx, _dy
+            self._sk_body = [(self._sk_x, self._sk_y)] + self._sk_body[:_slen - 1]
+
+            if (self._sk_x, self._sk_y) == self._sk_food:
+                self._sk_food = (_r.randint(0, _bands - 1), _r.randint(0, _levels - 1))
+                self._spec_idle_cycle_done = True
 
         try:
             for _x in range(_bands):
                 for _y in range(_levels): self._spec_segments[_x][_y].bgcolor = _bg
-
-            if _show_f1 and _f1 not in _snake_set:
-                _set_px(*_path[_f1], "#ff6a3d")
-            if _show_f2 and _f2 not in _snake_set:
-                _set_px(*_path[_f2], "#ff6a3d")
-
-            for _si in range(_snake_len):
-                _idx = (_head_idx - _si) % _plen
-                _x, _y = _path[_idx]
-                if _si == 0:   _c = "#d7ff8a"
-                else:
-                    _g = max(72, 255 - _si * 9)
-                    _c = f"#00{_g:02x}28"
-                _set_px(_x, _y, _c)
+            _set_px = self._set_px
+            _set_px(*self._sk_food, "#ff6a3d")
+            for _si, (_bx, _by) in enumerate(self._sk_body):
+                _c = "#d7ff8a" if _si == 0 else f"#00{max(72, 255 - _si * 9):02x}28"
+                _set_px(_bx, _by, _c)
         except Exception:
             self._render_spectrum_idle_pulse(); return
 

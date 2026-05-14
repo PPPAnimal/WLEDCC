@@ -2891,6 +2891,13 @@ class WLEDApp:
             flush()
             return controls
 
+        def _open_changelog(_):
+            p = os.path.join(_VERSION_DIR, "CHANGELOG.md")
+            try:
+                os.startfile(p)
+            except Exception:
+                pass
+
         manual_content = ft.Column(
             scroll=ft.ScrollMode.AUTO,
             width=520,
@@ -2907,7 +2914,7 @@ class WLEDApp:
                 ft.Divider(),
                 ft.TextButton(
                     content=ft.Text("Release Notes / Changelog ↗", size=10, color="grey500"),
-                    on_click=lambda _: os.startfile(os.path.join(_VERSION_DIR, "CHANGELOG.md")),
+                    on_click=_open_changelog,
                     tooltip="Open full changelog",
                     style=ft.ButtonStyle(padding=ft.Padding.only(top=0, bottom=4)),
                 ),
