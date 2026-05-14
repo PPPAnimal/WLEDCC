@@ -7,6 +7,10 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 - Always use `async def` for Flet event handlers.
 - Use `/plan` mode before changes that touch more than one function, affect more than ~10 lines, or involve architectural decisions. Skip it for targeted 1–3 line fixes where the location and change are fully specified in the request.
 - When editing files, provide only the changed lines (diff format) — do not rewrite the whole file.
+- **Logging:** When adding new behavior, instrument it with the existing `_log()` / debug-log system. Include enough context (function name, key values) that a failure is self-explaining in the log — don't make the user add print statements to find out what went wrong.
+- **DRY / reuse first:** Before writing a new helper, look for an existing one that does the same job. UI elements used in more than one place (color swatches, device cards, buttons) must be built by a single factory function or builder method and called everywhere they appear — never duplicated.
+- **No magic values:** Do not hardcode colors, sizes, timeouts, URLs, port numbers, or other tuneable constants inline. Define them as named constants near the top of the file (or in a dedicated constants block) and reference them by name. One place to change, easy to find.
+- **Write for humans:** Keep code readable and linear. Prefer flat, explicit logic over clever one-liners or deeply nested callbacks. A new contributor should be able to read a function top-to-bottom and understand it without tracing five layers of indirection. Avoid spaghetti — if a function is doing too many unrelated things, split it; if two functions are doing the same thing, merge them.
 
 ## Project Overview
 

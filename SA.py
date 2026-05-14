@@ -732,7 +732,10 @@ class SpectrumController:
         self._sa_smth_bass      = 0.0   # shared smoother for canvas modes
         self._sa_smth_vu        = 0.0
         self._sa_prev_smth_bass = 0.0
-        self._sa_canvas_beat    = False
+        self._sa_beat_detected  = False  # unified rising-edge beat signal
+        self._sa_beat_bass_avg  = 0.0   # adaptive running average for beat threshold
+        self._sa_beat_prev      = False  # previous frame beat state
+        self._sa_beat_sens      = 1.0   # loaded from active mode's per-mode config
         self._spec_idle_enabled     = True
         self._spec_idle_timeout     = 5.0
         self._spec_idle_effect      = "random"
@@ -791,7 +794,7 @@ class SpectrumController:
             "mirror":   {"zoom": 0.85,   "rotDeg": 10.0,   "opacity": 1.0,    "beat_sens": 2.0,  "dim_thresh": 0.25},
             "chroma":   {"maxSplit": 14, "trail": 0.18},
             "perlin":   {"noiseScale": 0.012, "evolveRate": 0.30},
-            "morph":    {"layers": 3, "jitter": 1.0},
+            "morph":    {"layers": 3, "jitter": 1.0, "beat_sens": 1.0},
         }
         self._spec_hallu_base_kind             = "waveform"
         self._spec_hallu_random_cycle_choices  = ["mirror","chroma","perlin","morph"]
@@ -1287,6 +1290,7 @@ class SpectrumController:
         elif mode in self._spec_color_mode_per_mode:
             _entry["extras"] = {
                 "color_mode": str(self._spec_color_mode_per_mode.get(mode, "gradient")),
+                "beat_sens":  float(self._sa_beat_sens),
             }
         self._spec_mode_configs[_path] = _entry
 
@@ -1316,6 +1320,13 @@ class SpectrumController:
         # Apply mode-specific extras
         _x = _s.get("extras") if isinstance(_s.get("extras"), dict) else {}
         if not _x:
+            if mode in self._spec_color_mode_per_mode:
+                self._sa_beat_sens = 1.0
+            elif mode == "hallucination":
+                _sub = self._spec_hallu_submode
+                _default_bs = 2.0 if _sub == "mirror" else 1.0
+                self._sa_beat_sens = float(
+                    self._spec_hallu_params_per_submode.get(_sub, {}).get("beat_sens", _default_bs))
             return
         if mode == "hallucination":
             _sub = self._spec_hallu_submode
@@ -1329,19 +1340,23 @@ class SpectrumController:
                 "mirror":   {"zoom": 0.85,   "rotDeg": 10.0,   "opacity": 1.0,    "beat_sens": 2.0,  "dim_thresh": 0.25},
                 "chroma":   {"maxSplit": 14, "trail": 0.18},
                 "perlin":   {"noiseScale": 0.012, "evolveRate": 0.30},
-                "morph":    {"layers": 3, "jitter": 1.0},
+                "morph":    {"layers": 3, "jitter": 1.0, "beat_sens": 1.0},
             }
             _params = _x.get("params", {})
             if isinstance(_params, dict) and _params:
                 self._spec_hallu_params_per_submode[_sub] = {
                     **_defaults.get(_sub, {}), **_params
                 }
+            _merged = self._spec_hallu_params_per_submode.get(_sub, _defaults.get(_sub, {}))
+            _default_bs = 2.0 if _sub == "mirror" else 1.0
+            self._sa_beat_sens = float(_merged.get("beat_sens", _default_bs))
         elif mode in self._spec_color_mode_per_mode:
             _valid_cm = ("loop", "gradient", "loop_smoke", "gradient_smoke", "random")
             _cm = str(_x.get("color_mode", "gradient")).lower()
             self._spec_color_mode_per_mode[mode] = _cm if _cm in _valid_cm else "gradient"
             self._spec_bs_color_mode = self._spec_color_mode_per_mode.get(
                 mode, self._spec_color_mode_per_mode.get("beat_saber", "gradient"))
+            self._sa_beat_sens = float(_x.get("beat_sens", 1.0))
 
     # ── Controls builder ──────────────────────────────────────────────────────
 
@@ -2484,6 +2499,22 @@ class SpectrumController:
         ], spacing=8, vertical_alignment=ft.CrossAxisAlignment.CENTER,
         visible=(self._spec_mode in ("beat_saber", "neon_cascade", "rock_stage")))
 
+        _canvas_bs_init = float(self._spec_mode_configs.get(self._spec_mode, {}).get(
+            "extras", {}).get("beat_sens", 1.0))
+        _canvas_bs_lbl = ft.Text(f"{_canvas_bs_init:.1f}", size=11, color="#ff9800", width=42)
+        def on_canvas_beat_sens(e):
+            v = round(float(e.control.value), 1)
+            self._sa_beat_sens = v
+            _canvas_bs_lbl.value = f"{v:.1f}"; _canvas_bs_lbl.update()
+            self._config_dirty = True; self._update_save_buttons()
+        _canvas_bs_slider = ft.Slider(min=0.2, max=5.0, value=_canvas_bs_init,
+                                      divisions=48, on_change=on_canvas_beat_sens, width=160)
+        _canvas_beat_sens_row = ft.Row([
+            ft.Text("Beat Sens:", size=11, color="grey400", width=78),
+            _canvas_bs_slider, _canvas_bs_lbl,
+        ], spacing=4,
+        visible=(self._spec_mode in ("beat_saber", "neon_cascade", "rock_stage")))
+
         # ── Hallucination sub-mode dropdown ──────────────────────────────
         def on_hallu_submode_change(e):
             _sub = str(e.control.value or "mirror").lower()
@@ -2594,6 +2625,7 @@ class SpectrumController:
         _m_bs_lbl    = ft.Text(f"{_m_bs_init:.1f}", size=11, color="#ff9800", width=42)
         def on_m_bs(e):
             v = round(float(e.control.value), 1)
+            self._sa_beat_sens = v
             _mirror_param_set("beat_sens", v); _m_bs_lbl.value = f"{v:.1f}"; _m_bs_lbl.update()
         _m_bs_slider = ft.Slider(min=0.2, max=5.0, value=_m_bs_init,
                                 divisions=48, on_change=on_m_bs, width=160)
@@ -2611,6 +2643,30 @@ class SpectrumController:
         visible=(self._spec_mode == "hallucination"
                     and self._spec_hallu_submode == "mirror"))
 
+        def _morph_param_set(key, value):
+            try:
+                self._spec_hallu_params_per_submode.setdefault("morph", {})[key] = float(value)
+                self._config_dirty = True
+                self._update_save_buttons()
+            except Exception:
+                pass
+
+        _morph_bs_init = float(self._spec_hallu_params_per_submode.get("morph", {}).get("beat_sens", 1.0))
+        _morph_bs_lbl  = ft.Text(f"{_morph_bs_init:.1f}", size=11, color="#ff9800", width=42)
+        def on_morph_bs(e):
+            v = round(float(e.control.value), 1)
+            self._sa_beat_sens = v
+            _morph_param_set("beat_sens", v)
+            _morph_bs_lbl.value = f"{v:.1f}"; _morph_bs_lbl.update()
+        _morph_bs_slider = ft.Slider(min=0.2, max=5.0, value=_morph_bs_init,
+                                     divisions=48, on_change=on_morph_bs, width=160)
+        _morph_sliders_col = ft.Column([
+            ft.Row([ft.Text("Beat Sens:", size=11, color="grey400", width=78),
+                    _morph_bs_slider, _morph_bs_lbl], spacing=4),
+        ], spacing=2,
+        visible=(self._spec_mode == "hallucination"
+                    and self._spec_hallu_submode == "morph"))
+
         _hallu_cm_init = self._spec_color_mode_per_mode.get("hallucination", "loop")
         _hallu_cm_dd = ft.Dropdown(
             width=180,
@@ -2627,6 +2683,7 @@ class SpectrumController:
             ft.Row([ft.Text("Color Mode:", size=12, color="grey400"), _hallu_cm_dd],
                 spacing=8, vertical_alignment=ft.CrossAxisAlignment.CENTER),
             _mirror_sliders_col,
+            _morph_sliders_col,
         ], spacing=2, visible=(self._spec_mode == "hallucination"))
 
         # EQ section
@@ -2741,6 +2798,7 @@ class SpectrumController:
                 _bg_col,
                 _hallu_row,
                 _color_mode_col,
+                _canvas_beat_sens_row,
                 ft.Divider(height=1, color="grey800"),
                 ft.Row([ft.Text("FPS:", size=12, color="grey400"), _fps_txt,
                         ft.Slider(min=8, max=_SA_MAX_FPS, value=float(self._spec_target_fps),
@@ -3381,7 +3439,7 @@ class SpectrumController:
         # ── Color: smooth hue transition on bass hit ──────────────────────────
         _lerp_h = self._lerp_h; _ease = self._ease
 
-        _new_beat_bs = self._sa_canvas_beat
+        _new_beat_bs = self._sa_beat_detected
         if _new_beat_bs:
             self._bs_hue_from  = _lerp_h(self._bs_hue_from, self._bs_hue_to, _ease(self._bs_hue_t))
             self._bs_hue_to    = self._bs_hue_seq[0]
@@ -3636,7 +3694,7 @@ class SpectrumController:
         # ── Hue: smooth transition on bass hit ────────────────────────────────
         _lerp_h = self._lerp_h; _ease = self._ease
 
-        _new_beat_nc = self._sa_canvas_beat
+        _new_beat_nc = self._sa_beat_detected
         if _new_beat_nc:
             self._nc_hue_from  = _lerp_h(self._nc_hue_from, self._nc_hue_to, _ease(self._nc_hue_t))
             self._nc_hue_to    = self._nc_hue_seq[0]
@@ -3958,7 +4016,7 @@ class SpectrumController:
             return (_ro + frac * 0.55) % 1.0
 
         # ── Bass-hit detection & palette transitions ───────────────────────────
-        _new_beat = self._sa_canvas_beat
+        _new_beat = self._sa_beat_detected
         _cm_rs   = self._tick_random_cm("rock_stage", _new_beat)
         _is_grad  = _cm_rs in ("gradient", "gradient_smoke")
         _is_smoke = _cm_rs in ("loop_smoke", "gradient_smoke")
@@ -5059,7 +5117,11 @@ class SpectrumController:
         _sm = self._sm
         self._sa_smth_bass      = _sm(self._sa_smth_bass, self._sa_raw_bass, 0.50, 0.06)
         self._sa_smth_vu        = _sm(self._sa_smth_vu,   self._sa_mono_vu,  0.30, 0.05)
-        self._sa_canvas_beat    = self._sa_smth_bass > 0.65 and self._sa_prev_smth_bass <= 0.65
+        self._sa_beat_bass_avg  = self._sa_beat_bass_avg * 0.92 + self._sa_bass * 0.08
+        _bt = max(0.06, self._sa_beat_bass_avg * max(1.05, 1.35 / max(0.1, self._sa_beat_sens)))
+        _beat_now = self._sa_bass > _bt
+        self._sa_beat_detected  = _beat_now and not self._sa_beat_prev
+        self._sa_beat_prev      = _beat_now
         self._sa_prev_smth_bass = self._sa_smth_bass
 
     def _extract_audio_bands(self):
@@ -5399,14 +5461,7 @@ class SpectrumController:
             beat_decay = max(0.85, min(0.975, 1.0 - 0.12 / _pd))
 
             # ── Beat detection ────────────────────────────────────────
-            _beat_sens   = max(0.2, float(p.get("beat_sens", 2.1)))
-            _thresh_mult = max(1.05, 1.35 / _beat_sens)
-            _pt_avg      = aux.get("_pt_avg", 0.0)
-            _pt_avg      = _pt_avg * 0.92 + bass * 0.08
-            aux["_pt_avg"] = _pt_avg
-            _pt_beat_now = bass > max(0.06, _pt_avg * _thresh_mult)
-            local_beat   = _pt_beat_now and not aux.get("_pt_beat_prev", False)
-            aux["_pt_beat_prev"] = _pt_beat_now
+            local_beat = self._sa_beat_detected
 
             # ── Speed burst + beat pop ────────────────────────────────
             beat_mul    = aux.get("beat_mul",    1.0)
@@ -5835,7 +5890,7 @@ class SpectrumController:
         h_val  = self._spec_display_hue
         N      = 120
 
-        beat_kick = 1.0 + (0.18 if beat else 0.0)
+        beat_kick = 1.0 + (0.18 if self._sa_beat_detected else 0.0)
         A_bass   = 14.0 * jitter
         A_mid    =  9.0 * jitter
         A_treble =  6.0 * jitter
