@@ -496,7 +496,7 @@ _SA_MENU_H    = 780   # height for main settings panel  (SA + ~620px panel)
 _SA_IDLE_H    = 760   # height for idle-effects panel   (SA + ~600px panel)
 _SA_NATIVE_W  = 300   # spectrum box native width  (scale reference)
 _SA_NATIVE_H  = 62    # spectrum box native height (scale reference)
-_SA_MAX_FPS   = 30    # raise to 60 here to unlock 60 fps everywhere
+_SA_MAX_FPS   = 60    # sliding-window audio loop supports up to 60 fps
 
 # ── Paths ────────────────────────────────────────────────────────────────────
 _VERSION_DIR = os.path.dirname(sys.executable if getattr(sys, "frozen", False) else os.path.abspath(__file__))
@@ -682,6 +682,10 @@ class SpectrumController:
         self._spec_segments         = []
         self._spec_gain             = 1.0
         self._spec_target_fps       = _SA_MAX_FPS
+        self._spec_actual_fps       = 0.0
+        self._spec_fps_label        = None
+        self._spec_fps_track_ts     = 0.0
+        self._spec_fps_frame_count  = 0
         self._spec_sensitivity      = 0.85
         self._spec_reactivity       = 1.0
         self._spec_bar_decay        = 2.0
@@ -1744,7 +1748,30 @@ class SpectrumController:
     def _sync_render(self):
         """Runs on the event loop thread — safe for Flet UI updates."""
         try:
+            _t0 = time.monotonic()
             self._render_spectrum()
+            _render_ms = (time.monotonic() - _t0) * 1000.0
+
+            _now = time.monotonic()
+            if self._spec_fps_track_ts > 0:
+                self._spec_fps_frame_count += 1
+                _elapsed = _now - self._spec_fps_track_ts
+                if _elapsed >= 1.0:
+                    self._spec_actual_fps      = self._spec_fps_frame_count / _elapsed
+                    self._spec_fps_frame_count = 0
+                    self._spec_fps_track_ts    = _now
+                    _lbl = self._spec_fps_label
+                    if _lbl is not None:
+                        try:
+                            _lbl.value = (f"{int(self._spec_target_fps)} FPS"
+                                          f"  actual: {self._spec_actual_fps:.0f}"
+                                          f"  render: {_render_ms:.0f}ms")
+                            _lbl.update()
+                        except Exception:
+                            pass
+            else:
+                self._spec_fps_track_ts    = _now
+                self._spec_fps_frame_count = 0
         except Exception:
             pass
         finally:
@@ -2247,6 +2274,7 @@ class SpectrumController:
 
         _sens_pct        = ft.Text(f"{int(self._spec_sensitivity * 100)}%",     size=12, color="#ff9800")
         _fps_txt         = ft.Text(f"{int(self._spec_target_fps)} FPS",          size=12, color="#ff9800")
+        self._spec_fps_label = _fps_txt
         _bars_txt        = ft.Text(f"{int(self._spec_analysis_bands)}",           size=12, color="#ff9800")
         _react_pct       = ft.Text(f"{self._spec_reactivity:.2f}x",              size=12, color="#ff9800")
         _bar_decay_pct   = ft.Text(f"{self._spec_bar_decay:.2f}x",               size=12, color="#ff9800")
@@ -2256,7 +2284,8 @@ class SpectrumController:
 
         def on_target_fps_change(e):
             self._spec_target_fps = max(8, min(_SA_MAX_FPS, int(round(float(e.control.value)))))
-            _fps_txt.value = f"{int(self._spec_target_fps)} FPS"; _fps_txt.update()
+            _fps_txt.value = f"{int(self._spec_target_fps)} FPS (actual: {self._spec_actual_fps:.0f})"
+            _fps_txt.update()
             self._config_dirty = True; self._update_save_buttons()
 
         def on_analysis_bars_change(e):
@@ -6036,7 +6065,8 @@ class SpectrumController:
                 if _sr not in (16000, 22050, 32000, 44100, 48000): _sr = 48000
                 _ab = max(6, min(int(self._spec_bands), int(self._spec_analysis_bands or self._spec_bands)))
                 _n  = 1024 if _sr >= 32000 else 512
-                _fn = max(_n, min(2048, int(_sr / 24)))
+                _fps_target = max(8, min(60, int(self._spec_target_fps or 24)))
+                _fn = max(128, int(_sr / _fps_target))
                 _freqs = _np.fft.rfftfreq(_n, d=1.0 / _sr)
                 _edges = _np.geomspace(40.0, 15000.0, _ab + 1)
                 _bins  = []
@@ -6048,18 +6078,38 @@ class SpectrumController:
                 _bcenters     = _np.sqrt(_edges[:-1] * _edges[1:])
                 _bcenters_log = _np.log10(_bcenters)
                 _eq_log       = _np.log10(_np.asarray(self._spec_eq_freqs, dtype=float))
+                # precompute per-session constants so the hot inner loop is GIL-free numpy
+                _blackman_w  = _np.blackman(_n)
+                _bin_starts  = _np.array([lo for lo, hi in _bins], dtype=int)
+                _bin_sizes   = _np.array([hi - lo for lo, hi in _bins], dtype=float)
 
                 import warnings as _w
                 _w.filterwarnings("ignore", message="data discontinuity", category=Warning)
                 with _current_device.recorder(samplerate=_sr,
                                             channels=int(self._spec_capture_channels),
                                             blocksize=_fn) as _rec:
-                    _last_render = 0.0
+                    _roll_mono    = _np.zeros(_n, dtype=float)
+                    _render_stop  = threading.Event()
+                    def _render_timer(_stop=_render_stop):
+                        try: ctypes.windll.winmm.timeBeginPeriod(1)
+                        except Exception: pass
+                        while not _stop.is_set():
+                            _stop.wait(self._get_spec_render_interval())
+                            if not _stop.is_set():
+                                self._schedule_render()
+                        try: ctypes.windll.winmm.timeEndPeriod(1)
+                        except Exception: pass
+                    threading.Thread(target=_render_timer, daemon=True,
+                                     name="SA_RenderTimer").start()
+                    self._status(f"Audio loop: {_fps_target} fps target, {_fn} frames/block (~{_fn*1000//_sr} ms)", debug_only=True)
                     while self.running and not self._spec_source_changed and not self._spec_disabled:
-                        _ri  = self._get_spec_render_interval()
+                        _t0  = time.monotonic()
                         _buf = _rec.record(numframes=_fn)
+                        # use actual block duration for smoothing normalization so physics
+                        # stay consistent regardless of what rate the hardware delivers
+                        _tscale = max(_fn / _sr, time.monotonic() - _t0) * 24.0
                         _raw = _np.asarray(_buf)
-                        if _raw.size < _n: time.sleep(0.01); continue
+                        if _raw.size == 0: time.sleep(0.01); continue
 
                         if _raw.ndim == 2 and _raw.shape[1] >= 2:
                             _left  = _raw[:, 0].reshape(-1)
@@ -6069,6 +6119,11 @@ class SpectrumController:
                             _arr = _raw.reshape(-1)
                             _left = _right = _arr
 
+                        # slide rolling window forward with the new mono samples
+                        _nc = min(len(_arr), _n)
+                        _roll_mono[:_n - _nc] = _roll_mono[_nc:]
+                        _roll_mono[_n - _nc:] = _arr[-_nc:]
+
                         _vu_n = min(_n, len(_left), len(_right))
                         if _vu_n > 0:
                             _l_lvl = float(_np.sqrt(_np.mean(_left[-_vu_n:]  ** 2)))
@@ -6076,29 +6131,31 @@ class SpectrumController:
                         else:
                             _l_lvl = _r_lvl = 0.0
 
-                        _arr  = _arr[-_n:] * _np.blackman(_n)
+                        _arr  = _roll_mono * _blackman_w
                         _spec = _np.abs(_np.fft.rfft(_arr))
-                        _vals = _np.asarray([float(_np.sqrt(_np.mean(_spec[lo:hi] ** 2))) if hi > lo else 0.0
-                                            for lo, hi in _bins])
-                        _vals = _np.log1p(_vals * 30.0)
+                        _sums = _np.add.reduceat(_spec ** 2, _bin_starts)[:_ab]
+                        _vals = _np.log1p(_np.sqrt(_sums / _bin_sizes) * 30.0)
 
                         _avg_arr = _np.asarray(self._spec_band_avg, dtype=float)
                         if _avg_arr.size != _vals.size:
                             self._spec_source_changed = True; continue
                         _rising = _vals > _avg_arr
+                        _sm_r   = 1.0 - 0.85  ** _tscale
+                        _sm_f   = 1.0 - 0.995 ** _tscale
                         self._spec_band_avg = list(_np.where(
                             _rising,
-                            _avg_arr * 0.85 + _vals * 0.15,
-                            _avg_arr * 0.995 + _vals * 0.005,
+                            _avg_arr * (1.0 - _sm_r) + _vals * _sm_r,
+                            _avg_arr * (1.0 - _sm_f) + _vals * _sm_f,
                         ))
                         _vals = _np.maximum(0.0, _vals - _avg_arr * 0.85)
                         _mx   = float(_vals.max()) if _vals.size else 0.0
 
                         if _mx > 0:
+                            _gf = 1.0 - 0.993 ** _tscale
                             if _mx > self._spec_gain:
-                                self._spec_gain = self._spec_gain * 0.85 + _mx * 0.15
+                                self._spec_gain = self._spec_gain * (1.0 - _sm_r) + _mx * _sm_r
                             else:
-                                self._spec_gain = max(0.02, self._spec_gain * 0.993 + _mx * 0.007)
+                                self._spec_gain = max(0.02, self._spec_gain * (1.0 - _gf) + _mx * _gf)
                             _vals = _vals / max(self._spec_gain, 1e-6)
 
                         _eq_curve = _np.interp(_bcenters_log, _eq_log,
@@ -6135,33 +6192,45 @@ class SpectrumController:
                         _react    = max(0.25, min(3.0, float(self._spec_reactivity)))
                         _bar_dec  = max(0.1,  min(5.0, float(self._spec_bar_decay)))
                         _peak_dec = max(0.1,  min(5.0, float(self._spec_peak_decay)))
-                        _rise     = min(0.98, 0.72 * _react)
-                        _fall     = 0.04 * _bar_dec
-                        _ph_frames= max(2, int(round(8 / _react)))
-                        _pdrop    = 0.02 * _peak_dec
+                        _rise     = 1.0 - (1.0 - min(0.98, 0.72 * _react)) ** _tscale
+                        _fall     = 0.04 * _bar_dec  * _tscale
+                        _ph_frames= max(2, int(round(8.0 / _react / _tscale)))
+                        _pdrop    = 0.02 * _peak_dec * _tscale
 
-                        for i in range(_ab):
-                            tgt = float(max(0.0, min(1.0, _vals[i])))
-                            cur = self._spec_bars[i]
-                            cur = (cur + (tgt - cur) * _rise) if tgt >= cur else max(0.0, cur - _fall)
-                            self._spec_bars[i] = cur
-                            if cur >= self._spec_peaks[i]:
-                                self._spec_peaks[i]     = cur
-                                self._spec_peak_hold[i] = _ph_frames
-                            else:
-                                if self._spec_peak_hold[i] > 0:
-                                    self._spec_peak_hold[i] -= 1
-                                else:
-                                    self._spec_peaks[i] = max(0.0, self._spec_peaks[i] - _pdrop)
+                        # vectorized bar + peak physics — numpy ops release the GIL
+                        # so the render thread can run PIL work concurrently
+                        _bars_a  = _np.asarray(self._spec_bars,      dtype=float)
+                        _peaks_a = _np.asarray(self._spec_peaks,     dtype=float)
+                        _holds_a = _np.asarray(self._spec_peak_hold, dtype=int)
+                        _tgt     = _np.clip(_vals, 0.0, 1.0)
+
+                        _rising_b = _tgt >= _bars_a
+                        _bars_a   = _np.where(_rising_b,
+                                              _bars_a + (_tgt - _bars_a) * _rise,
+                                              _np.maximum(0.0, _bars_a - _fall))
+
+                        _new_peak  = _bars_a >= _peaks_a
+                        _peaks_a   = _np.where(_new_peak, _bars_a, _peaks_a)
+                        _holds_a   = _np.where(_new_peak, _ph_frames, _holds_a)
+                        _hold_done = ~_new_peak & (_holds_a <= 0)
+                        _peaks_a   = _np.where(_hold_done,
+                                               _np.maximum(0.0, _peaks_a - _pdrop), _peaks_a)
+                        _holds_a   = _np.where(~_new_peak & ~_hold_done, _holds_a - 1, _holds_a)
+
+                        self._spec_bars      = _bars_a.tolist()
+                        self._spec_peaks     = _peaks_a.tolist()
+                        self._spec_peak_hold = _holds_a.tolist()
 
                         _l_env    = float(_np.log1p(_l_lvl * 18.0))
                         _r_env    = float(_np.log1p(_r_lvl * 18.0))
                         _vu_max   = max(_l_env, _r_env)
                         if _vu_max > 0.0:
+                            _vgr = 1.0 - 0.86  ** _tscale
+                            _vgf = 1.0 - 0.994 ** _tscale
                             if _vu_max > self._spec_vu_gain:
-                                self._spec_vu_gain = self._spec_vu_gain * 0.86 + _vu_max * 0.14
+                                self._spec_vu_gain = self._spec_vu_gain * (1.0 - _vgr) + _vu_max * _vgr
                             else:
-                                self._spec_vu_gain = max(0.06, self._spec_vu_gain * 0.994 + _vu_max * 0.006)
+                                self._spec_vu_gain = max(0.06, self._spec_vu_gain * (1.0 - _vgf) + _vu_max * _vgf)
                         _vs  = 0.65 * (max(0.1, min(1.5, float(self._spec_sensitivity))) / 0.7)
                         _vn  = max(self._spec_vu_gain, 1e-6)
                         _lt  = float(max(0.0, min(1.0, (_l_env / _vn) * _vs)))
@@ -6190,10 +6259,7 @@ class SpectrumController:
                         else:
                             self._spec_vu_peak_right = max(0.0, self._spec_vu_peak_right - _pdrop)
 
-                        _now = time.monotonic()
-                        if _now - _last_render >= _ri:
-                            self._schedule_render()
-                            _last_render = _now
+                    _render_stop.set()
 
             except Exception as ex:
                 _es = str(ex).lower()
