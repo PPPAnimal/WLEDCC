@@ -473,7 +473,7 @@ class _PilCanvas:
                     mask    = np.clip(lum / 80.0, 0.0, 1.0)[..., np.newaxis]
                     bloom_src = _PILImage.fromarray(
                         np.clip(a_arr * mask, 0, 255).astype(np.uint8), "RGBA")
-                    glow    = bloom_src.filter(_PILFilter.GaussianBlur(radius=S * 1.2))
+                    glow    = bloom_src.filter(_PILFilter.BoxBlur(radius=S * 1.2))
                     g_arr   = np.array(glow, dtype=np.float32)
                     bloomed = np.clip(a_arr + g_arr * 0.40, 0, 255).astype(np.uint8)
                     canvas  = _PILImage.fromarray(bloomed, "RGBA")
