@@ -5923,16 +5923,21 @@ class SpectrumController:
                 hist.pop()
 
 
-            canvas = _PILImage.new("RGBA", (W, H), (0, 0, 0, 255))
-            cdraw  = _PILDraw.Draw(canvas, "RGBA")
+            canvas = _PILImage.new("RGB", (W, H), (0, 0, 0))
+            cdraw  = _PILDraw.Draw(canvas)
 
             # Pre-compute rotated corners for each history frame so gap-fill can
             # reference adjacent frames without re-computing trig.
             # _frames[fi] = (corners_list, fhue, fbars, alpha)  or  None if skipped
             # corners_list[i] = (TL, TR, BR, BL) or None for zero-height bars
+            # feedback (opacity slider): high = gentle fade, low = steep/fast fade
+            # Power curve on position: same number of frames always, just brightness changes
+            _fade_power = 0.4 + (1.0 - feedback) * 4.0
+
             _frames = []
             for idx in range(1, len(hist)):
-                alpha  = int(255 * (feedback ** idx))   # opacity slider drives trail length
+                frac  = idx / max(1, _N - 1)
+                alpha = int(255 * ((1.0 - frac) ** _fade_power))
                 fbars, fhue = hist[idx]
                 if alpha < 4:
                     _frames.append(None)
@@ -5974,7 +5979,7 @@ class SpectrumController:
                     _bv = fbars[i] if i < len(fbars) else 0.0
                     _rv, _gv, _bvv = colorsys.hsv_to_rgb(
                         (fhue + i / n * _hue_spread) % 1.0, 1.0, 0.5 + _bv * 0.5)
-                    col = (int(_rv*255), int(_gv*255), int(_bvv*255), alpha)
+                    col = (int(_rv * alpha), int(_gv * alpha), int(_bvv * alpha))
 
                     # Fill gaps between this frame and the next newer frame
                     if (newer_corners is not None and
@@ -5984,6 +5989,11 @@ class SpectrumController:
                         cdraw.polygon([BL, BR, nBR, nBL], fill=col)  # bottom bridge
 
                     cdraw.polygon([TL, TR, BR, BL], fill=col)
+
+            # Blur disabled for now
+            # if blur_r > 0.3 and _PILFilter is not None:
+            #     canvas = canvas.filter(_PILFilter.GaussianBlur(radius=blur_r))
+            #     cdraw  = _PILDraw.Draw(canvas)
 
             # Current bars as plain upright rectangles on top — no rotation, no history effect
             if hist:
@@ -5996,7 +6006,7 @@ class SpectrumController:
                         (_cur_hue + i / n * _hue_spread) % 1.0, 1.0, 0.5 + _bv * 0.5)
                     cdraw.rectangle(
                         [i * bar_w, H - _bh, i * bar_w + bar_w - 1, H - 1],
-                        fill=(int(_rv*255), int(_gv*255), int(_bvv*255), 255))
+                        fill=(int(_rv*255), int(_gv*255), int(_bvv*255)))
 
             return canvas
 
