@@ -31,6 +31,7 @@ import subprocess
 import ctypes
 import base64
 import io
+import collections
 
 try:
     from PIL import Image as _PILImage, ImageDraw as _PILDraw, ImageFilter as _PILFilter, ImageFont as _PILFont
@@ -496,7 +497,17 @@ _SA_MENU_H    = 780   # height for main settings panel  (SA + ~620px panel)
 _SA_IDLE_H    = 760   # height for idle-effects panel   (SA + ~600px panel)
 _SA_NATIVE_W  = 300   # spectrum box native width  (scale reference)
 _SA_NATIVE_H  = 62    # spectrum box native height (scale reference)
-_SA_MAX_FPS   = 60    # sliding-window audio loop supports up to 60 fps
+_SA_MAX_FPS      = 60    # sliding-window audio loop supports up to 60 fps
+_IDLE_REF_FPS    = 30.0  # FPS at which idle-effect per-frame constants were tuned
+
+# ── Beat detection constants ──────────────────────────────────────────────────
+_BEAT_HISTORY_FRAMES = 6     # 12 rolling window length (~200 ms at 60 fps)
+_BEAT_RATIO_SCALE    = 0.5    # spike threshold at sens=1.0: 0.5 = must be 50% above rolling avg (1.5× mean)
+                              # practical range: 0.3 (loose) to 1.5 (tight); beat_sens slider divides this
+_BEAT_REFRACTORY_S   = 0.50   # minimum seconds between consecutive beats
+_BEAT_MIN_ENERGY     = 0.50   # per-hit floor: current frame's raw sub-bass energy must exceed this (log scale 0-3)
+_BEAT_MIN_VU         = 0.40   # overall VU gate — below this, no audio worth detecting. scale 0-1
+_BEAT_SUB_BASS_FRAC  = 0.05   # .1 fraction of FFT bands used as sub-bass tap (~20-80 Hz)
 
 # ── Paths ────────────────────────────────────────────────────────────────────
 _VERSION_DIR = os.path.dirname(sys.executable if getattr(sys, "frozen", False) else os.path.abspath(__file__))
@@ -736,9 +747,11 @@ class SpectrumController:
         self._sa_smth_bass      = 0.0   # shared smoother for canvas modes
         self._sa_smth_vu        = 0.0
         self._sa_prev_smth_bass = 0.0
-        self._sa_beat_detected  = False  # unified rising-edge beat signal
-        self._sa_beat_bass_avg  = 0.0   # adaptive running average for beat threshold
-        self._sa_beat_prev      = False  # previous frame beat state
+        self._sa_beat_detected   = False  # unified beat signal (True for one frame per hit)
+        self._sa_beat_history    = collections.deque([0.0] * _BEAT_HISTORY_FRAMES,
+                                                     maxlen=_BEAT_HISTORY_FRAMES)
+        self._sa_beat_last_ts    = 0.0   # monotonic time of last fired beat (refractory)
+        self._sa_raw_bass_energy = 0.0   # pre-whitening sub-bass log-power, written by audio loop
         self._sa_beat_sens      = 1.0   # loaded from active mode's per-mode config
         self._spec_idle_enabled     = True
         self._spec_idle_timeout     = 5.0
@@ -752,6 +765,8 @@ class SpectrumController:
         self._spec_idle_threshold   = 0.02
         self._spec_idle_active      = False
         self._spec_idle_cycle_done  = True
+        self._spec_idle_last_ts     = time.monotonic()
+        self._spec_idle_dt          = 1.0 / _IDLE_REF_FPS
         self._spec_last_audio_ts    = time.monotonic()
         self._spec_idle_text        = " SPECTRUM ANALYZER "
         self._spec_idle_scroll      = 0
@@ -1072,6 +1087,16 @@ class SpectrumController:
                 "params":        _sub_params,
             }
             self._spec_mode_configs[_hallu_path] = _h_base
+        # ── Beat detection test values ────────────────────────────────────────
+        _bt = c.get("beat_test", {})
+        if isinstance(_bt, dict) and _bt:
+            global _BEAT_MIN_VU, _BEAT_MIN_ENERGY, _BEAT_RATIO_SCALE, _BEAT_REFRACTORY_S, _BEAT_SUB_BASS_FRAC
+            _BEAT_MIN_VU        = float(_bt.get("min_vu",        _BEAT_MIN_VU))
+            _BEAT_MIN_ENERGY    = float(_bt.get("min_energy",    _BEAT_MIN_ENERGY))
+            _BEAT_RATIO_SCALE   = float(_bt.get("ratio_scale",   _BEAT_RATIO_SCALE))
+            _BEAT_REFRACTORY_S  = float(_bt.get("refractory_s",  _BEAT_REFRACTORY_S))
+            _BEAT_SUB_BASS_FRAC = float(_bt.get("sub_bass_frac", _BEAT_SUB_BASS_FRAC))
+
         self._apply_per_mode_settings(_active_mode if preserve_mode else self._spec_mode, restart_audio=False)
 
         if not preserve_mode and (self._spec_mode_random_enabled or self._spec_mode_random_on_song):
@@ -1130,6 +1155,14 @@ class SpectrumController:
                 "spec_hallu_base_kind":            str(self._spec_hallu_base_kind),
                 "spec_mode_configs":               json.loads(json.dumps(self._spec_mode_configs)),
                 "aspect_lock":                     bool(self._aspect_lock),
+                # ── Beat detection test (remove this section when tuning is done) ──
+                "beat_test": {
+                    "min_vu":        round(_BEAT_MIN_VU,        3),
+                    "min_energy":    round(_BEAT_MIN_ENERGY,    3),
+                    "ratio_scale":   round(_BEAT_RATIO_SCALE,   3),
+                    "refractory_s":  round(_BEAT_REFRACTORY_S,  3),
+                    "sub_bass_frac": round(_BEAT_SUB_BASS_FRAC, 3),
+                },
             }
             if win_pos:
                 c.update(win_pos)
@@ -2544,6 +2577,66 @@ class SpectrumController:
         ], spacing=4,
         visible=(self._spec_mode in ("beat_saber", "neon_cascade", "rock_stage")))
 
+        # ── Beat detection test sliders (runtime only, no save) ──────────
+        _btest_vis = self._spec_mode in ("beat_saber", "neon_cascade", "rock_stage")
+
+        _bvu_lbl  = ft.Text(f"{_BEAT_MIN_VU:.2f}",       size=11, color="#4fc3f7", width=42)
+        _bme_lbl  = ft.Text(f"{_BEAT_MIN_ENERGY:.2f}",   size=11, color="#4fc3f7", width=42)
+        _brs_lbl  = ft.Text(f"{_BEAT_RATIO_SCALE:.2f}",  size=11, color="#4fc3f7", width=42)
+        _brf_lbl  = ft.Text(f"{_BEAT_REFRACTORY_S:.2f}", size=11, color="#4fc3f7", width=42)
+
+        def on_bvu(e):
+            global _BEAT_MIN_VU
+            _BEAT_MIN_VU = round(float(e.control.value), 2)
+            _bvu_lbl.value = f"{_BEAT_MIN_VU:.2f}"; _bvu_lbl.update()
+            self._config_dirty = True; self._update_save_buttons()
+        def on_bme(e):
+            global _BEAT_MIN_ENERGY
+            _BEAT_MIN_ENERGY = round(float(e.control.value), 2)
+            _bme_lbl.value = f"{_BEAT_MIN_ENERGY:.2f}"; _bme_lbl.update()
+            self._config_dirty = True; self._update_save_buttons()
+        def on_brs(e):
+            global _BEAT_RATIO_SCALE
+            _BEAT_RATIO_SCALE = round(float(e.control.value), 2)
+            _brs_lbl.value = f"{_BEAT_RATIO_SCALE:.2f}"; _brs_lbl.update()
+            self._config_dirty = True; self._update_save_buttons()
+        def on_brf(e):
+            global _BEAT_REFRACTORY_S
+            _BEAT_REFRACTORY_S = round(float(e.control.value), 2)
+            _brf_lbl.value = f"{_BEAT_REFRACTORY_S:.2f}"; _brf_lbl.update()
+            self._config_dirty = True; self._update_save_buttons()
+
+        def _desc(txt):
+            return ft.Text(txt, size=10, color="grey600", italic=True)
+
+        _beat_test_col = ft.Column([
+            _desc("How easily a bass hit triggers. Higher = fires on subtle bumps; lower = hard hits only."),
+            ft.Column([
+                ft.Row([ft.Text("Min VU:",    size=11, color="grey400", width=100),
+                        ft.Slider(min=0.0, max=1.0,  value=_BEAT_MIN_VU,
+                                  divisions=20, on_change=on_bvu, width=140), _bvu_lbl], spacing=4),
+                _desc("Volume gate. No beats fire below this level. Raise to silence low-noise triggers."),
+            ], spacing=1),
+            ft.Column([
+                ft.Row([ft.Text("Min Energy:", size=11, color="grey400", width=100),
+                        ft.Slider(min=0.0, max=2.0,  value=_BEAT_MIN_ENERGY,
+                                  divisions=40, on_change=on_bme, width=140), _bme_lbl], spacing=4),
+                _desc("Minimum raw bass power per hit (log scale 0–3). Raise to reject weak hits; lower to allow them."),
+            ], spacing=1),
+            ft.Column([
+                ft.Row([ft.Text("Ratio Scale:", size=11, color="grey400", width=100),
+                        ft.Slider(min=0.1, max=2.0,  value=_BEAT_RATIO_SCALE,
+                                  divisions=38, on_change=on_brs, width=140), _brs_lbl], spacing=4),
+                _desc("Spike threshold 0.5 = bass must be 50% above its rolling average to count."),
+            ], spacing=1),
+            ft.Column([
+                ft.Row([ft.Text("Refractory:", size=11, color="grey400", width=100),
+                        ft.Slider(min=0.05, max=1.0, value=_BEAT_REFRACTORY_S,
+                                  divisions=19, on_change=on_brf, width=140), _brf_lbl], spacing=4),
+                _desc("Minimum gap between beats (seconds). Prevents double-triggering."),
+            ], spacing=1),
+        ], spacing=6, visible=_btest_vis)
+
         # ── Hallucination sub-mode dropdown ──────────────────────────────
         def on_hallu_submode_change(e):
             _sub = str(e.control.value or "mirror").lower()
@@ -2828,8 +2921,10 @@ class SpectrumController:
                 _hallu_row,
                 _color_mode_col,
                 _canvas_beat_sens_row,
+                _beat_test_col,
                 ft.Divider(height=1, color="grey800"),
-                ft.Row([ft.Text("FPS:", size=12, color="grey400"), _fps_txt,
+                ft.Row([ft.Text("FPS:", size=12, color="grey400"),
+                        ft.Container(content=_fps_txt, width=215),
                         ft.Slider(min=8, max=_SA_MAX_FPS, value=float(self._spec_target_fps),
                                 divisions=22, active_color="#ff9800",
                                 on_change=on_target_fps_change, expand=True)],
@@ -3305,6 +3400,9 @@ class SpectrumController:
             _mode = self._spec_mode_random_current
 
         if self._spec_idle_active:
+            _idle_now = time.monotonic()
+            self._spec_idle_dt = min(0.1, _idle_now - self._spec_idle_last_ts)
+            self._spec_idle_last_ts = _idle_now
             _idle_fx = str(self._spec_idle_effect or "random").lower()
             if _idle_fx == "random":
                 _now = time.monotonic()
@@ -4709,7 +4807,7 @@ class SpectrumController:
         if not _cols: return
         _spd = max(0.25, min(3.0, float(self._spec_idle_speed)))
         _old = self._spec_idle_scroll
-        self._spec_idle_phase += 0.18 * _spd
+        self._spec_idle_phase += 0.18 * _IDLE_REF_FPS * _spd * self._spec_idle_dt
         while self._spec_idle_phase >= 1.0:
             self._spec_idle_phase  -= 1.0
             self._spec_idle_scroll  = (self._spec_idle_scroll + 1) % len(_cols)
@@ -4733,7 +4831,7 @@ class SpectrumController:
         _bands = max(1, self._spec_bands); _levels = max(1, self._spec_levels)
         _spd   = max(0.25, min(3.0, float(self._spec_idle_speed)))
         _old_p = self._spec_idle_phase
-        self._spec_idle_phase += 0.11 * _spd
+        self._spec_idle_phase += 0.11 * _IDLE_REF_FPS * _spd * self._spec_idle_dt
         if self._spec_idle_phase >= 1000.0: self._spec_idle_phase = 0.0
         _p  = self._spec_idle_phase
         _cx = (_bands - 1) / 2.0; _cy = (_levels - 1) / 2.0
@@ -4768,7 +4866,7 @@ class SpectrumController:
             self._pul_key = _gkey
         _max_r = ((_cx**2 + _cy**2)**0.5) + 1.5
         for _st in self._pul_stars:
-            _st[1] += _st[2] * 0.18 * _spd
+            _st[1] += _st[2] * 0.18 * _IDLE_REF_FPS * _spd * self._spec_idle_dt
             if _st[1] > _max_r:
                 _st[1] = min(5.0, _max_r * 0.35)
                 _st[0] = random.uniform(0, 6.2832)
@@ -4787,7 +4885,7 @@ class SpectrumController:
         _bg     = "#101010"
         _track  = _bands + 20
         _old_p  = self._spec_idle_phase
-        self._spec_idle_phase = (self._spec_idle_phase + 0.35 * _spd) % float(_track)
+        self._spec_idle_phase = (self._spec_idle_phase + 0.35 * _IDLE_REF_FPS * _spd * self._spec_idle_dt) % float(_track)
         if self._spec_idle_phase < _old_p:
             self._spec_idle_cycle_done = True
         _y0     = max(0, min(_levels - 5, (_levels // 2) - 2))
@@ -4824,7 +4922,7 @@ class SpectrumController:
         _spd    = max(0.25, min(3.0, float(self._spec_idle_speed)))
         _bg     = "#101010"
         self._spec_idle_cycle_done = True
-        self._spec_idle_phase = (self._spec_idle_phase + 0.85 * _spd) % 100000.0
+        self._spec_idle_phase = (self._spec_idle_phase + 0.85 * _IDLE_REF_FPS * _spd * self._spec_idle_dt) % 100000.0
         _tick   = int(self._spec_idle_phase)
 
         _well_w = max(6, min(10, _bands - 2))
@@ -4889,7 +4987,7 @@ class SpectrumController:
         _spd    = max(0.25, min(3.0, float(self._spec_idle_speed)))
         _bg     = "#101010"
         _old_p  = self._spec_idle_phase
-        self._spec_idle_phase = (self._spec_idle_phase + 0.22 * _spd) % 100000.0
+        self._spec_idle_phase = (self._spec_idle_phase + 0.22 * _IDLE_REF_FPS * _spd * self._spec_idle_dt) % 100000.0
         _phase  = self._spec_idle_phase
 
         _inv_a = ["00100100","01111110","11011011","11111111","01111110","01000010"]
@@ -4940,8 +5038,8 @@ class SpectrumController:
             self._sk_food  = (_r.randint(0, _bands - 1), _r.randint(0, _levels - 1))
             self._sk_tick  = 0.0
 
-        self._sk_tick += 0.55 * _spd
-        _steps = max(1, int(self._sk_tick))
+        self._sk_tick += 0.55 * _IDLE_REF_FPS * _spd * self._spec_idle_dt
+        _steps = int(self._sk_tick)
         self._sk_tick -= _steps
 
         import random as _r
@@ -5068,7 +5166,7 @@ class SpectrumController:
         _line_count = max(1, len(_lines))
         _cycle_px = _start_y + ((_line_count - 1) * _line_gap) + 80
         _old_p = self._spec_idle_phase
-        self._spec_idle_phase = (self._spec_idle_phase + (0.30 * _spd)) % float(max(1, _cycle_px))
+        self._spec_idle_phase = (self._spec_idle_phase + (0.30 * _IDLE_REF_FPS * _spd * self._spec_idle_dt)) % float(max(1, _cycle_px))
         if self._spec_idle_phase < _old_p:
             self._spec_idle_cycle_done = True
         _base_y = _start_y - self._spec_idle_phase
@@ -5146,11 +5244,28 @@ class SpectrumController:
         _sm = self._sm
         self._sa_smth_bass      = _sm(self._sa_smth_bass, self._sa_raw_bass, 0.50, 0.06)
         self._sa_smth_vu        = _sm(self._sa_smth_vu,   self._sa_mono_vu,  0.30, 0.05)
-        self._sa_beat_bass_avg  = self._sa_beat_bass_avg * 0.92 + self._sa_bass * 0.08
-        _bt = max(0.06, self._sa_beat_bass_avg * max(1.05, 1.35 / max(0.1, self._sa_beat_sens)))
-        _beat_now = self._sa_bass > _bt
-        self._sa_beat_detected  = _beat_now and not self._sa_beat_prev
-        self._sa_beat_prev      = _beat_now
+        # ── Beat detection: LedFx-style energy-ratio over rolling window ─────────
+        # Uses pre-whitening sub-bass log-power (written by audio loop) so the
+        # detector sees absolute energy, not the display-smoothed whitened bars.
+        _energy = self._sa_raw_bass_energy
+        if self._sa_mono_vu < _BEAT_MIN_VU:
+            # No real audio — drain history so the baseline is fresh when music returns.
+            for _i in range(_BEAT_HISTORY_FRAMES):
+                self._sa_beat_history[_i] = _energy
+            self._sa_beat_detected = False
+        else:
+            self._sa_beat_history.append(_energy)
+            _hist_mean      = sum(self._sa_beat_history) / _BEAT_HISTORY_FRAMES
+            _required_ratio = _BEAT_RATIO_SCALE / max(0.1, self._sa_beat_sens)
+            _ratio          = (_energy / max(1e-6, _hist_mean)) - 1.0
+            _now_bt         = time.monotonic()
+            self._sa_beat_detected = (
+                _ratio     >= _required_ratio
+                and _energy >= _BEAT_MIN_ENERGY
+                and (_now_bt - self._sa_beat_last_ts) >= _BEAT_REFRACTORY_S
+            )
+            if self._sa_beat_detected:
+                self._sa_beat_last_ts = _now_bt
         self._sa_prev_smth_bass = self._sa_smth_bass
 
     def _extract_audio_bands(self):
@@ -5790,7 +5905,103 @@ class SpectrumController:
             return ghost
 
         # ================================================================
-        # IMAGE / BARS / BLANK PATH -- affine ghost trail
+        # BARS PATH -- rotated polygon history (same pattern as waveform/circle)
+        # ================================================================
+        elif kind == "bars":
+            _hue_spread = 0.7 if _grad else 0.3
+            _bars = self._spec_bars
+            n     = max(1, len(_bars))
+            bar_w = max(1, W // n)
+            _N    = 48
+
+            # Store bar-height arrays + hue as frozen snapshots (same idea as waveform point lists).
+            # Always insert so history keeps advancing on silence — old entries age out and the
+            # screen clears naturally. Empty list on silence draws nothing (bh<1 guard below).
+            hist = aux.setdefault("bars_hist", [])
+            hist.insert(0, (list(_bars[:n]) if not is_silent else [], h_val))
+            while len(hist) > _N:
+                hist.pop()
+
+
+            canvas = _PILImage.new("RGBA", (W, H), (0, 0, 0, 255))
+            cdraw  = _PILDraw.Draw(canvas, "RGBA")
+
+            # Pre-compute rotated corners for each history frame so gap-fill can
+            # reference adjacent frames without re-computing trig.
+            # _frames[fi] = (corners_list, fhue, fbars, alpha)  or  None if skipped
+            # corners_list[i] = (TL, TR, BR, BL) or None for zero-height bars
+            _frames = []
+            for idx in range(1, len(hist)):
+                alpha  = int(255 * (feedback ** idx))   # opacity slider drives trail length
+                fbars, fhue = hist[idx]
+                if alpha < 4:
+                    _frames.append(None)
+                    continue
+                rot_r  = math.radians(idx * rot_step)
+                cs, sn = math.cos(rot_r), math.sin(rot_r)
+                y_off  = idx * y_step
+                corners = []
+                for i, _bv in enumerate(fbars[:n]):
+                    _bh = int(_bv * H)          # no floor — skip silent bars entirely
+                    if _bh < 1:
+                        corners.append(None)
+                        continue
+                    _x0 = float(i * bar_w)         - cx
+                    _x1 = float(i * bar_w + bar_w) - cx
+                    _y0 = float(H - _bh)           - cy
+                    _y1 = float(H)                 - cy
+                    corners.append((
+                        (cx + _x0*cs - _y0*sn, cy + _x0*sn + _y0*cs + y_off),  # TL
+                        (cx + _x1*cs - _y0*sn, cy + _x1*sn + _y0*cs + y_off),  # TR
+                        (cx + _x1*cs - _y1*sn, cy + _x1*sn + _y1*cs + y_off),  # BR
+                        (cx + _x0*cs - _y1*sn, cy + _x0*sn + _y1*cs + y_off),  # BL
+                    ))
+                _frames.append((corners, fhue, fbars, alpha))
+
+            # Draw oldest → newest so newer frames land on top
+            for fi in range(len(_frames) - 1, -1, -1):
+                if _frames[fi] is None:
+                    continue
+                corners, fhue, fbars, alpha = _frames[fi]
+                newer_corners = (_frames[fi - 1][0]
+                                 if fi > 0 and _frames[fi - 1] is not None else None)
+
+                for i in range(min(n, len(corners))):
+                    c = corners[i]
+                    if c is None:
+                        continue
+                    TL, TR, BR, BL = c
+                    _bv = fbars[i] if i < len(fbars) else 0.0
+                    _rv, _gv, _bvv = colorsys.hsv_to_rgb(
+                        (fhue + i / n * _hue_spread) % 1.0, 1.0, 0.5 + _bv * 0.5)
+                    col = (int(_rv*255), int(_gv*255), int(_bvv*255), alpha)
+
+                    # Fill gaps between this frame and the next newer frame
+                    if (newer_corners is not None and
+                            i < len(newer_corners) and newer_corners[i] is not None):
+                        nTL, nTR, nBR, nBL = newer_corners[i]
+                        cdraw.polygon([TL, TR, nTR, nTL], fill=col)  # top bridge
+                        cdraw.polygon([BL, BR, nBR, nBL], fill=col)  # bottom bridge
+
+                    cdraw.polygon([TL, TR, BR, BL], fill=col)
+
+            # Current bars as plain upright rectangles on top — no rotation, no history effect
+            if hist:
+                _cur_bars, _cur_hue = hist[0]
+                for i, _bv in enumerate(_cur_bars[:n]):
+                    _bh = int(_bv * H)
+                    if _bh < 1:
+                        continue
+                    _rv, _gv, _bvv = colorsys.hsv_to_rgb(
+                        (_cur_hue + i / n * _hue_spread) % 1.0, 1.0, 0.5 + _bv * 0.5)
+                    cdraw.rectangle(
+                        [i * bar_w, H - _bh, i * bar_w + bar_w - 1, H - 1],
+                        fill=(int(_rv*255), int(_gv*255), int(_bvv*255), 255))
+
+            return canvas
+
+        # ================================================================
+        # IMAGE / BLANK PATH -- affine ghost trail
         # ================================================================
         fresh_img = self._draw_hallu_base(W, H, bass, mid, treble)
         hist      = aux.setdefault("img_hist", [])
@@ -5960,6 +6171,7 @@ class SpectrumController:
                 if self._spec_idle_active:
                     self._spec_idle_phase = 0.0; self._spec_idle_scroll = 0
                     self._spec_idle_cycle_done = False
+                    self._spec_idle_last_ts = _now
                     if str(self._spec_idle_effect).lower() == "random":
                         self._spec_idle_random_next_ts = _now
                         self._spec_idle_cycle_done = True
@@ -6102,6 +6314,7 @@ class SpectrumController:
                     threading.Thread(target=_render_timer, daemon=True,
                                      name="SA_RenderTimer").start()
                     self._status(f"Audio loop: {_fps_target} fps target, {_fn} frames/block (~{_fn*1000//_sr} ms)", debug_only=True)
+                    _last_render = 0.0
                     while self.running and not self._spec_source_changed and not self._spec_disabled:
                         _t0  = time.monotonic()
                         _buf = _rec.record(numframes=_fn)
@@ -6135,6 +6348,8 @@ class SpectrumController:
                         _spec = _np.abs(_np.fft.rfft(_arr))
                         _sums = _np.add.reduceat(_spec ** 2, _bin_starts)[:_ab]
                         _vals = _np.log1p(_np.sqrt(_sums / _bin_sizes) * 30.0)
+                        _nb   = max(1, int(_ab * _BEAT_SUB_BASS_FRAC))
+                        self._sa_raw_bass_energy = float(_np.mean(_vals[:_nb]))
 
                         _avg_arr = _np.asarray(self._spec_band_avg, dtype=float)
                         if _avg_arr.size != _vals.size:
@@ -6179,12 +6394,14 @@ class SpectrumController:
                         if _idle_on and not self._spec_idle_active:
                             self._spec_idle_phase = 0.0; self._spec_idle_scroll = 0
                             self._spec_idle_cycle_done = False
+                            self._spec_idle_last_ts = _now
                             if str(self._spec_idle_effect).lower() == "random":
                                 self._spec_idle_random_next_ts = _now
                                 self._spec_idle_cycle_done     = True
                         self._spec_idle_active = _idle_on
 
                         if _idle_on:
+                            _ri = self._get_spec_render_interval()
                             if _now - _last_render >= _ri:
                                 self._schedule_render(); _last_render = _now
                             continue
