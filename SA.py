@@ -506,7 +506,7 @@ _SA_MAX_FPS      = 60    # sliding-window audio loop supports up to 60 fps
 _IDLE_REF_FPS    = 30.0  # FPS at which idle-effect per-frame constants were tuned
 
 # ── Beat detection constants ──────────────────────────────────────────────────
-_BEAT_HISTORY_FRAMES = 6     # 12 rolling window length (~200 ms at 60 fps)
+_BEAT_HISTORY_FRAMES = 12     # 12 rolling window length (~200 ms at 60 fps)
 _BEAT_RATIO_SCALE    = 0.5    # spike threshold at sens=1.0: 0.5 = must be 50% above rolling avg (1.5× mean)
                               # practical range: 0.3 (loose) to 1.5 (tight); beat_sens slider divides this
 _BEAT_REFRACTORY_S   = 0.50   # minimum seconds between consecutive beats
@@ -758,6 +758,9 @@ class SpectrumController:
         self._sa_beat_last_ts    = 0.0   # monotonic time of last fired beat (refractory)
         self._sa_raw_bass_energy = 0.0   # pre-whitening sub-bass log-power, written by audio loop
         self._sa_beat_sens      = 1.0   # loaded from active mode's per-mode config
+        self._beat_ind_lit_until      = 0.0   # hold beat indicator lit until this monotonic time
+        self._sa_beat_ind_containers  = []    # all beat-dot Container refs (updated in _sync_render)
+        self._sa_excited_ind_containers = []  # all excited-dot Container refs
         self._spec_idle_enabled     = True
         self._spec_idle_timeout     = 5.0
         self._spec_idle_effect      = "random"
@@ -1407,6 +1410,25 @@ class SpectrumController:
         the caller is responsible for adding ``self.widget`` and
         ``self.menu_host`` to whatever layout it owns.
         """
+        # Reset indicator refs so stale controls from prior build aren't updated
+        self._sa_beat_ind_containers.clear()
+        self._sa_excited_ind_containers.clear()
+
+        def _make_beat_indicators():
+            """Two small status dots: beat (orange) and excited (cyan)."""
+            _bt = ft.Container(width=10, height=10, border_radius=5, bgcolor="#2a2a2a",
+                               tooltip="Beat detected")
+            _ex = ft.Container(width=10, height=10, border_radius=5, bgcolor="#2a2a2a",
+                               tooltip="Excited state")
+            self._sa_beat_ind_containers.append(_bt)
+            self._sa_excited_ind_containers.append(_ex)
+            return ft.Row([
+                ft.Column([_bt, ft.Text("B",  size=7, color="grey600", text_align=ft.TextAlign.CENTER)],
+                          spacing=1, horizontal_alignment=ft.CrossAxisAlignment.CENTER),
+                ft.Column([_ex, ft.Text("E",  size=7, color="grey600", text_align=ft.TextAlign.CENTER)],
+                          spacing=1, horizontal_alignment=ft.CrossAxisAlignment.CENTER),
+            ], spacing=6, vertical_alignment=ft.CrossAxisAlignment.CENTER)
+
         # ── Spectrum palette ──────────────────────────────────────────────
         _spec_palette = [
             "#00a800", "#00b500", "#00c300", "#00d000", "#00dd00", "#22e000",
@@ -1789,6 +1811,25 @@ class SpectrumController:
             _t0 = time.monotonic()
             self._render_spectrum()
             _render_ms = (time.monotonic() - _t0) * 1000.0
+
+            # ── Beat / excited indicators ──────────────────────────────────────
+            _now_ind = time.monotonic()
+            if self._sa_beat_detected:
+                self._beat_ind_lit_until = _now_ind + 0.15
+            _beat_on    = _now_ind < self._beat_ind_lit_until
+            _excited_on = bool(getattr(self, "_spec_hallu_excited", False))
+            for _c in self._sa_beat_ind_containers:
+                _col = "#ff9800" if _beat_on else "#2a2a2a"
+                if _c.bgcolor != _col:
+                    _c.bgcolor = _col
+                    try: _c.update()
+                    except Exception: pass
+            for _c in self._sa_excited_ind_containers:
+                _col = "#00e5ff" if _excited_on else "#2a2a2a"
+                if _c.bgcolor != _col:
+                    _c.bgcolor = _col
+                    try: _c.update()
+                    except Exception: pass
 
             _now = time.monotonic()
             if self._spec_fps_track_ts > 0:
@@ -2576,7 +2617,7 @@ class SpectrumController:
                                       divisions=48, on_change=on_canvas_beat_sens, width=160)
         _canvas_beat_sens_row = ft.Row([
             ft.Text("Beat Sens:", size=11, color="grey400", width=78),
-            _canvas_bs_slider, _canvas_bs_lbl,
+            _canvas_bs_slider, _canvas_bs_lbl, _make_beat_indicators(),
         ], spacing=4,
         visible=(self._spec_mode in ("beat_saber", "neon_cascade", "rock_stage")))
 
@@ -2763,7 +2804,7 @@ class SpectrumController:
             ft.Row([ft.Text("Trail Fade:",  size=11, color="grey400", width=78),
                     _m_op_slider,   _m_op_lbl,   _m_auto_blur_cb], spacing=4),
             ft.Row([ft.Text("Beat Sens:",   size=11, color="grey400", width=78),
-                    _m_bs_slider,   _m_bs_lbl],                      spacing=4),
+                    _m_bs_slider,   _m_bs_lbl, _make_beat_indicators()], spacing=4),
         ], spacing=2,
         visible=(self._spec_mode == "hallucination"
                     and self._spec_hallu_submode == "mirror"))
@@ -2787,7 +2828,7 @@ class SpectrumController:
                                      divisions=48, on_change=on_morph_bs, width=160)
         _morph_sliders_col = ft.Column([
             ft.Row([ft.Text("Beat Sens:", size=11, color="grey400", width=78),
-                    _morph_bs_slider, _morph_bs_lbl], spacing=4),
+                    _morph_bs_slider, _morph_bs_lbl, _make_beat_indicators()], spacing=4),
         ], spacing=2,
         visible=(self._spec_mode == "hallucination"
                     and self._spec_hallu_submode == "morph"))

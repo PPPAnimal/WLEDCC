@@ -18,19 +18,7 @@
 # [Buy Me a Coffee] https://paypal.me/BillSullivan02
 # Inquiries: privatebillsullivan@gmail.com
 # 
-# 
-# 
-# ledfx_monitor_loop
-# fetch_latest_release
-# check_ledfx_updates
-# brightness_worker
-# rainbow_loop
-# unified_poll_loop
-#
-#
-#
-#
-#
+
 
 import flet as ft
 try:
