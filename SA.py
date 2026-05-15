@@ -34,7 +34,7 @@ import io
 import collections
 
 try:
-    from PIL import Image as _PILImage, ImageDraw as _PILDraw, ImageFilter as _PILFilter, ImageFont as _PILFont
+    from PIL import Image as _PILImage, ImageDraw as _PILDraw, ImageFilter as _PILFilter, ImageFont as _PILFont, ImageChops as _PILChops
     _PIL_OK = True
 except Exception:
     _PILImage  = None
@@ -420,7 +420,9 @@ class _PilCanvas:
     """
 
     SCALE = 2       # supersample factor — render at 2×, display at 1×
-    BLOOM = True    # additive Gaussian glow for neon look
+    BLOOM = True    # additive glow for neon look
+    # 40% brightness lookup table for PIL point() used in bloom final blend.
+    _BLOOM_DIM = [round(v * 0.40) for v in range(256)]
 
     def __init__(self, width: int, height: int, image_ctrl):
         self.shapes    = []
@@ -459,32 +461,35 @@ class _PilCanvas:
                 except Exception:
                     pass
 
-            # Neon bloom: only bloom pre-multiply-bright pixels to avoid amplifying
-            # faint full-canvas overlays (beat-flash tints, background hazes).
+            # Resize first — bloom then runs on the small 300×62 image (4× fewer pixels).
+            out = canvas.resize((self._w, self._h), _LANCZOS)
+
+            # Neon bloom: identical float32 luminance-mask algorithm as original,
+            # but on the downscaled output so numpy arrays are 4× smaller → 4× faster.
             if self.BLOOM and _PILFilter is not None:
                 try:
                     import numpy as np
-                    a_arr   = np.array(canvas, dtype=np.float32)
+                    a_arr   = np.array(out, dtype=np.float32)
                     alpha_f = a_arr[..., 3:4] / 255.0
                     pm_rgb  = a_arr[..., :3] * alpha_f
                     lum     = (0.299 * pm_rgb[..., 0] +
-                            0.587 * pm_rgb[..., 1] +
-                            0.114 * pm_rgb[..., 2])
+                               0.587 * pm_rgb[..., 1] +
+                               0.114 * pm_rgb[..., 2])
                     mask    = np.clip(lum / 80.0, 0.0, 1.0)[..., np.newaxis]
                     bloom_src = _PILImage.fromarray(
                         np.clip(a_arr * mask, 0, 255).astype(np.uint8), "RGBA")
-                    glow    = bloom_src.filter(_PILFilter.BoxBlur(radius=S * 1.2))
+                    glow    = bloom_src.filter(_PILFilter.BoxBlur(radius=1.2))
                     g_arr   = np.array(glow, dtype=np.float32)
                     bloomed = np.clip(a_arr + g_arr * 0.40, 0, 255).astype(np.uint8)
-                    canvas  = _PILImage.fromarray(bloomed, "RGBA")
+                    out     = _PILImage.fromarray(bloomed, "RGBA")
                 except Exception:
                     pass
 
-            out = canvas.resize((self._w, self._h), _LANCZOS)
             buf = io.BytesIO()
             out.save(buf, format="PNG", compress_level=1)
             self._img_ctrl.src = buf.getvalue()   # Flet 0.84 accepts raw bytes
             self._img_ctrl.update()
+
         except Exception:
             pass
 
@@ -1796,9 +1801,7 @@ class SpectrumController:
                     _lbl = self._spec_fps_label
                     if _lbl is not None:
                         try:
-                            _lbl.value = (f"{int(self._spec_target_fps)} FPS"
-                                          f"  actual: {self._spec_actual_fps:.0f}"
-                                          f"  render: {_render_ms:.0f}ms")
+                            _lbl.value = f"FPS {self._spec_actual_fps:.0f}/{int(self._spec_target_fps)}"
                             _lbl.update()
                         except Exception:
                             pass
@@ -2306,7 +2309,7 @@ class SpectrumController:
             ]
 
         _sens_pct        = ft.Text(f"{int(self._spec_sensitivity * 100)}%",     size=12, color="#ff9800")
-        _fps_txt         = ft.Text(f"{int(self._spec_target_fps)} FPS",          size=12, color="#ff9800")
+        _fps_txt         = ft.Text(f"FPS --/{int(self._spec_target_fps)}",         size=12, color="#ff9800")
         self._spec_fps_label = _fps_txt
         _bars_txt        = ft.Text(f"{int(self._spec_analysis_bands)}",           size=12, color="#ff9800")
         _react_pct       = ft.Text(f"{self._spec_reactivity:.2f}x",              size=12, color="#ff9800")
@@ -2317,7 +2320,7 @@ class SpectrumController:
 
         def on_target_fps_change(e):
             self._spec_target_fps = max(8, min(_SA_MAX_FPS, int(round(float(e.control.value)))))
-            _fps_txt.value = f"{int(self._spec_target_fps)} FPS (actual: {self._spec_actual_fps:.0f})"
+            _fps_txt.value = f"FPS {self._spec_actual_fps:.0f}/{int(self._spec_target_fps)}"
             _fps_txt.update()
             self._config_dirty = True; self._update_save_buttons()
 
@@ -2923,8 +2926,7 @@ class SpectrumController:
                 _canvas_beat_sens_row,
                 _beat_test_col,
                 ft.Divider(height=1, color="grey800"),
-                ft.Row([ft.Text("FPS:", size=12, color="grey400"),
-                        ft.Container(content=_fps_txt, width=215),
+                ft.Row([_fps_txt,
                         ft.Slider(min=8, max=_SA_MAX_FPS, value=float(self._spec_target_fps),
                                 divisions=22, active_color="#ff9800",
                                 on_change=on_target_fps_change, expand=True)],
@@ -3873,7 +3875,7 @@ class SpectrumController:
             _bc   = _rgb(_bh)
             _bright = 0.45 + _bval * 0.55
             # Multi-pass neon glow (wide+dim → narrow+bright)
-            for _gw, _ga in ((_pw * 4.0, 0.03), (_pw * 2.2, 0.09), (_pw, 0.28), (_pw * 0.42, 0.82)):
+            for _gw, _ga in ((_pw * 0.85, 0.92),):
                 shapes.append(cv.Line(
                     x1=_bx, y1=_H, x2=_bx, y2=_H - _ph,
                     paint=ft.Paint(color=_wo(_ga * _bright, _bc), stroke_width=_gw)))
@@ -3930,11 +3932,10 @@ class SpectrumController:
                 return (int(r * 255), int(g * 255), int(b * 255))
             shapes.append(_PilGradPolyline(
                 _smooth, _nc_cfn,
-                [(8.0, 0.05*_nc_base_a), (3.8, 0.15*_nc_base_a),
-                (1.5, 0.55*_nc_base_a), (0.6, 1.00*_nc_base_a)],
+                [(1.8, 1.00*_nc_base_a)],
                 _W))
         else:
-            for _gw, _ga in ((8.0, 0.05), (3.8, 0.15), (1.5, 0.55), (0.6, 1.00)):
+            for _gw, _ga in ((1.8, 1.00),):
                 shapes.append(cv.Path(elements=_curve_pts,
                     paint=ft.Paint(color=_wo(_ga * (0.4 + _sv * 0.6), _rgb(_hue, 0.7, 1.0)),
                                 stroke_width=_gw, style=ft.PaintingStyle.STROKE)))
@@ -4027,7 +4028,7 @@ class SpectrumController:
             _bright = _s['life'] * (0.38 + _sv * 0.45)
             _sr     = 2.2 * _s['life']
             _sc     = _rgb(_ghue(_s['fi'] / max(1, _ana - 1))) if _is_grad else _C
-            for _r2, _ra in ((_sr * 4.2, 0.04), (_sr * 2.2, 0.13), (_sr * 1.2, 0.42), (_sr, 0.92)):
+            for _r2, _ra in ((_sr * 3.5, 0.08), (_sr, 0.90)):
                 if _r2 < 0.3: continue
                 shapes.append(cv.Circle(x=_s['x'], y=_s['y'], radius=_r2,
                     paint=ft.Paint(color=_wo(min(1.0, _ra * _bright), _sc),
