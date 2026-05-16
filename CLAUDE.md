@@ -11,6 +11,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 - **DRY / reuse first:** Before writing a new helper, look for an existing one that does the same job. UI elements used in more than one place (color swatches, device cards, buttons) must be built by a single factory function or builder method and called everywhere they appear — never duplicated.
 - **No magic values:** Do not hardcode colors, sizes, timeouts, URLs, port numbers, or other tuneable constants inline. Define them as named constants near the top of the file (or in a dedicated constants block) and reference them by name. One place to change, easy to find.
 - **Write for humans:** Keep code readable and linear. Prefer flat, explicit logic over clever one-liners or deeply nested callbacks. A new contributor should be able to read a function top-to-bottom and understand it without tracing five layers of indirection. Avoid spaghetti — if a function is doing too many unrelated things, split it; if two functions are doing the same thing, merge them.
+- **Time-based effects, never frame-based:** All animations, lerps, oscillators, and timers must use elapsed wall-clock seconds (`dt = now - last_ts`), not frame counts. Use `alpha = 1.0 - math.exp(-rate * dt)` for exponential smoothing where `rate` is in units of 1/second. This keeps behaviour identical at 30 fps and 60 fps.
 
 ## Project Overview
 

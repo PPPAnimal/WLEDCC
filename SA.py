@@ -512,6 +512,23 @@ _BEAT_RATIO_SCALE    = 0.5    # spike threshold at sens=1.0: 0.5 = must be 50% a
 _BEAT_REFRACTORY_S   = 0.50   # minimum seconds between consecutive beats
 _BEAT_MIN_ENERGY     = 0.50   # per-hit floor: current frame's raw sub-bass energy must exceed this (log scale 0-3)
 _BEAT_MIN_VU         = 0.40   # overall VU gate — below this, no audio worth detecting. scale 0-1
+
+# ── Excited state constants ───────────────────────────────────────────────────
+_EXCITED_BAR_THRESH = 0.18   # raw bar value to count as "active"
+_EXCITED_ON_SCORE   = 0.50   # integrator must reach this to latch excited ON
+_EXCITED_OFF_SCORE  = 0.22   # integrator must fall below this to latch excited OFF
+# Indicator color breakpoints (score thresholds for black → green → orange → red)
+_EXCITED_IND_GREEN  = 0.15
+_EXCITED_IND_ORANGE = 0.35
+_EXCITED_IND_RED    = 0.60
+
+# Rotation state machine constants (index = excite level 0=black 1=green 2=orange 3=red)
+_ROT_EXCITE_SLIDER_PCT  = (0.0,  0.25, 0.50, 1.00)  # fraction of slider magnitude allowed as rot_max
+_ROT_EXCITE_LERP_RATE   = (4.0,  0.5,  1.2,  2.5)   # lerp rate (1/sec) toward target per level
+_ROT_EXCITE_LERP_RAMP   = 1.0                         # rate (1/sec) at which lerp_rate itself ramps
+_ROT_EXCITE_CENTER_PROB = (1.0,  0.33, 0.25, 0.15)  # probability of picking center (0°) as next target
+_ROT_MAX_HIT_PROB       = 0.30                        # on beat, chance of targeting full rot_max when last target was below it
+_ROT_BEAT_FLIP_PROB     = 0.70                        # on beat, chance of flipping direction vs pushing further in same direction
 _BEAT_SUB_BASS_FRAC  = 0.05   # .1 fraction of FFT bands used as sub-bass tap (~20-80 Hz)
 
 # ── Paths ────────────────────────────────────────────────────────────────────
@@ -534,9 +551,10 @@ _NVU_CONTAIN_DEFAULTS = {"neon_cascade": True, "beat_saber": True}
 
 # Color modes available for random cycling, per visualizer mode
 _CM_RANDOM_POOL = {
-    "beat_saber":   ("loop", "gradient"),
-    "neon_cascade": ("loop", "gradient"),
-    "rock_stage":   ("loop", "gradient", "loop_smoke", "gradient_smoke"),
+    "beat_saber":    ("loop", "gradient"),
+    "neon_cascade":  ("loop", "gradient"),
+    "rock_stage":    ("loop", "gradient", "loop_smoke", "gradient_smoke"),
+    "hallucination": ("loop", "gradient"),
 }
 
 # ── Mode hierarchy — single source of truth for the random-playlist tree ──────
@@ -758,6 +776,11 @@ class SpectrumController:
         self._sa_beat_last_ts    = 0.0   # monotonic time of last fired beat (refractory)
         self._sa_raw_bass_energy = 0.0   # pre-whitening sub-bass log-power, written by audio loop
         self._sa_beat_sens      = 1.0   # loaded from active mode's per-mode config
+        # Per-mode beat detection params (replace global constants at runtime)
+        self._sa_beat_min_vu       = _BEAT_MIN_VU
+        self._sa_beat_min_energy   = _BEAT_MIN_ENERGY
+        self._sa_beat_ratio_scale  = _BEAT_RATIO_SCALE
+        self._sa_beat_refractory_s = _BEAT_REFRACTORY_S
         self._beat_ind_lit_until      = 0.0   # hold beat indicator lit until this monotonic time
         self._sa_beat_ind_containers  = []    # all beat-dot Container refs (updated in _sync_render)
         self._sa_excited_ind_containers = []  # all excited-dot Container refs
@@ -819,7 +842,7 @@ class SpectrumController:
         self._spec_hallu_submode               = "mirror"
         self._spec_hallu_params_per_submode    = {
             "mirror":   {"zoom": 0.85,   "rotDeg": 10.0,   "opacity": 1.0,    "beat_sens": 2.0,  "dim_thresh": 0.25},
-            "chroma":   {"maxSplit": 14, "trail": 0.18},
+            "chroma":   {"maxSplit": 14, "trail": 0.18, "speed": 1.0, "auto_speed": True},
             "perlin":   {"noiseScale": 0.012, "evolveRate": 0.30},
             "morph":    {"layers": 3, "jitter": 1.0, "beat_sens": 1.0},
         }
@@ -837,10 +860,20 @@ class SpectrumController:
         self._spec_hallu_auto_spread           = True
         self._spec_hallu_auto_blur             = True
 
-        self._spec_hallu_excited             = False
-        self._spec_hallu_excited_ts          = 0.0
-        self._spec_hallu_excited_prev       = False
-        self._spec_hallu_rot_smooth        = 0.0
+        # Unified excited state (computed in _compute_audio_frame, used by any mode)
+        self._sa_excited            = False
+        self._sa_excited_score      = 0.0   # running broad-activity integrator [0..1]
+        self._sa_excited_prev_state = False
+        # Rotation state machine (shared by hallucination/mirror/waveform)
+        self._sa_rot_level            = 0
+        self._sa_rot_level_held_until = 0.0   # peak-hold: level can't drop until this timestamp
+        self._sa_rot_target           = 0.0
+        self._sa_rot_current    = 0.0
+        self._sa_rot_lerp_rate  = 1.5
+        self._sa_rot_last_ts   = 0.0
+        self._sa_rot_prev_beat = False
+        # Time-based hallucination rendering
+        self._hallu_last_render_ts  = 0.0
         self._hallu_img                        = None
         self._hallu_host                       = None
 
@@ -1324,18 +1357,30 @@ class SpectrumController:
         }
         if mode == "hallucination":
             _sub = self._spec_hallu_submode
+            # Merge current beat params into the active submode's params dict before saving
+            _sub_params = dict(self._spec_hallu_params_per_submode.get(_sub, {}))
+            _sub_params.update({
+                "beat_sens":         float(self._sa_beat_sens),
+                "beat_min_vu":       float(self._sa_beat_min_vu),
+                "beat_min_energy":   float(self._sa_beat_min_energy),
+                "beat_ratio_scale":  float(self._sa_beat_ratio_scale),
+                "beat_refractory_s": float(self._sa_beat_refractory_s),
+            })
             _entry["extras"] = {
                 "color_mode":  str(self._spec_color_mode_per_mode.get("hallucination", "loop")),
-                "auto_rot":      bool(self._spec_hallu_auto_rot),
-                "auto_spread":   bool(self._spec_hallu_auto_spread),
-                "auto_blur":     bool(self._spec_hallu_auto_blur),
-
-                "params":        dict(self._spec_hallu_params_per_submode.get(_sub, {})),
+                "auto_rot":    bool(self._spec_hallu_auto_rot),
+                "auto_spread": bool(self._spec_hallu_auto_spread),
+                "auto_blur":   bool(self._spec_hallu_auto_blur),
+                "params":      _sub_params,
             }
         elif mode in self._spec_color_mode_per_mode:
             _entry["extras"] = {
-                "color_mode": str(self._spec_color_mode_per_mode.get(mode, "gradient")),
-                "beat_sens":  float(self._sa_beat_sens),
+                "color_mode":        str(self._spec_color_mode_per_mode.get(mode, "gradient")),
+                "beat_sens":         float(self._sa_beat_sens),
+                "beat_min_vu":       float(self._sa_beat_min_vu),
+                "beat_min_energy":   float(self._sa_beat_min_energy),
+                "beat_ratio_scale":  float(self._sa_beat_ratio_scale),
+                "beat_refractory_s": float(self._sa_beat_refractory_s),
             }
         self._spec_mode_configs[_path] = _entry
 
@@ -1364,44 +1409,58 @@ class SpectrumController:
             self._spec_eq_gains = [1.0] * len(self._spec_eq_freqs)
         # Apply mode-specific extras
         _x = _s.get("extras") if isinstance(_s.get("extras"), dict) else {}
+
+        def _load_beat_params(src, default_sens=1.0):
+            """Load all 5 beat detection params from src dict into instance vars."""
+            self._sa_beat_sens         = float(src.get("beat_sens",         default_sens))
+            self._sa_beat_min_vu       = float(src.get("beat_min_vu",       _BEAT_MIN_VU))
+            self._sa_beat_min_energy   = float(src.get("beat_min_energy",   _BEAT_MIN_ENERGY))
+            self._sa_beat_ratio_scale  = float(src.get("beat_ratio_scale",  _BEAT_RATIO_SCALE))
+            self._sa_beat_refractory_s = float(src.get("beat_refractory_s", _BEAT_REFRACTORY_S))
+
+        _hallu_sub_defaults = {
+            "mirror": {"zoom": 0.85, "rotDeg": 10.0, "opacity": 1.0,
+                       "beat_sens": 2.0, "dim_thresh": 0.25},
+            "chroma": {"maxSplit": 14, "trail": 0.18, "speed": 1.0, "auto_speed": True},
+            "perlin": {"noiseScale": 0.012, "evolveRate": 0.30},
+            "morph":  {"layers": 3, "jitter": 1.0, "beat_sens": 1.0},
+        }
+
         if not _x:
-            if mode in self._spec_color_mode_per_mode:
-                self._sa_beat_sens = 1.0
-            elif mode == "hallucination":
+            if mode == "hallucination":
                 _sub = self._spec_hallu_submode
+                _merged = self._spec_hallu_params_per_submode.get(
+                    _sub, _hallu_sub_defaults.get(_sub, {}))
                 _default_bs = 2.0 if _sub == "mirror" else 1.0
-                self._sa_beat_sens = float(
-                    self._spec_hallu_params_per_submode.get(_sub, {}).get("beat_sens", _default_bs))
+                _load_beat_params(_merged, _default_bs)
+            elif mode in self._spec_color_mode_per_mode:
+                _load_beat_params({})
             return
+
         if mode == "hallucination":
             _sub = self._spec_hallu_submode
             _cm = str(_x.get("color_mode", "random")).lower()
             self._spec_color_mode_per_mode["hallucination"] = _cm if _cm in ("loop", "gradient", "random") else "random"
-            self._spec_hallu_auto_rot       = bool(_x.get("auto_rot",       True))
-            self._spec_hallu_auto_spread    = bool(_x.get("auto_spread",    True))
-            self._spec_hallu_auto_blur      = bool(_x.get("auto_blur",      True))
-
-            _defaults = {
-                "mirror":   {"zoom": 0.85,   "rotDeg": 10.0,   "opacity": 1.0,    "beat_sens": 2.0,  "dim_thresh": 0.25},
-                "chroma":   {"maxSplit": 14, "trail": 0.18},
-                "perlin":   {"noiseScale": 0.012, "evolveRate": 0.30},
-                "morph":    {"layers": 3, "jitter": 1.0, "beat_sens": 1.0},
-            }
+            self._spec_bs_color_mode = self._spec_color_mode_per_mode["hallucination"]
+            self._spec_hallu_auto_rot    = bool(_x.get("auto_rot",    True))
+            self._spec_hallu_auto_spread = bool(_x.get("auto_spread", True))
+            self._spec_hallu_auto_blur   = bool(_x.get("auto_blur",   True))
             _params = _x.get("params", {})
             if isinstance(_params, dict) and _params:
                 self._spec_hallu_params_per_submode[_sub] = {
-                    **_defaults.get(_sub, {}), **_params
+                    **_hallu_sub_defaults.get(_sub, {}), **_params
                 }
-            _merged = self._spec_hallu_params_per_submode.get(_sub, _defaults.get(_sub, {}))
+            _merged = self._spec_hallu_params_per_submode.get(
+                _sub, _hallu_sub_defaults.get(_sub, {}))
             _default_bs = 2.0 if _sub == "mirror" else 1.0
-            self._sa_beat_sens = float(_merged.get("beat_sens", _default_bs))
+            _load_beat_params(_merged, _default_bs)
         elif mode in self._spec_color_mode_per_mode:
             _valid_cm = ("loop", "gradient", "loop_smoke", "gradient_smoke", "random")
             _cm = str(_x.get("color_mode", "gradient")).lower()
             self._spec_color_mode_per_mode[mode] = _cm if _cm in _valid_cm else "gradient"
             self._spec_bs_color_mode = self._spec_color_mode_per_mode.get(
                 mode, self._spec_color_mode_per_mode.get("beat_saber", "gradient"))
-            self._sa_beat_sens = float(_x.get("beat_sens", 1.0))
+            _load_beat_params(_x)
 
     # ── Controls builder ──────────────────────────────────────────────────────
 
@@ -1410,25 +1469,6 @@ class SpectrumController:
         the caller is responsible for adding ``self.widget`` and
         ``self.menu_host`` to whatever layout it owns.
         """
-        # Reset indicator refs so stale controls from prior build aren't updated
-        self._sa_beat_ind_containers.clear()
-        self._sa_excited_ind_containers.clear()
-
-        def _make_beat_indicators():
-            """Two small status dots: beat (orange) and excited (cyan)."""
-            _bt = ft.Container(width=10, height=10, border_radius=5, bgcolor="#2a2a2a",
-                               tooltip="Beat detected")
-            _ex = ft.Container(width=10, height=10, border_radius=5, bgcolor="#2a2a2a",
-                               tooltip="Excited state")
-            self._sa_beat_ind_containers.append(_bt)
-            self._sa_excited_ind_containers.append(_ex)
-            return ft.Row([
-                ft.Column([_bt, ft.Text("B",  size=7, color="grey600", text_align=ft.TextAlign.CENTER)],
-                          spacing=1, horizontal_alignment=ft.CrossAxisAlignment.CENTER),
-                ft.Column([_ex, ft.Text("E",  size=7, color="grey600", text_align=ft.TextAlign.CENTER)],
-                          spacing=1, horizontal_alignment=ft.CrossAxisAlignment.CENTER),
-            ], spacing=6, vertical_alignment=ft.CrossAxisAlignment.CENTER)
-
         # ── Spectrum palette ──────────────────────────────────────────────
         _spec_palette = [
             "#00a800", "#00b500", "#00c300", "#00d000", "#00dd00", "#22e000",
@@ -1817,17 +1857,20 @@ class SpectrumController:
             if self._sa_beat_detected:
                 self._beat_ind_lit_until = _now_ind + 0.15
             _beat_on    = _now_ind < self._beat_ind_lit_until
-            _excited_on = bool(getattr(self, "_spec_hallu_excited", False))
             for _c in self._sa_beat_ind_containers:
                 _col = "#ff9800" if _beat_on else "#2a2a2a"
                 if _c.bgcolor != _col:
                     _c.bgcolor = _col
                     try: _c.update()
                     except Exception: pass
+            _ex_level = self._sa_rot_level
+            _ex_col   = ("#f44336" if _ex_level >= 3 else
+                         "#ff9800" if _ex_level >= 2 else
+                         "#00c853" if _ex_level >= 1 else
+                         "#2a2a2a")
             for _c in self._sa_excited_ind_containers:
-                _col = "#00e5ff" if _excited_on else "#2a2a2a"
-                if _c.bgcolor != _col:
-                    _c.bgcolor = _col
+                if _c.bgcolor != _ex_col:
+                    _c.bgcolor = _ex_col
                     try: _c.update()
                     except Exception: pass
 
@@ -2237,6 +2280,27 @@ class SpectrumController:
         self._status("Spectrum settings opened")
         self._refresh_spectrum_sources()
 
+        # Reset indicator refs so stale containers from prior open aren't updated
+        self._sa_beat_ind_containers.clear()
+        self._sa_excited_ind_containers.clear()
+
+        def _make_beat_indicators():
+            """Two small status dots: beat (orange) and excited (cyan)."""
+            _bt = ft.Container(width=10, height=10, border_radius=5, bgcolor="#2a2a2a",
+                               tooltip="Beat detected")
+            _ex = ft.Container(width=10, height=10, border_radius=5, bgcolor="#2a2a2a",
+                               tooltip="Excited state")
+            self._sa_beat_ind_containers.append(_bt)
+            self._sa_excited_ind_containers.append(_ex)
+            return ft.Row([
+                ft.Column([_bt, ft.Text("B", size=7, color="grey600",
+                                        text_align=ft.TextAlign.CENTER)],
+                          spacing=1, horizontal_alignment=ft.CrossAxisAlignment.CENTER),
+                ft.Column([_ex, ft.Text("E", size=7, color="grey600",
+                                        text_align=ft.TextAlign.CENTER)],
+                          spacing=1, horizontal_alignment=ft.CrossAxisAlignment.CENTER),
+            ], spacing=6, vertical_alignment=ft.CrossAxisAlignment.CENTER)
+
         _sens_slider = _react_slider = None
         _bar_decay_slider = _peak_decay_slider = None
 
@@ -2605,81 +2669,63 @@ class SpectrumController:
         ], spacing=8, vertical_alignment=ft.CrossAxisAlignment.CENTER,
         visible=(self._spec_mode in ("beat_saber", "neon_cascade", "rock_stage")))
 
-        _canvas_bs_init = float(self._spec_mode_configs.get(self._spec_mode, {}).get(
-            "extras", {}).get("beat_sens", 1.0))
-        _canvas_bs_lbl = ft.Text(f"{_canvas_bs_init:.1f}", size=11, color="#ff9800", width=42)
-        def on_canvas_beat_sens(e):
-            v = round(float(e.control.value), 1)
-            self._sa_beat_sens = v
-            _canvas_bs_lbl.value = f"{v:.1f}"; _canvas_bs_lbl.update()
-            self._config_dirty = True; self._update_save_buttons()
-        _canvas_bs_slider = ft.Slider(min=0.2, max=5.0, value=_canvas_bs_init,
-                                      divisions=48, on_change=on_canvas_beat_sens, width=160)
-        _canvas_beat_sens_row = ft.Row([
-            ft.Text("Beat Sens:", size=11, color="grey400", width=78),
-            _canvas_bs_slider, _canvas_bs_lbl, _make_beat_indicators(),
-        ], spacing=4,
-        visible=(self._spec_mode in ("beat_saber", "neon_cascade", "rock_stage")))
-
-        # ── Beat detection test sliders (runtime only, no save) ──────────
-        _btest_vis = self._spec_mode in ("beat_saber", "neon_cascade", "rock_stage")
-
-        _bvu_lbl  = ft.Text(f"{_BEAT_MIN_VU:.2f}",       size=11, color="#4fc3f7", width=42)
-        _bme_lbl  = ft.Text(f"{_BEAT_MIN_ENERGY:.2f}",   size=11, color="#4fc3f7", width=42)
-        _brs_lbl  = ft.Text(f"{_BEAT_RATIO_SCALE:.2f}",  size=11, color="#4fc3f7", width=42)
-        _brf_lbl  = ft.Text(f"{_BEAT_REFRACTORY_S:.2f}", size=11, color="#4fc3f7", width=42)
-
-        def on_bvu(e):
-            global _BEAT_MIN_VU
-            _BEAT_MIN_VU = round(float(e.control.value), 2)
-            _bvu_lbl.value = f"{_BEAT_MIN_VU:.2f}"; _bvu_lbl.update()
-            self._config_dirty = True; self._update_save_buttons()
-        def on_bme(e):
-            global _BEAT_MIN_ENERGY
-            _BEAT_MIN_ENERGY = round(float(e.control.value), 2)
-            _bme_lbl.value = f"{_BEAT_MIN_ENERGY:.2f}"; _bme_lbl.update()
-            self._config_dirty = True; self._update_save_buttons()
-        def on_brs(e):
-            global _BEAT_RATIO_SCALE
-            _BEAT_RATIO_SCALE = round(float(e.control.value), 2)
-            _brs_lbl.value = f"{_BEAT_RATIO_SCALE:.2f}"; _brs_lbl.update()
-            self._config_dirty = True; self._update_save_buttons()
-        def on_brf(e):
-            global _BEAT_REFRACTORY_S
-            _BEAT_REFRACTORY_S = round(float(e.control.value), 2)
-            _brf_lbl.value = f"{_BEAT_REFRACTORY_S:.2f}"; _brf_lbl.update()
-            self._config_dirty = True; self._update_save_buttons()
-
         def _desc(txt):
             return ft.Text(txt, size=10, color="grey600", italic=True)
 
-        _beat_test_col = ft.Column([
-            _desc("How easily a bass hit triggers. Higher = fires on subtle bumps; lower = hard hits only."),
-            ft.Column([
-                ft.Row([ft.Text("Min VU:",    size=11, color="grey400", width=100),
-                        ft.Slider(min=0.0, max=1.0,  value=_BEAT_MIN_VU,
-                                  divisions=20, on_change=on_bvu, width=140), _bvu_lbl], spacing=4),
-                _desc("Volume gate. No beats fire below this level. Raise to silence low-noise triggers."),
-            ], spacing=1),
-            ft.Column([
-                ft.Row([ft.Text("Min Energy:", size=11, color="grey400", width=100),
-                        ft.Slider(min=0.0, max=2.0,  value=_BEAT_MIN_ENERGY,
-                                  divisions=40, on_change=on_bme, width=140), _bme_lbl], spacing=4),
-                _desc("Minimum raw bass power per hit (log scale 0–3). Raise to reject weak hits; lower to allow them."),
-            ], spacing=1),
-            ft.Column([
+        def _make_beat_params_col(visible_cond, src=None):
+            """Build the 5-slider Beat Detection block. src=dict of initial values (or None=instance vars)."""
+            _s = src or {}
+            _bs_i   = float(_s.get("beat_sens",         self._sa_beat_sens))
+            _vu_i   = float(_s.get("beat_min_vu",       self._sa_beat_min_vu))
+            _me_i   = float(_s.get("beat_min_energy",   self._sa_beat_min_energy))
+            _rs_i   = float(_s.get("beat_ratio_scale",  self._sa_beat_ratio_scale))
+            _rf_i   = float(_s.get("beat_refractory_s", self._sa_beat_refractory_s))
+            _lbs = ft.Text(f"{_bs_i:.1f}", size=11, color="#ff9800", width=42)
+            _lvu = ft.Text(f"{_vu_i:.2f}", size=11, color="#4fc3f7", width=42)
+            _lme = ft.Text(f"{_me_i:.2f}", size=11, color="#4fc3f7", width=42)
+            _lrs = ft.Text(f"{_rs_i:.2f}", size=11, color="#4fc3f7", width=42)
+            _lrf = ft.Text(f"{_rf_i:.2f}", size=11, color="#4fc3f7", width=42)
+            def _on_bs(e):
+                self._sa_beat_sens = round(float(e.control.value), 1)
+                _lbs.value = f"{self._sa_beat_sens:.1f}"; _lbs.update()
+                self._config_dirty = True; self._update_save_buttons()
+            def _on_vu(e):
+                self._sa_beat_min_vu = round(float(e.control.value), 2)
+                _lvu.value = f"{self._sa_beat_min_vu:.2f}"; _lvu.update()
+                self._config_dirty = True; self._update_save_buttons()
+            def _on_me(e):
+                self._sa_beat_min_energy = round(float(e.control.value), 2)
+                _lme.value = f"{self._sa_beat_min_energy:.2f}"; _lme.update()
+                self._config_dirty = True; self._update_save_buttons()
+            def _on_rs(e):
+                self._sa_beat_ratio_scale = round(float(e.control.value), 2)
+                _lrs.value = f"{self._sa_beat_ratio_scale:.2f}"; _lrs.update()
+                self._config_dirty = True; self._update_save_buttons()
+            def _on_rf(e):
+                self._sa_beat_refractory_s = round(float(e.control.value), 2)
+                _lrf.value = f"{self._sa_beat_refractory_s:.2f}"; _lrf.update()
+                self._config_dirty = True; self._update_save_buttons()
+            return ft.Column([
+                ft.Text("Beat Detection", size=11, color="grey500"),
+                ft.Row([ft.Text("Beat Sens:",   size=11, color="grey400", width=100),
+                        ft.Slider(min=0.2, max=5.0, value=_bs_i, divisions=48,
+                                  on_change=_on_bs, width=140), _lbs], spacing=4),
+                ft.Row([ft.Text("Refractory:",  size=11, color="grey400", width=100),
+                        ft.Slider(min=0.05, max=2.0, value=_rf_i, divisions=39,
+                                  on_change=_on_rf, width=140), _lrf], spacing=4),
+                ft.Row([ft.Text("Min VU:",      size=11, color="grey400", width=100),
+                        ft.Slider(min=0.0, max=1.0,  value=_vu_i, divisions=20,
+                                  on_change=_on_vu, width=140), _lvu], spacing=4),
+                ft.Row([ft.Text("Min Energy:",  size=11, color="grey400", width=100),
+                        ft.Slider(min=0.0, max=2.0,  value=_me_i, divisions=40,
+                                  on_change=_on_me, width=140), _lme], spacing=4),
                 ft.Row([ft.Text("Ratio Scale:", size=11, color="grey400", width=100),
-                        ft.Slider(min=0.1, max=2.0,  value=_BEAT_RATIO_SCALE,
-                                  divisions=38, on_change=on_brs, width=140), _brs_lbl], spacing=4),
-                _desc("Spike threshold 0.5 = bass must be 50% above its rolling average to count."),
-            ], spacing=1),
-            ft.Column([
-                ft.Row([ft.Text("Refractory:", size=11, color="grey400", width=100),
-                        ft.Slider(min=0.05, max=1.0, value=_BEAT_REFRACTORY_S,
-                                  divisions=19, on_change=on_brf, width=140), _brf_lbl], spacing=4),
-                _desc("Minimum gap between beats (seconds). Prevents double-triggering."),
-            ], spacing=1),
-        ], spacing=6, visible=_btest_vis)
+                        ft.Slider(min=0.1, max=2.0,  value=_rs_i, divisions=38,
+                                  on_change=_on_rs, width=140), _lrs], spacing=4),
+            ], spacing=3, visible=visible_cond)
+
+        _canvas_beat_params = _make_beat_params_col(
+            self._spec_mode in ("beat_saber", "neon_cascade", "rock_stage"))
 
         # ── Hallucination sub-mode dropdown ──────────────────────────────
         def on_hallu_submode_change(e):
@@ -2787,14 +2833,8 @@ class SpectrumController:
             on_change=lambda e: setattr(self, "_spec_hallu_auto_blur", bool(e.control.value)),
             active_color="#ff9800", scale=0.8,
         )
-        _m_bs_init   = float(self._spec_hallu_params_per_submode.get("mirror", {}).get("beat_sens", 1.0))
-        _m_bs_lbl    = ft.Text(f"{_m_bs_init:.1f}", size=11, color="#ff9800", width=42)
-        def on_m_bs(e):
-            v = round(float(e.control.value), 1)
-            self._sa_beat_sens = v
-            _mirror_param_set("beat_sens", v); _m_bs_lbl.value = f"{v:.1f}"; _m_bs_lbl.update()
-        _m_bs_slider = ft.Slider(min=0.2, max=5.0, value=_m_bs_init,
-                                divisions=48, on_change=on_m_bs, width=160)
+        _is_hallu = self._spec_mode == "hallucination"
+        _cur_sub  = self._spec_hallu_submode
 
         _mirror_sliders_col = ft.Column([
             ft.Row([ft.Text("Ghost Spread:", size=11, color="grey400", width=78),
@@ -2803,11 +2843,10 @@ class SpectrumController:
                     _m_rot_slider,  _m_rot_lbl,  _m_auto_rot_cb],  spacing=4),
             ft.Row([ft.Text("Trail Fade:",  size=11, color="grey400", width=78),
                     _m_op_slider,   _m_op_lbl,   _m_auto_blur_cb], spacing=4),
-            ft.Row([ft.Text("Beat Sens:",   size=11, color="grey400", width=78),
-                    _m_bs_slider,   _m_bs_lbl, _make_beat_indicators()], spacing=4),
+            _make_beat_params_col(True,
+                src=self._spec_hallu_params_per_submode.get("mirror", {})),
         ], spacing=2,
-        visible=(self._spec_mode == "hallucination"
-                    and self._spec_hallu_submode == "mirror"))
+        visible=(_is_hallu and _cur_sub == "mirror"))
 
         def _morph_param_set(key, value):
             try:
@@ -2817,21 +2856,51 @@ class SpectrumController:
             except Exception:
                 pass
 
-        _morph_bs_init = float(self._spec_hallu_params_per_submode.get("morph", {}).get("beat_sens", 1.0))
-        _morph_bs_lbl  = ft.Text(f"{_morph_bs_init:.1f}", size=11, color="#ff9800", width=42)
-        def on_morph_bs(e):
-            v = round(float(e.control.value), 1)
-            self._sa_beat_sens = v
-            _morph_param_set("beat_sens", v)
-            _morph_bs_lbl.value = f"{v:.1f}"; _morph_bs_lbl.update()
-        _morph_bs_slider = ft.Slider(min=0.2, max=5.0, value=_morph_bs_init,
-                                     divisions=48, on_change=on_morph_bs, width=160)
         _morph_sliders_col = ft.Column([
-            ft.Row([ft.Text("Beat Sens:", size=11, color="grey400", width=78),
-                    _morph_bs_slider, _morph_bs_lbl, _make_beat_indicators()], spacing=4),
+            _make_beat_params_col(True,
+                src=self._spec_hallu_params_per_submode.get("morph", {})),
         ], spacing=2,
-        visible=(self._spec_mode == "hallucination"
-                    and self._spec_hallu_submode == "morph"))
+        visible=(_is_hallu and _cur_sub == "morph"))
+
+        _chroma_p          = self._spec_hallu_params_per_submode.get("chroma", {})
+        _chroma_off_init   = float(_chroma_p.get("maxSplit", 14))
+        _chroma_spd_init   = min(2.0, max(0.0, float(_chroma_p.get("speed", 1.0))))
+        _chroma_autos_init = bool(_chroma_p.get("auto_speed", True))
+        _chroma_off_lbl    = ft.Text(f"{_chroma_off_init:.0f}", size=11, color="#ff9800", width=36)
+        _chroma_spd_lbl    = ft.Text(f"{_chroma_spd_init:.1f}", size=11, color="#ff9800", width=36)
+        async def _on_chroma_offset(e):
+            v = float(e.control.value)
+            self._spec_hallu_params_per_submode.setdefault("chroma", {})["maxSplit"] = v
+            _chroma_off_lbl.value = f"{v:.0f}"; _chroma_off_lbl.update()
+            self._config_dirty = True; self._update_save_buttons()
+        async def _on_chroma_speed(e):
+            v = float(e.control.value)
+            self._spec_hallu_params_per_submode.setdefault("chroma", {})["speed"] = v
+            _chroma_spd_lbl.value = f"{v:.1f}"; _chroma_spd_lbl.update()
+            self._config_dirty = True; self._update_save_buttons()
+        _chroma_auto_spd_cb = ft.Checkbox(
+            label="Auto", value=_chroma_autos_init,
+            on_change=lambda e: (
+                self._spec_hallu_params_per_submode.setdefault("chroma", {}).update({"auto_speed": bool(e.control.value)})
+                or setattr(self, "_config_dirty", True)
+                or self._update_save_buttons()
+            ),
+            active_color="#ff9800", scale=0.8,
+        )
+        _chroma_sliders_col = ft.Column([
+            ft.Text("Chromatic", size=11, color="grey500"),
+            ft.Row([ft.Text("Max Offset:", size=11, color="grey400", width=78),
+                    ft.Slider(min=0, max=40, value=_chroma_off_init, divisions=40,
+                              on_change=_on_chroma_offset, width=140), _chroma_off_lbl], spacing=4),
+            ft.Row([ft.Text("Excite Speed:", size=11, color="grey400", width=78),
+                    ft.Slider(min=0.0, max=2.0, value=_chroma_spd_init, divisions=20,
+                              on_change=_on_chroma_speed, width=140),
+                    _chroma_spd_lbl, _chroma_auto_spd_cb], spacing=4),
+        ], spacing=3, visible=(_is_hallu and _cur_sub == "chroma"))
+
+        _perlin_beat_col = _make_beat_params_col(
+            _is_hallu and _cur_sub == "perlin",
+            src=self._spec_hallu_params_per_submode.get("perlin", {}))
 
         _hallu_cm_init = self._spec_color_mode_per_mode.get("hallucination", "loop")
         _hallu_cm_dd = ft.Dropdown(
@@ -2850,6 +2919,8 @@ class SpectrumController:
                 spacing=8, vertical_alignment=ft.CrossAxisAlignment.CENTER),
             _mirror_sliders_col,
             _morph_sliders_col,
+            _chroma_sliders_col,
+            _perlin_beat_col,
         ], spacing=2, visible=(self._spec_mode == "hallucination"))
 
         # EQ section
@@ -2964,8 +3035,7 @@ class SpectrumController:
                 _bg_col,
                 _hallu_row,
                 _color_mode_col,
-                _canvas_beat_sens_row,
-                _beat_test_col,
+                _canvas_beat_params,
                 ft.Divider(height=1, color="grey800"),
                 ft.Row([_fps_txt,
                         ft.Slider(min=8, max=_SA_MAX_FPS, value=float(self._spec_target_fps),
@@ -3390,8 +3460,9 @@ class SpectrumController:
             content=ft.Column([
                 ft.Row([
                     ft.Container(expand=True),
+                    _make_beat_indicators(),
                     _close_btn,
-                ], spacing=0),
+                ], spacing=6),
                 _tabs,
                 ft.Divider(height=1, color="grey700"),
                 ft.Row([
@@ -5290,7 +5361,7 @@ class SpectrumController:
         # Uses pre-whitening sub-bass log-power (written by audio loop) so the
         # detector sees absolute energy, not the display-smoothed whitened bars.
         _energy = self._sa_raw_bass_energy
-        if self._sa_mono_vu < _BEAT_MIN_VU:
+        if self._sa_mono_vu < self._sa_beat_min_vu:
             # No real audio — drain history so the baseline is fresh when music returns.
             for _i in range(_BEAT_HISTORY_FRAMES):
                 self._sa_beat_history[_i] = _energy
@@ -5298,17 +5369,52 @@ class SpectrumController:
         else:
             self._sa_beat_history.append(_energy)
             _hist_mean      = sum(self._sa_beat_history) / _BEAT_HISTORY_FRAMES
-            _required_ratio = _BEAT_RATIO_SCALE / max(0.1, self._sa_beat_sens)
+            _required_ratio = self._sa_beat_ratio_scale / max(0.1, self._sa_beat_sens)
             _ratio          = (_energy / max(1e-6, _hist_mean)) - 1.0
             _now_bt         = time.monotonic()
             self._sa_beat_detected = (
                 _ratio     >= _required_ratio
-                and _energy >= _BEAT_MIN_ENERGY
-                and (_now_bt - self._sa_beat_last_ts) >= _BEAT_REFRACTORY_S
+                and _energy >= self._sa_beat_min_energy
+                and (_now_bt - self._sa_beat_last_ts) >= self._sa_beat_refractory_s
             )
             if self._sa_beat_detected:
                 self._sa_beat_last_ts = _now_bt
         self._sa_prev_smth_bass = self._sa_smth_bass
+
+        # ── Unified excited state: broad spectral activity across all bars ────
+        _bars_ex     = self._spec_bars
+        _n_ex        = len(_bars_ex)
+        _active_frac = (sum(1 for _b in _bars_ex if _b > _EXCITED_BAR_THRESH) / _n_ex) if _n_ex else 0.0
+        _score       = self._sm(self._sa_excited_score, _active_frac, 0.06, 0.025)
+        self._sa_excited_score = _score
+        if not self._sa_excited and _score >= _EXCITED_ON_SCORE:
+            self._sa_excited = True
+        elif self._sa_excited and _score < _EXCITED_OFF_SCORE:
+            self._sa_excited = False
+        if self._sa_excited != self._sa_excited_prev_state:
+            #self._status("Excited: ON" if self._sa_excited else "Excited: OFF",
+            #             "cyan" if self._sa_excited else "grey500", debug_only=True)
+            self._sa_excited_prev_state = self._sa_excited
+
+        # ── Rotation lerp-rate ramp (level tracks excite score) ──────────────
+        _rot_now   = time.monotonic()
+        _rot_dt_cf = min(0.1, _rot_now - self._sa_rot_last_ts) if self._sa_rot_last_ts > 0 else 0.0
+        _raw_level = (3 if _score >= _EXCITED_IND_RED    else
+                      2 if _score >= _EXCITED_IND_ORANGE  else
+                      1 if _score >= _EXCITED_IND_GREEN   else
+                      0)
+        # Peak-hold: level upgrades instantly, downgrades only after 2-second hold
+        if _raw_level > self._sa_rot_level:
+            self._sa_rot_level            = _raw_level
+            self._sa_rot_level_held_until = _rot_now + 2.0
+        elif _raw_level == self._sa_rot_level:
+            self._sa_rot_level_held_until = _rot_now + 2.0   # refresh while at peak
+        elif _rot_now >= self._sa_rot_level_held_until:
+            self._sa_rot_level            = _raw_level
+            self._sa_rot_level_held_until = _rot_now + 2.0
+        _lerp_tgt = _ROT_EXCITE_LERP_RATE[self._sa_rot_level]
+        self._sa_rot_lerp_rate += (_lerp_tgt - self._sa_rot_lerp_rate) * (_ROT_EXCITE_LERP_RAMP * _rot_dt_cf)
+        self._sa_rot_last_ts   = _rot_now
 
     def _extract_audio_bands(self):
         """Return (bass, mid, treble, beat, peak) scalars [0..1].
@@ -5374,41 +5480,21 @@ class SpectrumController:
                 self._spec_hallu_prev_frame.size != (W, H)):
             self._spec_hallu_prev_frame = _PILImage.new("RGBA", (W, H), (0, 0, 0, 255))
 
-        bass, mid, treble, beat, peak = self._extract_audio_bands()
+        bass, mid, treble, _, peak = self._extract_audio_bands()
+        beat = self._sa_beat_detected   # use unified detector (per-mode params apply)
 
-        # ── Excited state logic (Big Bass hits only) ──────────────────
-        _now = time.monotonic()
-        _smth = self._spec_hallu_aux.get("_excited_smth_bass", 0.0)
-        # Fast rise, slow decay to catch the peak
-        _smth = (_smth * 0.5 + bass * 0.5) if bass > _smth else (_smth * 0.94 + bass * 0.06)
-        _prev = self._spec_hallu_aux.get("_excited_prev_bass", 0.0)
-
-        # Trigger only on rising edge of a heavy bass hit (>0.75)
-        if (_smth > 0.85 and _prev <= 0.85):
-            self._spec_hallu_excited = True
-            self._spec_hallu_excited_ts = _now
-
-        self._spec_hallu_aux["_excited_smth_bass"] = _smth
-        self._spec_hallu_aux["_excited_prev_bass"] = _smth
-
-        # cooldown
-        if _now - self._spec_hallu_excited_ts > 2.0:
-            self._spec_hallu_excited = False
-
-        # Update status log on state change
-        if self._spec_hallu_excited != self._spec_hallu_excited_prev:
-            if self._spec_hallu_excited:
-                self._status("Hallucination: EXCITED", "cyan", debug_only=True)
-            else:
-                self._status("Hallucination: Calm", "grey500", debug_only=True)
-            self._spec_hallu_excited_prev = self._spec_hallu_excited
+        # ── Real-time dt for time-based animation ─────────────────────
+        _now_render = time.monotonic()
+        _dt = min(0.1, _now_render - self._hallu_last_render_ts) \
+              if self._hallu_last_render_ts > 0 else (1.0 / 30.0)
+        self._hallu_last_render_ts = _now_render
 
         # ── Color-mode tick: drive _spec_display_hue and gradient flag ──
         _hallu_cm = self._spec_color_mode_per_mode.get("hallucination", "loop")
         if _hallu_cm == "random":
             _hallu_cm = self._tick_random_cm("hallucination", beat) or "loop"
         if _hallu_cm == "loop":
-            self._spec_display_hue = (time.monotonic() / 20.0) % 1.0
+            self._spec_display_hue = (_now_render / 20.0) % 1.0
         self._spec_hallu_gradient = (_hallu_cm == "gradient")
 
         params = self._spec_hallu_params_per_submode.get(sub, {})
@@ -5419,7 +5505,7 @@ class SpectrumController:
             "morph":    self._hallu_morph,
         }.get(sub, self._hallu_mirror)
         try:
-            frame = fn(W, H, bass, mid, treble, beat, peak, params)
+            frame = fn(W, H, bass, mid, treble, beat, peak, params, _dt)
         except Exception:
             frame = self._draw_hallu_base(W, H, bass, mid, treble)
         self._spec_hallu_prev_frame = frame.copy()
@@ -5566,7 +5652,7 @@ class SpectrumController:
                 pass
         return img
 
-    def _hallu_mirror(self, W, H, bass, mid, treble, beat, peak, p):
+    def _hallu_mirror(self, W, H, bass, mid, treble, beat, peak, p, _dt=None):
         """Droste tunnel (particles base) / Ghost ribbon (waveform/circle/image bases).
 
         Sliders:
@@ -5584,33 +5670,56 @@ class SpectrumController:
         h_val  = self._spec_display_hue
         cx, cy = W / 2.0, H / 2.0
         t_auto = time.monotonic()
-
-        # Big-hit detector (rising edge of smoothed bass > 0.68) -- shared by all paths
-        _smth_bass = aux.get("_smth_bass", 0.0)
-        _smth_bass = (_smth_bass * 0.50 + bass * 0.50 if bass > _smth_bass
-                    else _smth_bass * 0.94 + bass * 0.06)
-        _prev_smth = aux.get("_prev_smth", 0.0)
-        _big_hit   = (_smth_bass > 0.68 and _prev_smth <= 0.68)
-        aux["_smth_bass"] = _smth_bass
-        aux["_prev_smth"] = _smth_bass
+        _ts    = (_dt if _dt is not None else (1.0 / 30.0)) * 30.0  # dt scale vs 30 fps ref
 
         def _osc(key):
             st = aux.setdefault(key, {"pos": 0.0, "vel": 0.005, "pause_until": 0.0, "target": 1.0})
             if t_auto < st["pause_until"]:
                 return st["pos"]
-            spd = 0.0001 + peak * 0.0015
+            spd = min(0.3, (0.0001 + peak * 0.0015) * _ts)  # time-normalised velocity step
             st["vel"] = st["vel"] * (1.0 - spd) + (st["target"] - st["pos"]) * spd
             st["pos"] = max(-1.0, min(1.0, st["pos"] + st["vel"]))
             if abs(st["pos"]) >= 0.98:
                 st["vel"] *= -0.3
                 st["target"] = -math.copysign(1.0, st["pos"]) * random.uniform(0.3, 0.75)
-            elif _big_hit:
+            elif self._sa_beat_detected:   # unified beat drives direction changes
                 if random.random() < 0.45:
                     if random.random() < 0.65:
                         st["pause_until"] = t_auto + random.uniform(1.5, 5.0)
                     else:
                         st["target"] = -math.copysign(1.0, st["vel"]) * random.uniform(0.3, 0.8)
             return st["pos"]
+
+        # ── Excitement-driven rotation state machine ──────────────────────────
+        _rot_dt    = min((_dt if _dt is not None and _dt > 0 else 1.0 / 30.0), 0.1)
+        _rot_level = self._sa_rot_level
+        _rot_max   = abs(float(p.get("rotDeg", 2.0))) * _ROT_EXCITE_SLIDER_PCT[_rot_level]
+        # Clamp target to current rot_max bounds (level may have changed)
+        self._sa_rot_target = max(-_rot_max, min(_rot_max, self._sa_rot_target))
+        # Beat rising edge → direction control only (stop, center, or flip)
+        _beat_edge = self._sa_beat_detected and not self._sa_rot_prev_beat
+        self._sa_rot_prev_beat = self._sa_beat_detected
+        if _beat_edge and _rot_level > 0 and _rot_max > 0:
+            if random.random() < _ROT_EXCITE_CENTER_PROB[_rot_level]:
+                self._sa_rot_target = 0.0
+            else:
+                _cur_sign  = math.copysign(1.0, self._sa_rot_current) if self._sa_rot_current != 0.0 else 1.0
+                _sign      = -_cur_sign if random.random() < _ROT_BEAT_FLIP_PROB else _cur_sign
+                _was_below_max = abs(self._sa_rot_target) < _rot_max * 0.95
+                if _was_below_max and random.random() < _ROT_MAX_HIT_PROB:
+                    self._sa_rot_target = _sign * _rot_max
+                else:
+                    self._sa_rot_target = _sign * _rot_max * random.uniform(0.5, 1.0)
+        # Target reached → pick next random target in opposite direction
+        if _rot_max > 0 and abs(self._sa_rot_current - self._sa_rot_target) < max(0.15, _rot_max * 0.04):
+            if random.random() < _ROT_EXCITE_CENTER_PROB[_rot_level]:
+                self._sa_rot_target = 0.0
+            else:
+                _sign = -math.copysign(1.0, self._sa_rot_target) if self._sa_rot_target != 0.0 else 1.0
+                self._sa_rot_target = -_sign * _rot_max * random.uniform(0.4, 1.0)
+        # Excite level controls speed only — lerp rate is ramped in _compute_audio_frame
+        _alpha = 1.0 - math.exp(-self._sa_rot_lerp_rate * _rot_dt)
+        self._sa_rot_current += (self._sa_rot_target - self._sa_rot_current) * _alpha
 
         # ================================================================
         # PARTICLES PATH -- single-buffer Droste feedback
@@ -5665,17 +5774,14 @@ class SpectrumController:
             zoom_base  = float(p.get("zoom",    0.94))
             trail_fade = max(0.5, min(1.0, float(p.get("opacity", 0.92))))
 
-            excited = getattr(self, "_spec_hallu_excited", False)
-            cap     = 1.0 if excited else 0.5
-
             if getattr(self, "_spec_hallu_auto_rot", False):
-                driven_rot = max(0.5, abs(rot_base)) * cap * _osc("rot_osc")
+                driven_rot = self._sa_rot_current
             else:
                 driven_rot = rot_base
 
             if getattr(self, "_spec_hallu_auto_spread", False):
                 osc_v       = abs(_osc("spread_osc"))
-                driven_zoom = 0.85 + (zoom_base - 0.85) * (1.0 - osc_v * cap)
+                driven_zoom = 0.85 + (zoom_base - 0.85) * (1.0 - osc_v)
             else:
                 driven_zoom = zoom_base
 
@@ -5772,22 +5878,11 @@ class SpectrumController:
         # ================================================================
         feedback = float(p.get("opacity", 0.92))
 
-        rot_base = float(p.get("rotDeg", 0.0)) * 1.5
+        rot_base = float(p.get("rotDeg", 0.0))
         if getattr(self, "_spec_hallu_auto_rot", False):
-            target_rot = max(0.5, abs(rot_base)) * _osc("rot_osc")
+            rot_step = self._sa_rot_current
         else:
-            target_rot = rot_base
-
-        if kind == "waveform":
-            if not getattr(self, "_spec_hallu_excited", False):
-                target_rot *= 0.25
-                if peak < 0.15:
-                    _grav = max(0.0, min(1.0, (peak - 0.02) / 0.13))
-                    target_rot *= _grav
-
-        lerp_f = 0.08
-        self._spec_hallu_rot_smooth += (target_rot - self._spec_hallu_rot_smooth) * lerp_f
-        rot_step = self._spec_hallu_rot_smooth
+            rot_step = rot_base * 1.5
 
         if getattr(self, "_spec_hallu_auto_spread", False):
             zoom_val = 0.92 + 0.06 * _osc("spread_osc")
@@ -6092,29 +6187,249 @@ class SpectrumController:
         ghost.alpha_composite(fresh_img)
         return ghost
 
-    def _hallu_chroma(self, W, H, bass, mid, treble, beat, peak, p):
+    def _hallu_chroma(self, W, H, bass, mid, treble, beat, peak, p, _dt=None):
         """Chromatic aberration — shift R/G/B channels independently."""
         try:
             import numpy as np
         except ImportError:
             return self._draw_hallu_base(W, H, bass, mid, treble)
 
-        base = np.array(self._draw_hallu_base(W, H, bass, mid, treble), dtype=np.float32)
-        off  = int(2 + treble * float(p.get("maxSplit", 14)))
-        offY = int((mid - 0.5) * float(p.get("maxSplit", 14)) * 0.4)
+        kind    = self._spec_hallu_base_kind
+        base_img = self._draw_hallu_base(W, H, bass, mid, treble)
 
-        out = np.zeros_like(base)
-        out[..., 0] = np.roll(base[..., 0], (-offY, -off), axis=(0, 1))
-        out[..., 1] = base[..., 1]
-        out[..., 2] = np.roll(base[..., 2], (offY,  off), axis=(0, 1))
-        out[..., 3] = 255
+        if kind == "waveform":
+            _dt_c     = min(0.1, _dt if _dt is not None else 1.0 / 30.0)
+            max_split = float(p.get("maxSplit", 14))
+            aux       = self._spec_hallu_aux
 
-        trail = float(p.get("trail", 0.18))
+            # Beat burst: inflates split for ~125 ms then decays
+            beat_split = aux.get("_chroma_beat_split", 0.0)
+            if beat:
+                beat_split = max_split * 0.7
+            beat_split *= math.exp(-8.0 * _dt_c)
+            aux["_chroma_beat_split"] = beat_split
+
+            off  = int(4 + (bass * 2 + treble * 0.4) * max_split + beat_split)
+            offY = int((mid - 0.5) * max_split * 0.4)
+
+            # Slider (0–2) sets how much excitement multiplies wave speed.
+            # auto_speed off → constant 1×; on → 1× + excited × slider.
+            _excited_mult = float(p.get("speed", 1.0))
+            if p.get("auto_speed", True):
+                speed_scale = 1.0 + self._sa_excited_score * _excited_mult
+            else:
+                speed_scale = 1.0
+            aux["_chroma_phase"] = aux.get("_chroma_phase", 0.0) + _dt_c * speed_scale
+            t_phase  = aux["_chroma_phase"]
+            cy       = H / 2.0
+            A_bass   = H * 0.25
+            A_mid    = H * 0.20
+            A_treble = H * 0.10
+
+            # Each channel gets its own phase-shifted waveform so all three
+            # reach both edges — no pixel-roll gaps.
+            def _wave_pts(x_shift, y_shift=0):
+                pts = []
+                for x in range(0, W + 2, 2):
+                    f = (x + x_shift) / W
+                    y = int(cy
+                        + math.sin(f * 5  + t_phase * 2.0) * A_bass   * bass
+                        + math.sin(f * 14 + t_phase * 4.0) * A_mid    * mid
+                        + math.sin(f * 30 + t_phase * 7.0) * A_treble * treble) + y_shift
+                    pts.append((x, y))
+                return pts
+
+            r_pts = _wave_pts( off, -offY)
+            g_pts = _wave_pts(   0,     0)
+            b_pts = _wave_pts(-off,  offY)
+
+            _cm = self._tick_random_cm("hallucination", beat)
+
+            if _cm == "gradient":
+                # Pure R/G/B channels drawn separately → additive mixing at overlaps.
+                def _draw_ch_rgb(pts):
+                    ch  = _PILImage.new("L", (W, H), 0)
+                    dch = _PILDraw.Draw(ch)
+                    dch.line(pts, fill=35,  width=6, joint="curve")
+                    dch.line(pts, fill=100, width=6, joint="curve")
+                    dch.line(pts, fill=210, width=6)
+                    return np.array(ch, dtype=np.float32)
+
+                out = np.zeros((H, W, 4), dtype=np.float32)
+                out[..., 0] = _draw_ch_rgb(r_pts)
+                out[..., 1] = _draw_ch_rgb(g_pts)
+                out[..., 2] = _draw_ch_rgb(b_pts)
+                out[..., 3] = 255
+
+            else:  # "loop" — beat-driven hue; three lines at hue, hue+⅓, hue+⅔
+                if "_chroma_hue_from" not in aux:
+                    aux["_chroma_hue_from"] = 0.0
+                    aux["_chroma_hue_to"]   = 0.0
+                    aux["_chroma_hue_t"]    = 1.0
+                    aux["_chroma_hue_seq"]  = [0.00, 0.08, 0.50, 0.33, 0.77]
+                if beat:
+                    aux["_chroma_hue_from"] = self._lerp_h(
+                        aux["_chroma_hue_from"], aux["_chroma_hue_to"],
+                        self._ease(aux["_chroma_hue_t"]))
+                    aux["_chroma_hue_to"]  = aux["_chroma_hue_seq"][0]
+                    aux["_chroma_hue_seq"] = aux["_chroma_hue_seq"][1:] + [aux["_chroma_hue_seq"][0]]
+                    aux["_chroma_hue_t"]   = 0.0
+                aux["_chroma_hue_t"] = min(1.0, aux["_chroma_hue_t"] + _dt_c / 0.55)
+                h = self._lerp_h(aux["_chroma_hue_from"], aux["_chroma_hue_to"],
+                                 self._ease(aux["_chroma_hue_t"]))
+                canvas = _PILImage.new("RGBA", (W, H), (0, 0, 0, 255))
+                d      = _PILDraw.Draw(canvas, "RGBA")
+                for pts, hue_off in [(r_pts, 0.0), (g_pts, 1/3), (b_pts, 2/3)]:
+                    hue = (h + hue_off) % 1.0
+                    rc, gc, bc = colorsys.hsv_to_rgb(hue, 1.0, 1.0)
+                    col = (int(rc*255), int(gc*255), int(bc*255))
+                    d.line(pts, fill=(*col, 20),  width=5, joint="curve")
+                    d.line(pts, fill=(*col, 65),  width=3, joint="curve")
+                    d.line(pts, fill=(*col, 185), width=1)
+                out = np.array(canvas, dtype=np.float32)
+                out[..., 3] = 255
+
+        elif kind == "circle":
+            _dt_c     = min(0.1, _dt if _dt is not None else 1.0 / 30.0)
+            max_split = float(p.get("maxSplit", 14))
+            aux       = self._spec_hallu_aux
+
+            beat_split = aux.get("_chroma_beat_split", 0.0)
+            if beat:
+                beat_split = max_split * 0.7
+            beat_split *= math.exp(-8.0 * _dt_c)
+            aux["_chroma_beat_split"] = beat_split
+
+            off  = int(4 + (bass * 2 + treble * 0.4) * max_split + beat_split)
+            offY = int((mid - 0.5) * max_split * 0.4)
+
+            _excited_mult = float(p.get("speed", 1.0))
+            _auto         = bool(p.get("auto_speed", True))
+            speed_scale   = (1.0 + self._sa_excited_score * _excited_mult) if _auto else 1.0
+            aux["_chroma_phase"] = aux.get("_chroma_phase", 0.0) + _dt_c * speed_scale
+            t_phase = aux["_chroma_phase"]
+
+            # ── Circle rotation ──────────────────────────────────────────────
+            _circle_angle = aux.get("_chroma_circle_angle", 0.0)
+            if _auto:
+                # Excite state machine: _sa_rot_current is angular velocity in deg/sec.
+                # slider / 2 * 360 deg/sec = slider / 2 rotations/sec (max at full excite).
+                _rot_max = (_excited_mult / 2.0) * 360.0 * _ROT_EXCITE_SLIDER_PCT[self._sa_rot_level]
+                self._sa_rot_target = max(-_rot_max, min(_rot_max, self._sa_rot_target))
+                _beat_edge = self._sa_beat_detected and not self._sa_rot_prev_beat
+                self._sa_rot_prev_beat = self._sa_beat_detected
+                if _beat_edge and self._sa_rot_level > 0 and _rot_max > 0:
+                    if random.random() < _ROT_EXCITE_CENTER_PROB[self._sa_rot_level]:
+                        self._sa_rot_target = 0.0
+                    else:
+                        _cur_sign = math.copysign(1.0, self._sa_rot_current) if self._sa_rot_current != 0.0 else 1.0
+                        _sign = -_cur_sign if random.random() < _ROT_BEAT_FLIP_PROB else _cur_sign
+                        if abs(self._sa_rot_target) < _rot_max * 0.95 and random.random() < _ROT_MAX_HIT_PROB:
+                            self._sa_rot_target = _sign * _rot_max
+                        else:
+                            self._sa_rot_target = _sign * _rot_max * random.uniform(0.5, 1.0)
+                if _rot_max > 0 and abs(self._sa_rot_current - self._sa_rot_target) < max(1.0, _rot_max * 0.04):
+                    if random.random() < _ROT_EXCITE_CENTER_PROB[self._sa_rot_level]:
+                        self._sa_rot_target = 0.0
+                    else:
+                        _sign = -math.copysign(1.0, self._sa_rot_target) if self._sa_rot_target != 0.0 else 1.0
+                        self._sa_rot_target = -_sign * _rot_max * random.uniform(0.4, 1.0)
+                _rot_alpha = 1.0 - math.exp(-self._sa_rot_lerp_rate * _dt_c)
+                self._sa_rot_current += (self._sa_rot_target - self._sa_rot_current) * _rot_alpha
+                _circle_angle += math.radians(self._sa_rot_current) * _dt_c
+            else:
+                _circle_angle += (_excited_mult / 2.0) * 2 * math.pi * _dt_c
+            aux["_chroma_circle_angle"] = _circle_angle % (2 * math.pi)
+
+            # Rotate the aberration offset direction by _circle_angle so the
+            # chromatic separation axis sweeps around the canvas center.
+            _cos_r = math.cos(_circle_angle)
+            _sin_r = math.sin(_circle_angle)
+            _rdx =  off * _cos_r + offY * _sin_r
+            _rdy =  off * _sin_r - offY * _cos_r
+
+            CX, CY = W / 2.0, H / 2.0
+            R_base = min(CX, CY) * 0.55
+            steps  = 128
+
+            def _circle_pts(dx, dy):
+                cx_c, cy_c = CX + dx, CY + dy
+                pts = []
+                for i in range(steps):
+                    ang = 2 * math.pi * i / steps
+                    r = (R_base
+                         + math.sin(ang * 6  + t_phase * 3.0) * 7.0 * mid
+                         + math.sin(ang * 14 + t_phase * 5.0) * 4.0 * treble
+                         + bass * 16.0)
+                    pts.append((int(cx_c + r * math.cos(ang)), int(cy_c + r * math.sin(ang))))
+                return pts + [pts[0]]
+
+            r_pts = _circle_pts( _rdx,  _rdy)
+            g_pts = _circle_pts(    0,     0)
+            b_pts = _circle_pts(-_rdx, -_rdy)
+
+            _cm = self._tick_random_cm("hallucination", beat)
+
+            if _cm == "gradient":
+                def _draw_ch_rgb_circle(pts):
+                    ch  = _PILImage.new("L", (W, H), 0)
+                    dch = _PILDraw.Draw(ch)
+                    dch.line(pts, fill=35,  width=6)
+                    dch.line(pts, fill=100, width=4)
+                    dch.line(pts, fill=210, width=2)
+                    return np.array(ch, dtype=np.float32)
+
+                out = np.zeros((H, W, 4), dtype=np.float32)
+                out[..., 0] = _draw_ch_rgb_circle(r_pts)
+                out[..., 1] = _draw_ch_rgb_circle(g_pts)
+                out[..., 2] = _draw_ch_rgb_circle(b_pts)
+                out[..., 3] = 255
+
+            else:  # loop — beat-driven hue; three circles at hue, hue+⅓, hue+⅔
+                if "_chroma_hue_from" not in aux:
+                    aux["_chroma_hue_from"] = 0.0
+                    aux["_chroma_hue_to"]   = 0.0
+                    aux["_chroma_hue_t"]    = 1.0
+                    aux["_chroma_hue_seq"]  = [0.00, 0.08, 0.50, 0.33, 0.77]
+                if beat:
+                    aux["_chroma_hue_from"] = self._lerp_h(
+                        aux["_chroma_hue_from"], aux["_chroma_hue_to"],
+                        self._ease(aux["_chroma_hue_t"]))
+                    aux["_chroma_hue_to"]  = aux["_chroma_hue_seq"][0]
+                    aux["_chroma_hue_seq"] = aux["_chroma_hue_seq"][1:] + [aux["_chroma_hue_seq"][0]]
+                    aux["_chroma_hue_t"]   = 0.0
+                aux["_chroma_hue_t"] = min(1.0, aux["_chroma_hue_t"] + _dt_c / 0.55)
+                h = self._lerp_h(aux["_chroma_hue_from"], aux["_chroma_hue_to"],
+                                 self._ease(aux["_chroma_hue_t"]))
+                canvas = _PILImage.new("RGBA", (W, H), (0, 0, 0, 255))
+                d      = _PILDraw.Draw(canvas, "RGBA")
+                for pts, hue_off in [(r_pts, 0.0), (g_pts, 1/3), (b_pts, 2/3)]:
+                    hue = (h + hue_off) % 1.0
+                    rc, gc, bc = colorsys.hsv_to_rgb(hue, 1.0, 1.0)
+                    col = (int(rc*255), int(gc*255), int(bc*255))
+                    d.line(pts, fill=(*col, 20),  width=5)
+                    d.line(pts, fill=(*col, 65),  width=3)
+                    d.line(pts, fill=(*col, 185), width=1)
+                out = np.array(canvas, dtype=np.float32)
+                out[..., 3] = 255
+
+        else:
+            base = np.array(base_img, dtype=np.float32)
+            off  = int(2 + treble * float(p.get("maxSplit", 14)))
+            offY = int((mid - 0.5) * float(p.get("maxSplit", 14)) * 0.4)
+
+            out = np.zeros_like(base)
+            out[..., 0] = np.roll(base[..., 0], (-offY, -off), axis=(0, 1))
+            out[..., 1] = base[..., 1]
+            out[..., 2] = np.roll(base[..., 2], (offY,  off), axis=(0, 1))
+            out[..., 3] = 255
+
+        trail    = float(p.get("trail", 0.18))
         prev_arr = np.array(self._spec_hallu_prev_frame, dtype=np.float32)
-        blended = out * (1 - trail) + prev_arr * trail * 0.85
+        blended  = out * (1 - trail) + prev_arr * trail * 0.85
         return _PILImage.fromarray(np.clip(blended, 0, 255).astype(np.uint8))
 
-    def _hallu_perlin(self, W, H, bass, mid, treble, beat, peak, p):
+    def _hallu_perlin(self, W, H, bass, mid, treble, beat, peak, p, _dt=None):
         """Perlin-style flow field particles."""
         try:
             import numpy as np
@@ -6136,7 +6451,8 @@ class SpectrumController:
                 np.random.uniform(0, H, 140).astype(np.float32),
             ])
         parts = aux["parts"]
-        phase = aux.get("phase", 0.0) + evolve_rate * 0.01 * (1 + mid * 2)
+        _ts_p = (_dt if _dt is not None else (1.0 / 30.0)) * 30.0
+        phase = aux.get("phase", 0.0) + evolve_rate * 0.01 * (1 + mid * 2) * _ts_p
         aux["phase"] = phase
 
         xi = (parts[:, 0] * noise_scale * W + phase * W).astype(int) % 256
@@ -6163,11 +6479,12 @@ class SpectrumController:
             draw.ellipse([ix - r_px, iy - r_px, ix + r_px, iy + r_px], fill=col)
         return canvas
 
-    def _hallu_morph(self, W, H, bass, mid, treble, beat, peak, p):
+    def _hallu_morph(self, W, H, bass, mid, treble, beat, peak, p, _dt=None):
         """Geometry morphing: layered polygon rings with audio-driven vertex jitter."""
         aux = self._spec_hallu_aux
 
-        dt = 0.005 + peak * 0.18
+        _ts_m = (_dt if _dt is not None else (1.0 / 30.0)) * 30.0
+        dt = (0.005 + peak * 0.18) * _ts_m  # time-normalised animation step
         t = aux.get("t", 0.0) + dt
         aux["t"] = t
 
