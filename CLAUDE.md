@@ -7,8 +7,8 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 - Always use `async def` for Flet event handlers.
 - Use `/plan` mode before changes that touch more than one function, affect more than ~10 lines, or involve architectural decisions. Skip it for targeted 1–3 line fixes where the location and change are fully specified in the request.
 - When editing files, provide only the changed lines (diff format) — do not rewrite the whole file.
-- **Logging:** When adding new behavior, instrument it with the existing `_log()` / debug-log system. Include enough context (function name, key values) that a failure is self-explaining in the log — don't make the user add print statements to find out what went wrong.
-- **DRY / reuse first:** Before writing a new helper, look for an existing one that does the same job. UI elements used in more than one place (color swatches, device cards, buttons) must be built by a single factory function or builder method and called everywhere they appear — never duplicated.
+- **Logging:** When adding new behavior, instrument it with `self.log(message, color, debug=False)`. Use `debug=True` for verbose or high-frequency messages. Include the function name and key values so a failure is self-explaining in the log without needing extra print statements. Use `self.log_unique(key, message)` for messages that would otherwise spam on repeat. After completing an edit or feature, ask the user whether any log entries added for that task should be removed or cleaned up.
+- **DRY / reuse first:** Before writing a new code, consider making a helper instead, check if an existing one already does the job. Avoid duplicating large blocks of logic — if multiple features, modes, or controls share similar behavior and one needs a small variation, add a parameter or a one-line override rather than copying the whole helper block. Use judgment: a tiny amount of duplication is fine if sharing it would require over-engineering. The goal is to avoid unnecessary duplication, not abstraction for its own sake.
 - **No magic values:** Do not hardcode colors, sizes, timeouts, URLs, port numbers, or other tuneable constants inline. Define them as named constants near the top of the file (or in a dedicated constants block) and reference them by name. One place to change, easy to find.
 - **Write for humans:** Keep code readable and linear. Prefer flat, explicit logic over clever one-liners or deeply nested callbacks. A new contributor should be able to read a function top-to-bottom and understand it without tracing five layers of indirection. Avoid spaghetti — if a function is doing too many unrelated things, split it; if two functions are doing the same thing, merge them.
 - **Time-based effects, never frame-based:** All animations, lerps, oscillators, and timers must use elapsed wall-clock seconds (`dt = now - last_ts`), not frame counts. Use `alpha = 1.0 - math.exp(-rate * dt)` for exponential smoothing where `rate` is in units of 1/second. This keeps behaviour identical at 30 fps and 60 fps.
@@ -77,7 +77,7 @@ Discovery uses mDNS (`zeroconf`) for `_http._tcp` services. Device state is cach
 - Per-mode config persisted separately; `_PilCanvas` handles PIL-based neon rendering
 
 ### Flet Layout Rules
-- **Controls cannot live in two layout trees at once.** Any control that appears in both `_master_wide` and `_master_narrow` must have separate `_wide` / `_narrow` instances. Follow the established pattern: `ledfx_btn_wide` / `ledfx_btn_narrow`, each with their own paired `ft.Text` / `ft.Icon` refs so updates reach whichever layout is currently visible.
+- **Controls cannot live in two layout trees at once.** Only controls explicitly placed in both the wide and narrow master bar rows need `_wide` / `_narrow` paired instances — this is not a blanket rule for all controls. Each pair needs its own `ft.Text` / `ft.Icon` refs so updates reach whichever layout is visible. See `ledfx_btn_wide` / `ledfx_btn_narrow` (~line 3149) as the established pattern.
 
 ### Flet 0.84 Compatibility Notes
 Breaking changes from older Flet versions that are already handled in the code:
@@ -91,7 +91,7 @@ All runtime data lives in `%APPDATA%\Roaming\WLEDCC\`:
 - `wledcc_cache.json` — device list, config, preset cache
 - `wled_session_*.log` — per-session logs
 - `ui_watchdog.log` — freeze detection alerts
-- Per-mode SA config files
+- 'SA-config.json' - Per-mode SA config file
 
 ### Key Files
 | File | Purpose |

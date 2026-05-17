@@ -1790,11 +1790,15 @@ class SpectrumController:
         if _m in self._spec_color_mode_per_mode:
             self._spec_bs_color_mode = self._spec_color_mode_per_mode[_m]
         if _m == "hallucination" and _sub is not None:
-            self._capture_per_mode_settings("hallucination")
-            self._spec_hallu_submode    = _sub
-            self._spec_hallu_base_kind  = _base
-            self._spec_hallu_aux        = {}
-            self._spec_hallu_prev_frame = None
+            self._spec_mode_transitioning = True
+            try:
+                self._capture_per_mode_settings("hallucination")
+                self._spec_hallu_submode    = _sub
+                self._spec_hallu_base_kind  = _base
+                self._spec_hallu_aux        = {}
+                self._spec_hallu_prev_frame = None
+            finally:
+                self._spec_mode_transitioning = False
         self._spec_mode = _m
         self._spec_mode_random_current = _m
         self._apply_per_mode_settings(_m)
@@ -2728,28 +2732,37 @@ class SpectrumController:
             self._spec_mode in ("beat_saber", "neon_cascade", "rock_stage"))
 
         # ── Hallucination sub-mode dropdown ──────────────────────────────
-        def on_hallu_submode_change(e):
+        async def on_hallu_submode_change(e):
             _sub = str(e.control.value or "mirror").lower()
             _valid = ("mirror", "chroma", "perlin", "morph")
-            self._capture_per_mode_settings("hallucination")
-            self._spec_hallu_submode = _sub if _sub in _valid else "mirror"
-            self._spec_hallu_prev_frame = None
-            self._spec_hallu_aux = {}
-            self._apply_per_mode_settings("hallucination")
-            self._config_dirty = True
-            _tab = _tabs.selected_index
-            _clear_panel_refs()
-            self._show_combined_settings(initial_tab=_tab)
+            self._spec_mode_transitioning = True
+            try:
+                self._capture_per_mode_settings("hallucination")
+                self._spec_hallu_submode = _sub if _sub in _valid else "mirror"
+                self._spec_hallu_prev_frame = None
+                self._spec_hallu_aux = {}
+                self._apply_per_mode_settings("hallucination")
+                self._config_dirty = True
+                _tab = _tabs.selected_index
+                _clear_panel_refs()
+                self._show_combined_settings(initial_tab=_tab)
+            finally:
+                self._spec_mode_transitioning = False
 
-        def on_hallu_base_change(e):
-            self._capture_per_mode_settings("hallucination")
-            self._spec_hallu_base_kind = str(e.control.value or "waveform")
-            self._spec_hallu_prev_frame = None
-            self._apply_per_mode_settings("hallucination")
-            self._config_dirty = True
-            _tab = _tabs.selected_index
-            _clear_panel_refs()
-            self._show_combined_settings(initial_tab=_tab)
+        async def on_hallu_base_change(e):
+            self._spec_mode_transitioning = True
+            try:
+                self._capture_per_mode_settings("hallucination")
+                self._spec_hallu_base_kind = str(e.control.value or "waveform")
+                self._spec_hallu_prev_frame = None
+                self._spec_hallu_aux = {}
+                self._apply_per_mode_settings("hallucination")
+                self._config_dirty = True
+                _tab = _tabs.selected_index
+                _clear_panel_refs()
+                self._show_combined_settings(initial_tab=_tab)
+            finally:
+                self._spec_mode_transitioning = False
 
         _hallu_options = [
             ft.dropdown.Option("mirror",   "1. Recursive Mirror"),
@@ -6430,54 +6443,351 @@ class SpectrumController:
         return _PILImage.fromarray(np.clip(blended, 0, 255).astype(np.uint8))
 
     def _hallu_perlin(self, W, H, bass, mid, treble, beat, peak, p, _dt=None):
-        """Perlin-style flow field particles."""
+        """Perlin flow field — four fully independent sub-modes.
+
+        'waveform'  140 dots, random spawn, raw audio, coordinated refresh.
+        'circle'    140 comets, wrapping, beat-driven direction bias.
+        'particles' 140 comets, 8-position tails, coordinated refresh.
+        'bars'      140 comets, wrapping at screen edges, no refresh.
+        """
         try:
             import numpy as np
         except ImportError:
             return self._draw_hallu_base(W, H, bass, mid, treble)
 
-        aux = self._spec_hallu_aux
+        kind = self._spec_hallu_base_kind
+        aux  = self._spec_hallu_aux
+        TWO_PI      = 2.0 * math.pi
         noise_scale = float(p.get("noiseScale", 0.012))
         evolve_rate = float(p.get("evolveRate", 0.30))
 
-        if "noise_table" not in aux:
-            rng = np.random.default_rng(42)
-            aux["noise_table"] = rng.random((256, 256), dtype=np.float32)
-        noise_t = aux["noise_table"]
+        # shared: noise table only — no particle state, no audio smoothing
+        if "nt" not in aux:
+            aux["nt"]  = np.random.default_rng(1337).random((256, 256), dtype=np.float32)
+            aux["rng"] = np.random.default_rng()
+            aux["t0"]  = time.monotonic()
+        nt = aux["nt"];  _r = aux["rng"]
 
-        if "parts" not in aux:
-            aux["parts"] = np.column_stack([
-                np.random.uniform(0, W, 140).astype(np.float32),
-                np.random.uniform(0, H, 140).astype(np.float32),
-            ])
-        parts = aux["parts"]
-        _ts_p = (_dt if _dt is not None else (1.0 / 30.0)) * 30.0
-        phase = aux.get("phase", 0.0) + evolve_rate * 0.01 * (1 + mid * 2) * _ts_p
-        aux["phase"] = phase
+        def _vnoise(fx, fy):
+            N  = 256
+            fx = fx % N;  fy = fy % N
+            x0 = np.floor(fx).astype(np.int32);  y0 = np.floor(fy).astype(np.int32)
+            x1 = (x0 + 1) % N;                   y1 = (y0 + 1) % N
+            tx = fx - x0;                         ty = fy - y0
+            sx = tx * tx * (3 - 2 * tx);          sy = ty * ty * (3 - 2 * ty)
+            a = nt[y0, x0];  b = nt[y0, x1]
+            c = nt[y1, x0];  d = nt[y1, x1]
+            ab = a + sx * (b - a);                cd = c + sx * (d - c)
+            return ab + sy * (cd - ab)
 
-        xi = (parts[:, 0] * noise_scale * W + phase * W).astype(int) % 256
-        yi = (parts[:, 1] * noise_scale * H + phase * H * 0.7).astype(int) % 256
-        angles = noise_t[yi, xi] * (2 * math.pi * 2)
-        speed = 0.8 + (bass + mid) * 1.5
-        parts[:, 0] = (parts[:, 0] + np.cos(angles) * speed) % W
-        parts[:, 1] = (parts[:, 1] + np.sin(angles) * speed) % H
-        aux["parts"] = parts
+        # ════════════════════════════════════════════════════════════════════
+        # WAVEFORM — noise-field particle swarm, raw audio, coordinated refresh
+        # ════════════════════════════════════════════════════════════════════
+        if kind == "waveform":
+            N_PART = 140;  MAX_AGE = 240;  REFRESH_S = 8.0;  TRAIL = 0.08
+            b_eff, m_eff = bass, mid
 
-        prev_arr = np.array(self._spec_hallu_prev_frame, dtype=np.float32)
-        fade = 0.93 - bass * 0.06
-        prev_arr[..., :3] *= fade
-        canvas = _PILImage.fromarray(np.clip(prev_arr, 0, 255).astype(np.uint8))
-        draw = _PILDraw.Draw(canvas, "RGBA")
-        h_val = self._spec_display_hue
-        r_px  = 1 if bass < 0.25 else (2 if bass < 0.6 else 3)
-        a_px  = int(180 + treble * 75)
-        for px, py in parts:
-            ix, iy = int(px), int(py)
-            hue = (h_val + float(px) / W * 0.4 + float(py) / H * 0.15) % 1.0
-            rv, gv, bv = colorsys.hsv_to_rgb(hue, 1.0, 0.55 + peak * 0.45)
-            col = (int(rv*255), int(gv*255), int(bv*255), a_px)
-            draw.ellipse([ix - r_px, iy - r_px, ix + r_px, iy + r_px], fill=col)
-        return canvas
+            if "px" not in aux:
+                aux["px"]  = _r.random(N_PART, dtype=np.float32) * W
+                aux["py"]  = _r.random(N_PART, dtype=np.float32) * H
+                aux["age"] = (_r.random(N_PART, dtype=np.float32) * 45).astype(np.float32)
+                ghu = self._spec_display_hue
+                aux["hue"] = ((ghu + _r.uniform(-15/360, 15/360, N_PART)) % 1.0).astype(np.float32)
+                aux["lr"]  = 0.0
+                aux["rp"]  = 0
+
+            px  = aux["px"];  py  = aux["py"]
+            age = aux["age"]; hue = aux["hue"]
+            t   = time.monotonic() - aux["t0"]
+            z   = t * (0.2 + m_eff * evolve_rate * 2.0)
+
+            def _respawn_wv(idx):
+                n = len(idx)
+                if n == 0:
+                    return
+                aux["px"][idx]  = _r.random(n, dtype=np.float32) * W
+                aux["py"][idx]  = _r.random(n, dtype=np.float32) * H
+                aux["age"][idx] = 0.0
+                ghu = self._spec_display_hue
+                aux["hue"][idx] = ((ghu + _r.uniform(-15/360, 15/360, n)) % 1.0).astype(np.float32)
+
+            now = time.monotonic()
+            extra_fade = False
+            if (now - aux["lr"]) > REFRESH_S:
+                aux["lr"] = now;  aux["rp"] = N_PART;  extra_fade = True
+
+            if aux["rp"] > 0:
+                n_retire   = min(max(1, N_PART // 30), aux["rp"])
+                aux["rp"] -= n_retire
+                _respawn_wv(np.argsort(-age)[:n_retire])
+
+            n_f = _vnoise(px * noise_scale + z, py * noise_scale - z * 0.7)
+            ang = n_f * TWO_PI
+            spd = 0.7 + m_eff * 1.4 + b_eff * 0.8
+            px  += np.cos(ang) * spd
+            py  += np.sin(ang) * spd
+            age += 1.0
+
+            off = (px < -2) | (px > W + 2) | (py < -2) | (py > H + 2) | (age > MAX_AGE)
+            if off.any():
+                _respawn_wv(np.where(off)[0])
+
+            arr = np.array(self._spec_hallu_prev_frame, dtype=np.float32)
+            k   = (1.0 - TRAIL) * (0.80 if extra_fade else 1.0)
+            arr[..., :3] *= k
+            canvas = _PILImage.fromarray(np.clip(arr, 0, 255).astype(np.uint8))
+            draw = _PILDraw.Draw(canvas, "RGBA")
+            in_b = (px >= 0) & (px < W) & (py >= 0) & (py < H)
+            for i in np.where(in_b)[0]:
+                rv, gv, bv = colorsys.hsv_to_rgb(float(hue[i]), 0.74, 0.98)
+                xi = int(px[i]);  yi = int(py[i])
+                draw.rectangle((xi, yi, xi + 1, yi + 1), fill=(int(rv*255), int(gv*255), int(bv*255), 255))
+            return canvas
+
+        # ════════════════════════════════════════════════════════════════════
+        # CIRCLE — comet tails, wrapping, beat-driven direction bias.
+        # Beat-edge shifts global bias by a random angle scaled with excite level:
+        #   green (1) → up to 45°, orange (2) → up to 90°, red (3) → up to 180°.
+        # ════════════════════════════════════════════════════════════════════
+        if kind == "circle":
+            N_C = 140;  N_T = 8
+            _smooth = self._sm
+            b_eff = _smooth(aux.get("_sb", bass), bass, 0.30, 0.08)
+            m_eff = _smooth(aux.get("_smm", mid), mid,  0.30, 0.08)
+            aux["_sb"] = b_eff;  aux["_smm"] = m_eff
+
+            if "c_x" not in aux:
+                aux["c_x"]   = _r.random(N_C, dtype=np.float32) * W
+                aux["c_y"]   = _r.random(N_C, dtype=np.float32) * H
+                ghu = self._spec_display_hue
+                aux["c_hue"] = ((ghu + _r.uniform(-15/360, 15/360, N_C)) % 1.0).astype(np.float32)
+                aux["c_ang"] = _r.random(N_C, dtype=np.float32) * TWO_PI
+                aux["tails"] = [[] for _ in range(N_C)]
+                aux["bias"]  = 0.0
+                aux["_pb"]   = False
+
+            c_x   = aux["c_x"];  c_y   = aux["c_y"];  c_hue = aux["c_hue"]
+            c_ang = aux["c_ang"]
+            tails = aux["tails"]
+            t_p   = time.monotonic() - aux["t0"]
+            z_p   = t_p * (0.10 + m_eff * evolve_rate * 1.2)
+
+            beat_edge = beat and not aux["_pb"]
+            aux["_pb"] = beat
+            if beat_edge:
+                _max_rad = (0.0, math.pi / 4, math.pi / 2, math.pi)[min(self._sa_rot_level, 3)]
+                aux["bias"] += _max_rad * self._sa_excited_score * float(_r.uniform(-1.0, 1.0))
+
+            n_vals     = _vnoise(c_x * noise_scale + z_p, c_y * noise_scale - z_p * 0.7)
+            ang_target = n_vals * TWO_PI + aux["bias"]
+            A  = 0.12
+            sc = (1 - A) * np.cos(c_ang) + A * np.cos(ang_target)
+            ss = (1 - A) * np.sin(c_ang) + A * np.sin(ang_target)
+            c_ang[:] = np.arctan2(ss, sc)
+
+            spd_c = 0.5 + m_eff * 1.2 + b_eff * 0.7
+
+            for i in range(N_C):
+                tails[i].insert(0, (float(c_x[i]), float(c_y[i])))
+                if len(tails[i]) > N_T:
+                    tails[i].pop()
+                if beat and len(tails[i]) < N_T:
+                    tails[i].insert(0, (float(c_x[i]), float(c_y[i])))
+
+                c_x[i] += math.cos(float(c_ang[i])) * spd_c
+                c_y[i] += math.sin(float(c_ang[i])) * spd_c
+
+                if c_x[i] < 0 or c_x[i] >= W:
+                    c_x[i] = c_x[i] % W
+                    tails[i] = []
+                if c_y[i] < 0 or c_y[i] >= H:
+                    c_y[i] = c_y[i] % H
+                    tails[i] = []
+
+            arr = np.array(self._spec_hallu_prev_frame, dtype=np.float32)
+            arr[..., :3] *= 0.94
+            canvas = _PILImage.fromarray(np.clip(arr, 0, 255).astype(np.uint8))
+            draw   = _PILDraw.Draw(canvas, "RGBA")
+
+            for i in range(N_C):
+                hue_c = float(c_hue[i])
+                tail  = tails[i]
+                for j, (tx, ty) in enumerate(tail):
+                    frac  = j / max(1, N_T - 1)
+                    brt   = max(0.10, 0.88 - frac * 0.72)
+                    alpha = int(220 * ((1.0 - frac) ** 1.4))
+                    rv, gv, bv = colorsys.hsv_to_rgb(hue_c, 0.75, brt)
+                    draw.rectangle((int(tx), int(ty), int(tx), int(ty)),
+                                   fill=(int(rv*255), int(gv*255), int(bv*255), alpha))
+                hx = int(c_x[i]);  hy = int(c_y[i])
+                if 0 <= hx < W and 0 <= hy < H:
+                    rv, gv, bv = colorsys.hsv_to_rgb(hue_c, 0.82, 1.0)
+                    draw.rectangle((hx, hy, hx + 1, hy + 1),
+                                   fill=(int(rv*255), int(gv*255), int(bv*255), 255))
+            return canvas
+
+        # ════════════════════════════════════════════════════════════════════
+        # PARTICLES — comet tails, coordinated refresh every 10s.
+        # Beat adds a duplicate tail entry (bright node marks the hit).
+        # ════════════════════════════════════════════════════════════════════
+        if kind == "particles":
+            N_C = 140;  N_T = 8
+            _smooth = self._sm
+            b_eff = _smooth(aux.get("_sb", bass), bass, 0.30, 0.08)
+            m_eff = _smooth(aux.get("_smm", mid), mid,  0.30, 0.08)
+            aux["_sb"] = b_eff;  aux["_smm"] = m_eff
+
+            if "c_x" not in aux:
+                aux["c_x"]   = _r.random(N_C, dtype=np.float32) * W
+                aux["c_y"]   = _r.random(N_C, dtype=np.float32) * H
+                ghu = self._spec_display_hue
+                aux["c_hue"] = ((ghu + _r.uniform(-15/360, 15/360, N_C)) % 1.0).astype(np.float32)
+                aux["c_ang"] = _r.random(N_C, dtype=np.float32) * TWO_PI
+                aux["tails"] = [[] for _ in range(N_C)]
+                aux["clr"]   = 0.0
+                aux["rp"]    = 0
+
+            c_x   = aux["c_x"];  c_y   = aux["c_y"];  c_hue = aux["c_hue"]
+            c_ang = aux["c_ang"]
+            tails = aux["tails"]
+            t_p   = time.monotonic() - aux["t0"]
+            z_p   = t_p * (0.10 + m_eff * evolve_rate * 1.2)
+
+            now = time.monotonic()
+            extra_fade = False
+            if (now - aux["clr"]) > 10.0:
+                aux["clr"] = now;  aux["rp"] = N_C;  extra_fade = True
+
+            if aux["rp"] > 0:
+                aux["rp"] -= 1
+                ri        = int(_r.integers(0, N_C))
+                c_x[ri]   = float(_r.random() * W)
+                c_y[ri]   = float(_r.random() * H)
+                ghu       = self._spec_display_hue
+                c_hue[ri] = (ghu + float(_r.uniform(-15/360, 15/360))) % 1.0
+                tails[ri] = []
+
+            n_vals     = _vnoise(c_x * noise_scale + z_p, c_y * noise_scale - z_p * 0.7)
+            ang_target = n_vals * TWO_PI
+            A = 0.12
+            sc = (1 - A) * np.cos(c_ang) + A * np.cos(ang_target)
+            ss = (1 - A) * np.sin(c_ang) + A * np.sin(ang_target)
+            c_ang[:] = np.arctan2(ss, sc)
+
+            spd_c = 0.5 + m_eff * 1.2 + b_eff * 0.7
+
+            for i in range(N_C):
+                tails[i].insert(0, (float(c_x[i]), float(c_y[i])))
+                if len(tails[i]) > N_T:
+                    tails[i].pop()
+                if beat and len(tails[i]) < N_T:
+                    tails[i].insert(0, (float(c_x[i]), float(c_y[i])))
+
+                c_x[i] += math.cos(float(c_ang[i])) * spd_c
+                c_y[i] += math.sin(float(c_ang[i])) * spd_c
+
+                if c_x[i] < -4 or c_x[i] > W + 4 or c_y[i] < -4 or c_y[i] > H + 4:
+                    c_x[i]   = float(_r.random() * W)
+                    c_y[i]   = float(_r.random() * H)
+                    ghu      = self._spec_display_hue
+                    c_hue[i] = (ghu + float(_r.uniform(-15/360, 15/360))) % 1.0
+                    tails[i] = []
+
+            arr = np.array(self._spec_hallu_prev_frame, dtype=np.float32)
+            arr[..., :3] *= 0.94 * (0.80 if extra_fade else 1.0)
+            canvas = _PILImage.fromarray(np.clip(arr, 0, 255).astype(np.uint8))
+            draw   = _PILDraw.Draw(canvas, "RGBA")
+
+            for i in range(N_C):
+                hue_c = float(c_hue[i])
+                tail  = tails[i]
+                for j, (tx, ty) in enumerate(tail):
+                    frac  = j / max(1, N_T - 1)
+                    brt   = max(0.10, 0.88 - frac * 0.72)
+                    alpha = int(220 * ((1.0 - frac) ** 1.4))
+                    rv, gv, bv = colorsys.hsv_to_rgb(hue_c, 0.75, brt)
+                    draw.rectangle((int(tx), int(ty), int(tx), int(ty)),
+                                   fill=(int(rv*255), int(gv*255), int(bv*255), alpha))
+                hx = int(c_x[i]);  hy = int(c_y[i])
+                if 0 <= hx < W and 0 <= hy < H:
+                    rv, gv, bv = colorsys.hsv_to_rgb(hue_c, 0.82, 1.0)
+                    draw.rectangle((hx, hy, hx + 1, hy + 1),
+                                   fill=(int(rv*255), int(gv*255), int(bv*255), 255))
+            return canvas
+
+        # ════════════════════════════════════════════════════════════════════
+        # BARS — comet tails, wrap at screen edges, no coordinated refresh.
+        # ════════════════════════════════════════════════════════════════════
+        if kind == "bars":
+            N_C = 140;  N_T = 8
+            _smooth = self._sm
+            b_eff = _smooth(aux.get("_sb", bass), bass, 0.30, 0.08)
+            m_eff = _smooth(aux.get("_smm", mid), mid,  0.30, 0.08)
+            aux["_sb"] = b_eff;  aux["_smm"] = m_eff
+
+            if "c_x" not in aux:
+                aux["c_x"]   = _r.random(N_C, dtype=np.float32) * W
+                aux["c_y"]   = _r.random(N_C, dtype=np.float32) * H
+                ghu = self._spec_display_hue
+                aux["c_hue"] = ((ghu + _r.uniform(-15/360, 15/360, N_C)) % 1.0).astype(np.float32)
+                aux["c_ang"] = _r.random(N_C, dtype=np.float32) * TWO_PI
+                aux["tails"] = [[] for _ in range(N_C)]
+
+            c_x   = aux["c_x"];  c_y   = aux["c_y"];  c_hue = aux["c_hue"]
+            c_ang = aux["c_ang"]
+            tails = aux["tails"]
+            t_p   = time.monotonic() - aux["t0"]
+            z_p   = t_p * (0.10 + m_eff * evolve_rate * 1.2)
+
+            n_vals     = _vnoise(c_x * noise_scale + z_p, c_y * noise_scale - z_p * 0.7)
+            ang_target = n_vals * TWO_PI
+            A  = 0.12
+            sc = (1 - A) * np.cos(c_ang) + A * np.cos(ang_target)
+            ss = (1 - A) * np.sin(c_ang) + A * np.sin(ang_target)
+            c_ang[:] = np.arctan2(ss, sc)
+
+            spd_c = 0.5 + m_eff * 1.2 + b_eff * 0.7
+
+            for i in range(N_C):
+                tails[i].insert(0, (float(c_x[i]), float(c_y[i])))
+                if len(tails[i]) > N_T:
+                    tails[i].pop()
+                if beat and len(tails[i]) < N_T:
+                    tails[i].insert(0, (float(c_x[i]), float(c_y[i])))
+
+                c_x[i] += math.cos(float(c_ang[i])) * spd_c
+                c_y[i] += math.sin(float(c_ang[i])) * spd_c
+
+                if c_x[i] < 0 or c_x[i] >= W:
+                    c_x[i] = c_x[i] % W
+                    tails[i] = []
+                if c_y[i] < 0 or c_y[i] >= H:
+                    c_y[i] = c_y[i] % H
+                    tails[i] = []
+
+            arr = np.array(self._spec_hallu_prev_frame, dtype=np.float32)
+            arr[..., :3] *= 0.94
+            canvas = _PILImage.fromarray(np.clip(arr, 0, 255).astype(np.uint8))
+            draw   = _PILDraw.Draw(canvas, "RGBA")
+
+            for i in range(N_C):
+                hue_c = float(c_hue[i])
+                tail  = tails[i]
+                for j, (tx, ty) in enumerate(tail):
+                    frac  = j / max(1, N_T - 1)
+                    brt   = max(0.10, 0.88 - frac * 0.72)
+                    alpha = int(220 * ((1.0 - frac) ** 1.4))
+                    rv, gv, bv = colorsys.hsv_to_rgb(hue_c, 0.75, brt)
+                    draw.rectangle((int(tx), int(ty), int(tx), int(ty)),
+                                   fill=(int(rv*255), int(gv*255), int(bv*255), alpha))
+                hx = int(c_x[i]);  hy = int(c_y[i])
+                if 0 <= hx < W and 0 <= hy < H:
+                    rv, gv, bv = colorsys.hsv_to_rgb(hue_c, 0.82, 1.0)
+                    draw.rectangle((hx, hy, hx + 1, hy + 1),
+                                   fill=(int(rv*255), int(gv*255), int(bv*255), 255))
+            return canvas
+
+        return self._draw_hallu_base(W, H, bass, mid, treble)
 
     def _hallu_morph(self, W, H, bass, mid, treble, beat, peak, p, _dt=None):
         """Geometry morphing: layered polygon rings with audio-driven vertex jitter."""
