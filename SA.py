@@ -782,6 +782,7 @@ class SpectrumController:
         self._sa_beat_min_energy   = _BEAT_MIN_ENERGY
         self._sa_beat_ratio_scale  = _BEAT_RATIO_SCALE
         self._sa_beat_refractory_s = _BEAT_REFRACTORY_S
+        self._sa_beat_flash_enabled = True   # white circle flash on beat hit
         self._beat_ind_lit_until      = 0.0   # hold beat indicator lit until this monotonic time
         self._sa_beat_ind_containers  = []    # all beat-dot Container refs (updated in _sync_render)
         self._sa_excited_ind_containers = []  # all excited-dot Container refs
@@ -1078,12 +1079,13 @@ class SpectrumController:
         )
 
         # ── Hallucination dropdown state (needed to compute config path) ─────
-        _valid_sub = ("mirror","chroma","perlin","morph")
-        _hs = str(c.get("spec_hallu_submode", "mirror")).lower()
-        self._spec_hallu_submode = "mirror" if _hs == "random" else (_hs if _hs in _valid_sub else "mirror")
-        _hbk = str(c.get("spec_hallu_base_kind", "waveform")).lower()
-        _valid_base = {bl["key"] for bl in _HALLU_BASE_LAYERS}
-        self._spec_hallu_base_kind = _hbk if _hbk in _valid_base else "waveform"
+        if not preserve_mode:
+            _valid_sub = ("mirror","chroma","perlin","morph")
+            _hs = str(c.get("spec_hallu_submode", "mirror")).lower()
+            self._spec_hallu_submode = "mirror" if _hs == "random" else (_hs if _hs in _valid_sub else "mirror")
+            _hbk = str(c.get("spec_hallu_base_kind", "waveform")).lower()
+            _valid_base = {bl["key"] for bl in _HALLU_BASE_LAYERS}
+            self._spec_hallu_base_kind = _hbk if _hbk in _valid_base else "waveform"
 
         self._spec_idle_enabled = bool(c.get("spec_idle_enabled", True))
         self._spec_idle_timeout = _clamp(c.get("spec_idle_timeout", 5.0), 2.0, 30.0, 5.0)
@@ -1412,8 +1414,9 @@ class SpectrumController:
                 "beat_sens":         float(self._sa_beat_sens),
                 "beat_min_vu":       float(self._sa_beat_min_vu),
                 "beat_min_energy":   float(self._sa_beat_min_energy),
-                "beat_ratio_scale":  float(self._sa_beat_ratio_scale),
-                "beat_refractory_s": float(self._sa_beat_refractory_s),
+                "beat_ratio_scale":   float(self._sa_beat_ratio_scale),
+                "beat_refractory_s":  float(self._sa_beat_refractory_s),
+                "beat_flash_enabled": bool(self._sa_beat_flash_enabled),
             }
         self._spec_mode_configs[_path] = _entry
 
@@ -1454,7 +1457,7 @@ class SpectrumController:
         _hallu_sub_defaults = {
             "mirror": {"zoom": 0.85, "rotDeg": 10.0, "opacity": 1.0,
                        "beat_sens": 2.0, "dim_thresh": 0.25},
-            "chroma": {"maxSplit": 14, "trail": 0.18, "speed": 1.0, "auto_speed": True},
+            "chroma": {"maxSplit": 14, "trail": 0.18, "speed": 1.0, "auto_speed": True, "beat_sens": 1.0},
             "perlin": {"noiseScale": 0.012, "evolveRate": 0.30},
             "morph":  {"beat_sens": 1.0},
         }
@@ -1468,6 +1471,7 @@ class SpectrumController:
                 _load_beat_params(_merged, _default_bs)
             elif mode in self._spec_color_mode_per_mode:
                 _load_beat_params({})
+                self._sa_beat_flash_enabled = True
             return
 
         if mode == "hallucination":
@@ -1494,6 +1498,7 @@ class SpectrumController:
             self._spec_bs_color_mode = self._spec_color_mode_per_mode.get(
                 mode, self._spec_color_mode_per_mode.get("beat_saber", "gradient"))
             _load_beat_params(_x)
+            self._sa_beat_flash_enabled = bool(_x.get("beat_flash_enabled", True))
 
     # ── Controls builder ──────────────────────────────────────────────────────
 
@@ -1872,7 +1877,6 @@ class SpectrumController:
             if self._spec_mode_random_enabled or self._spec_mode_random_on_song:
                 self._spec_mode_random_current = _m
             self._apply_per_mode_settings(_m)
-            self._config_dirty = True
             if self._menu_open and self._menu_last_tab == 0:
                 self._menu_rebuild_requested = True
         finally:
@@ -2713,8 +2717,8 @@ class SpectrumController:
         def _desc(txt):
             return ft.Text(txt, size=10, color="grey600", italic=True)
 
-        def _make_beat_params_col(visible_cond, src=None):
-            """Build the 5-slider Beat Detection block. src=dict of initial values (or None=instance vars)."""
+        def _make_beat_params_col(visible_cond, src=None, show_flash_toggle=False):
+            """Build the Beat Detection block (5 sliders + optional flash toggle)."""
             _s = src or {}
             _bs_i   = float(_s.get("beat_sens",         self._sa_beat_sens))
             _vu_i   = float(_s.get("beat_min_vu",       self._sa_beat_min_vu))
@@ -2746,8 +2750,42 @@ class SpectrumController:
                 self._sa_beat_refractory_s = round(float(e.control.value), 2)
                 _lrf.value = f"{self._sa_beat_refractory_s:.2f}"; _lrf.update()
                 self._config_dirty = True; self._update_save_buttons()
-            return ft.Column([
-                ft.Text("Beat Detection", size=11, color="grey500"),
+            async def _on_flash_toggle(e):
+                self._sa_beat_flash_enabled = bool(e.control.value)
+                self._config_dirty = True; self._update_save_buttons()
+            async def _on_copy_beat_to_all(e):
+                _beat_vals = {
+                    "beat_sens":         self._sa_beat_sens,
+                    "beat_min_vu":       self._sa_beat_min_vu,
+                    "beat_min_energy":   self._sa_beat_min_energy,
+                    "beat_ratio_scale":  self._sa_beat_ratio_scale,
+                    "beat_refractory_s": self._sa_beat_refractory_s,
+                }
+                for _m in ("beat_saber", "neon_cascade", "rock_stage"):
+                    _p = self._config_path_for(_m)
+                    self._spec_mode_configs.setdefault(_p, {}).setdefault("extras", {}).update(_beat_vals)
+                for _sub in ("mirror", "chroma", "perlin", "morph"):
+                    self._spec_hallu_params_per_submode.setdefault(_sub, {}).update(_beat_vals)
+                for _k, _v in self._spec_mode_configs.items():
+                    if _k.startswith("hallucination/"):
+                        _v.setdefault("extras", {}).setdefault("params", {}).update(_beat_vals)
+                self._config_dirty = True
+                self._update_save_buttons()
+            _flash_cb = ft.Checkbox(
+                label="Beat Flashes", scale=0.85,
+                value=self._sa_beat_flash_enabled, active_color="#ff9800",
+                on_change=_on_flash_toggle,
+            ) if show_flash_toggle else None
+            _rows = [
+                ft.Row([
+                    ft.Text("Beat Detection", size=11, color="#ff9800", weight=ft.FontWeight.BOLD),
+                    ft.TextButton("→ All", on_click=_on_copy_beat_to_all,
+                        style=ft.ButtonStyle(padding=ft.padding.symmetric(horizontal=6, vertical=0))),
+                ], spacing=0, vertical_alignment=ft.CrossAxisAlignment.CENTER),
+            ]
+            if _flash_cb:
+                _rows.append(_flash_cb)
+            _rows += [
                 ft.Row([ft.Text("Beat Sens:",   size=11, color="grey400", width=100),
                         ft.Slider(min=0.2, max=5.0, value=_bs_i, divisions=48,
                                   on_change=_on_bs, width=140), _lbs], spacing=4),
@@ -2763,15 +2801,19 @@ class SpectrumController:
                 ft.Row([ft.Text("Ratio Scale:", size=11, color="grey400", width=100),
                         ft.Slider(min=0.1, max=2.0,  value=_rs_i, divisions=38,
                                   on_change=_on_rs, width=140), _lrs], spacing=4),
-            ], spacing=3, visible=visible_cond)
+            ]
+            return ft.Column(_rows, spacing=3, visible=visible_cond)
 
         _canvas_beat_params = _make_beat_params_col(
-            self._spec_mode in ("beat_saber", "neon_cascade", "rock_stage"))
+            self._spec_mode in ("beat_saber", "neon_cascade", "rock_stage"),
+            show_flash_toggle=True)
 
         # ── Hallucination sub-mode dropdown ──────────────────────────────
         async def on_hallu_submode_change(e):
             _sub = str(e.control.value or "mirror").lower()
             _valid = ("mirror", "chroma", "perlin", "morph")
+            if _sub == self._spec_hallu_submode:
+                return
             self._spec_mode_transitioning = True
             try:
                 self._capture_per_mode_settings("hallucination")
@@ -2787,6 +2829,8 @@ class SpectrumController:
                 self._spec_mode_transitioning = False
 
         async def on_hallu_base_change(e):
+            if str(e.control.value or "waveform") == self._spec_hallu_base_kind:
+                return
             self._spec_mode_transitioning = True
             try:
                 self._capture_per_mode_settings("hallucination")
@@ -3129,6 +3173,7 @@ class SpectrumController:
                     ft.Slider(min=0.0, max=2.0, value=_chroma_spd_init, divisions=20,
                               on_change=_on_chroma_speed, width=140),
                     _chroma_spd_lbl, _chroma_auto_spd_cb], spacing=4),
+            _make_beat_params_col(True, src=self._spec_hallu_params_per_submode.get("chroma", {})),
         ], spacing=3, visible=(_is_hallu and _cur_sub == "chroma"))
 
         _perlin_beat_col = _make_beat_params_col(
@@ -3689,13 +3734,28 @@ class SpectrumController:
         # Reflect current dirty state immediately in case menu was reopened while dirty
         self._update_save_buttons()
 
+        _menu_prev_btn = ft.IconButton(
+            icon=ft.Icons.SKIP_PREVIOUS, icon_size=14,
+            tooltip="Previous mode",
+            style=ft.ButtonStyle(padding=ft.Padding.all(4)),
+            on_click=lambda _: self._cycle_spec_mode(-1),
+        )
+        _menu_next_btn = ft.IconButton(
+            icon=ft.Icons.SKIP_NEXT, icon_size=14,
+            tooltip="Next mode",
+            style=ft.ButtonStyle(padding=ft.Padding.all(4)),
+            on_click=lambda _: self._cycle_spec_mode(1),
+        )
         panel = ft.Container(
             content=ft.Column([
                 ft.Row([
                     ft.Container(expand=True),
+                    _menu_prev_btn,
+                    _menu_next_btn,
+                    ft.Container(expand=True),
                     _make_beat_indicators(),
                     _close_btn,
-                ], spacing=6),
+                ], spacing=4, vertical_alignment=ft.CrossAxisAlignment.CENTER),
                 _tabs,
                 ft.Divider(height=1, color="grey700"),
                 ft.Row([
@@ -4103,7 +4163,7 @@ class SpectrumController:
 
         # ── Layer 5 — White bass flash ────────────────────────────────────────
         _hf = self._bs_hit_flash
-        if _hf > 0.01:
+        if _hf > 0.01 and self._sa_beat_flash_enabled:
             _fe = _hf * _hf  # ease-out
             # Expanding white ring
             _ring_r = 10.0 + (1.0 - _hf) * 85.0
@@ -4384,7 +4444,7 @@ class SpectrumController:
 
         # ── Layer 6 — White bass flash ─────────────────────────────────────────
         _hf = self._nc_hit_flash
-        if _hf > 0.01:
+        if _hf > 0.01 and self._sa_beat_flash_enabled:
             _fe = _hf * _hf  # ease-out
             _cx, _cy = _W / 2.0, _H / 2.0
             _ring_r = 8.0 + (1.0 - _hf) * 72.0
@@ -4800,7 +4860,7 @@ class SpectrumController:
 
         # ── Layer 6 — White bass flash ─────────────────────────────────────────
         _hf = self._rsp_hit_flash
-        if _hf > 0.01:
+        if _hf > 0.01 and self._sa_beat_flash_enabled:
             _fe = _hf * _hf
             shapes.append(cv.Circle(x=_W / 2.0, y=_H / 2.0, radius=8.0 + (1.0 - _hf) * 68.0,
                 paint=ft.Paint(color=_wo(_fe * 0.70, _Cw),
@@ -5692,7 +5752,8 @@ class SpectrumController:
         if not pool:
             pool = list(self._spec_hallu_random_cycle_choices)
         self._spec_hallu_random_current = random.choice(pool) if pool else "mirror"
-        self._spec_hallu_aux = {}
+        self._spec_hallu_aux        = {}
+        self._spec_hallu_prev_frame = None
         self._spec_hallu_prev_frame = None
 
     def _render_hallucination(self):
@@ -7029,11 +7090,12 @@ class SpectrumController:
             draw  = _PILDraw.Draw(faded, "RGBA")
             cy    = H / 2
             A     = H * bp.get("helix_amp", 0.36) * (1 + bass * 0.4)
-            k     = bp.get("helix_k", 0.045) + mid * 0.025
+            k     = bp.get("helix_k", 0.045) + mid * 0.005
             tt    = t * 1.6
             rungs = max(4, int(bp.get("helix_rungs", 18)))
 
             # rungs first so strands draw on top
+            _is_grad = getattr(self, "_spec_hallu_gradient", False)
             rung_hue = (h_val + 0.08) % 1.0
             for i in range(rungs):
                 rx  = ((i + 0.5) / rungs) * W
@@ -7041,15 +7103,12 @@ class SpectrumController:
                 yb  = cy - A * math.sin(k * rx + tt)
                 depth = abs(yt - yb) / (2 * A) if A > 0 else 0.0
                 v   = 0.18 + depth * 0.52
-                rc, gc, bc = colorsys.hsv_to_rgb(rung_hue, 0.80, v)
+                _rh = (rx / W) * 0.33 if _is_grad else rung_hue
+                rc, gc, bc = colorsys.hsv_to_rgb(_rh, 0.80, v)
                 draw.line([(rx, yt), (rx, yb)],
                           fill=(int(rc*255), int(gc*255), int(bc*255), 200), width=1)
 
             # strands
-            rc, gc, bc = colorsys.hsv_to_rgb(h_val, 0.95, 0.85)
-            top_col = (int(rc*255), int(gc*255), int(bc*255), 255)
-            rc, gc, bc = colorsys.hsv_to_rgb((h_val + 0.56) % 1.0, 0.90, 0.80)
-            bot_col = (int(rc*255), int(gc*255), int(bc*255), 255)
             pts_top, pts_bot = [], []
             x = 0.0
             while x <= W:
@@ -7058,16 +7117,29 @@ class SpectrumController:
                 pts_bot.append((x, cy - A * s))
                 x += 1.5
             if len(pts_top) >= 2:
-                draw.line(pts_top, fill=top_col, width=2)
-                draw.line(pts_bot, fill=bot_col, width=2)
+                if _is_grad:
+                    for i in range(len(pts_top) - 1):
+                        h = (pts_top[i][0] / W) * 0.33
+                        rc, gc, bc = colorsys.hsv_to_rgb(h, 0.95, 0.85)
+                        col = (int(rc*255), int(gc*255), int(bc*255), 255)
+                        draw.line([pts_top[i], pts_top[i+1]], fill=col, width=2)
+                        draw.line([pts_bot[i], pts_bot[i+1]], fill=col, width=2)
+                else:
+                    rc, gc, bc = colorsys.hsv_to_rgb(h_val, 0.95, 0.85)
+                    top_col = (int(rc*255), int(gc*255), int(bc*255), 255)
+                    rc, gc, bc = colorsys.hsv_to_rgb((h_val + 0.56) % 1.0, 0.90, 0.80)
+                    bot_col = (int(rc*255), int(gc*255), int(bc*255), 255)
+                    draw.line(pts_top, fill=top_col, width=2)
+                    draw.line(pts_bot, fill=bot_col, width=2)
 
             # treble sparkles
             if treble > 0.45:
-                rc, gc, bc = colorsys.hsv_to_rgb(h_val, 0.60, 1.0)
-                sp_col = (int(rc*255), int(gc*255), int(bc*255), 255)
                 for _ in range(3):
                     i  = int(random.random() * rungs)
                     rx = ((i + 0.5) / rungs) * W
+                    _sh = (rx / W) * 0.33 if _is_grad else h_val
+                    rc, gc, bc = colorsys.hsv_to_rgb(_sh, 0.60, 1.0)
+                    sp_col = (int(rc*255), int(gc*255), int(bc*255), 255)
                     draw.rectangle((rx-1, cy-1, rx+1, cy+1), fill=sp_col)
             return faded
 
@@ -7152,10 +7224,10 @@ class SpectrumController:
             cx, cy = W / 2, H / 2
             A_x  = W * 0.45 * (1 + bass * 0.05)
             A_y  = H * 0.42 * (1 + bass * 0.15)
-            a    = bp.get("liss_a", 3.0) + bass * 0.6
-            b    = bp.get("liss_b", 2.0) + mid  * 0.4
-            phi  = t * bp.get("liss_phi_rate", 0.5)
-            psi  = t * 0.2 + math.sin(t * 0.15) * 0.4
+            a    = bp.get("liss_a", .01) + bass * 0.1
+            b    = bp.get("liss_b", .01) + mid  * 0.1
+            phi  = t * bp.get("liss_phi_rate", 0.1)
+            psi  = t * 0.2 + math.sin(t * 0.15) * 0.1
             N    = 320
             for layer in range(2):
                 phase = layer * 0.25
@@ -7168,7 +7240,7 @@ class SpectrumController:
                     pts.append((cx + A_x * math.sin(a * u + phi + phase),
                                  cy + A_y * math.sin(b * u + psi)))
                 if len(pts) >= 2:
-                    draw.line(pts, fill=col, width=2)
+                    draw.line(pts, fill=col, width=4)
             if treble > 0.4:
                 rc, gc, bc = colorsys.hsv_to_rgb(h_val, 0.60, 1.0)
                 sp_col = (int(rc*255), int(gc*255), int(bc*255), 255)
