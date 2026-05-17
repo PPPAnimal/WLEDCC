@@ -7087,38 +7087,47 @@ class SpectrumController:
             sf_speed = bp.get("sf_m_speed", 0.25)
             sf_max   = bp.get("sf_m_max",   8.0)
             sf_n1    = bp.get("sf_n1",       0.55)
-            m  = 3 + (math.sin(t * sf_speed) * 0.5 + 0.5) * sf_max + mid * 0.8
+            # Blend between two adjacent integer m's so the superformula always
+            # closes: r(0)=r(2π) only holds when m is an integer, so non-integer
+            # m produces a gap. Smoothstep-blending two integer-m curves keeps
+            # the animation smooth and guarantees both endpoints are identical.
+            m_float = 3 + (math.sin(t * sf_speed) * 0.5 + 0.5) * sf_max + mid * 0.8
+            m_low   = int(math.floor(m_float))
+            m_high  = m_low + 1
+            _frac   = m_float - m_low
+            blend   = _frac * _frac * (3 - 2 * _frac)   # smoothstep
             n1 = sf_n1 + bass * 0.30
             n2 = 1.50 + treble * 0.50
             n3 = n2
             N  = 360
-            if _np_ok:
-                theta = np.linspace(0, 2 * math.pi, N + 1, dtype=np.float32)
-                t1 = np.abs(np.cos(m * theta / 4)) ** n2
-                t2 = np.abs(np.sin(m * theta / 4)) ** n3
-                s  = t1 + t2
-                with np.errstate(divide="ignore", invalid="ignore"):
-                    r_arr = np.where(s > 1e-9, s ** (-1.0 / n1), 0.0)
-                r_arr = np.where(np.isfinite(r_arr), r_arr, 0.0)
-                max_r = float(r_arr.max()) or 1.0
-                raw   = list(zip(theta.tolist(), r_arr.tolist()))
-            else:
-                raw   = []
-                max_r = 0.0
-                for i in range(N + 1):
-                    th  = (i / N) * 2 * math.pi
-                    t1  = abs(math.cos(m * th / 4)) ** n2
-                    t2  = abs(math.sin(m * th / 4)) ** n3
-                    sv  = t1 + t2
-                    r   = (sv ** (-1.0 / n1)) if sv > 1e-9 else 0.0
-                    if not math.isfinite(r):
-                        r = 0.0
-                    raw.append((th, r))
-                    if r > max_r:
-                        max_r = r
-                if max_r == 0.0:
-                    max_r = 1.0
-            norm = 1.0 / max_r
+            _TWO_PI = 2 * math.pi
+
+            def _sf_samples(m_int):
+                if _np_ok:
+                    theta = np.linspace(0, _TWO_PI, N + 1, dtype=np.float32)
+                    t1 = np.abs(np.cos(m_int * theta / 4)) ** n2
+                    t2 = np.abs(np.sin(m_int * theta / 4)) ** n3
+                    s  = t1 + t2
+                    with np.errstate(divide="ignore", invalid="ignore"):
+                        r_a = np.where(s > 1e-9, s ** (-1.0 / n1), 0.0)
+                    r_a = np.where(np.isfinite(r_a), r_a, 0.0)
+                    mx  = float(r_a.max()) or 1.0
+                    return (r_a / mx).tolist()
+                else:
+                    out, max_r = [], 0.0
+                    for i in range(N + 1):
+                        th = (i / N) * _TWO_PI
+                        sv = abs(math.cos(m_int * th / 4)) ** n2 + abs(math.sin(m_int * th / 4)) ** n3
+                        r  = (sv ** (-1.0 / n1)) if sv > 1e-9 else 0.0
+                        if not math.isfinite(r): r = 0.0
+                        out.append(r)
+                        if r > max_r: max_r = r
+                    norm = (1.0 / max_r) if max_r > 0 else 1.0
+                    return [v * norm for v in out]
+
+            r_low  = _sf_samples(m_low)
+            r_high = _sf_samples(m_high)
+
             for layer in range(2):
                 shrink = 1.0 - layer * 0.18
                 hue    = (h_val + layer * 0.08) % 1.0
@@ -7126,12 +7135,13 @@ class SpectrumController:
                 rc, gc, bc = colorsys.hsv_to_rgb(hue, 0.95, v)
                 col = (int(rc*255), int(gc*255), int(bc*255), 220 - layer * 40)
                 pts = []
-                for th, r in raw:
-                    rn = r * norm * shrink
-                    pts.append((cx + base_rx * rn * math.cos(th),
-                                 cy + base_ry * rn * math.sin(th)))
-                if len(pts) >= 2:
-                    draw.line(pts, fill=col, width=2)
+                for i in range(N + 1):
+                    theta = (i / N) * _TWO_PI
+                    r     = r_low[i] + blend * (r_high[i] - r_low[i])
+                    pts.append((cx + base_rx * r * shrink * math.cos(theta),
+                                cy + base_ry * r * shrink * math.sin(theta)))
+                pts.append(pts[0])
+                draw.line(pts, fill=col, width=2)
             return faded
 
         # ── Lissajous Ribbon ──────────────────────────────────────────────────
