@@ -529,6 +529,7 @@ _ROT_EXCITE_LERP_RAMP   = 1.0                         # rate (1/sec) at which le
 _ROT_EXCITE_CENTER_PROB = (1.0,  0.33, 0.25, 0.15)  # probability of picking center (0°) as next target
 _ROT_MAX_HIT_PROB       = 0.30                        # on beat, chance of targeting full rot_max when last target was below it
 _ROT_BEAT_FLIP_PROB     = 0.70                        # on beat, chance of flipping direction vs pushing further in same direction
+_ROT_MORPH_SPEED_SCALE  = 15.0                        # deg/sec per unit of _sa_rot_current for morph global spin
 _BEAT_SUB_BASS_FRAC  = 0.05   # .1 fraction of FFT bands used as sub-bass tap (~20-80 Hz)
 
 # ── Paths ────────────────────────────────────────────────────────────────────
@@ -844,9 +845,19 @@ class SpectrumController:
             "mirror":   {"zoom": 0.85,   "rotDeg": 10.0,   "opacity": 1.0,    "beat_sens": 2.0,  "dim_thresh": 0.25},
             "chroma":   {"maxSplit": 14, "trail": 0.18, "speed": 1.0, "auto_speed": True},
             "perlin":   {"noiseScale": 0.012, "evolveRate": 0.30},
-            "morph":    {"layers": 3, "jitter": 1.0, "beat_sens": 1.0},
+            "morph":    {"beat_sens": 1.0},
         }
         self._spec_hallu_base_kind             = "waveform"
+        self._spec_hallu_base_params           = {
+            "circle":    {"rotDeg": 5.0, "spreadRange": 0.70, "layers": 3, "jitter": 1.0,
+                          "auto_rot": True, "auto_spread": True},
+            "waveform":  {"helix_amp": 0.36, "helix_k": 0.045, "helix_rungs": 18,
+                          "helix_amp_auto": False, "helix_k_auto": False, "helix_rungs_auto": False},
+            "particles": {"sf_m_speed": 0.25, "sf_m_max": 8.0, "sf_n1": 0.55,
+                          "sf_m_speed_auto": False, "sf_m_max_auto": False, "sf_n1_auto": False},
+            "bars":      {"liss_a": 3.0, "liss_b": 2.0, "liss_phi_rate": 0.5,
+                          "liss_a_auto": False, "liss_b_auto": False, "liss_phi_rate_auto": False},
+        }
         self._spec_hallu_random_cycle_choices  = ["mirror","chroma","perlin","morph"]
         self._spec_hallu_random_cycle_seconds  = 60.0
         self._spec_hallu_random_current        = "mirror"
@@ -1128,6 +1139,27 @@ class SpectrumController:
                 "params":        _sub_params,
             }
             self._spec_mode_configs[_hallu_path] = _h_base
+        # ── Hallucination base-kind params — load all four kinds at startup ──
+        _bp_defaults = {
+            "circle":    {"rotDeg": 5.0, "spreadRange": 0.70, "layers": 3, "jitter": 1.0,
+                          "auto_rot": True, "auto_spread": True},
+            "waveform":  {"helix_amp": 0.36, "helix_k": 0.045, "helix_rungs": 18,
+                          "helix_amp_auto": False, "helix_k_auto": False, "helix_rungs_auto": False},
+            "particles": {"sf_m_speed": 0.25, "sf_m_max": 8.0, "sf_n1": 0.55,
+                          "sf_m_speed_auto": False, "sf_m_max_auto": False, "sf_n1_auto": False},
+            "bars":      {"liss_a": 3.0, "liss_b": 2.0, "liss_phi_rate": 0.5,
+                          "liss_a_auto": False, "liss_b_auto": False, "liss_phi_rate_auto": False},
+        }
+        for _kind in ("circle", "waveform", "particles", "bars"):
+            _bk_path   = f"hallucination/morph/{_kind}"
+            _bk_extras = self._spec_mode_configs.get(_bk_path, {}).get("extras", {})
+            _bk_bp     = _bk_extras.get("base_params", {}) if isinstance(_bk_extras, dict) else {}
+            # Migration: old configs stored circle shape params in extras.params
+            if _kind == "circle" and not _bk_bp:
+                _old   = _bk_extras.get("params", {}) if isinstance(_bk_extras, dict) else {}
+                _bk_bp = {k: _old[k] for k in ("rotDeg","spreadRange","layers","jitter","auto_rot","auto_spread") if k in _old}
+            self._spec_hallu_base_params[_kind] = {
+                **_bp_defaults[_kind], **((_bk_bp) if isinstance(_bk_bp, dict) else {})}
         # ── Beat detection test values ────────────────────────────────────────
         _bt = c.get("beat_test", {})
         if isinstance(_bt, dict) and _bt:
@@ -1372,6 +1404,7 @@ class SpectrumController:
                 "auto_spread": bool(self._spec_hallu_auto_spread),
                 "auto_blur":   bool(self._spec_hallu_auto_blur),
                 "params":      _sub_params,
+                "base_params": dict(self._spec_hallu_base_params.get(self._spec_hallu_base_kind, {})),
             }
         elif mode in self._spec_color_mode_per_mode:
             _entry["extras"] = {
@@ -1423,7 +1456,7 @@ class SpectrumController:
                        "beat_sens": 2.0, "dim_thresh": 0.25},
             "chroma": {"maxSplit": 14, "trail": 0.18, "speed": 1.0, "auto_speed": True},
             "perlin": {"noiseScale": 0.012, "evolveRate": 0.30},
-            "morph":  {"layers": 3, "jitter": 1.0, "beat_sens": 1.0},
+            "morph":  {"beat_sens": 1.0},
         }
 
         if not _x:
@@ -2318,10 +2351,14 @@ class SpectrumController:
 
         def _do_reload(_=None):
             _tab = _tabs.selected_index
-            _keep_mode = self._spec_mode  # guard against concurrent render-loop mode changes
-            _clear_panel_refs()
-            self.load_config(preserve_mode=True)
-            self._spec_mode = _keep_mode  # ensure mode is never reverted by undo
+            _keep_mode = self._spec_mode
+            self._spec_mode_transitioning = True
+            try:
+                _clear_panel_refs()
+                self.load_config(preserve_mode=True)
+                self._spec_mode = _keep_mode
+            finally:
+                self._spec_mode_transitioning = False
             self._show_combined_settings(initial_tab=_tab)
 
         def _do_save(_=None):
@@ -2861,19 +2898,202 @@ class SpectrumController:
         ], spacing=2,
         visible=(_is_hallu and _cur_sub == "mirror"))
 
-        def _morph_param_set(key, value):
+        def _base_param_set(kind, key, value):
             try:
-                self._spec_hallu_params_per_submode.setdefault("morph", {})[key] = float(value)
+                self._spec_hallu_base_params.setdefault(kind, {})[key] = value
                 self._config_dirty = True
                 self._update_save_buttons()
             except Exception:
                 pass
 
-        _morph_sliders_col = ft.Column([
-            _make_beat_params_col(True,
-                src=self._spec_hallu_params_per_submode.get("morph", {})),
-        ], spacing=2,
-        visible=(_is_hallu and _cur_sub == "morph"))
+        _cur_base = self._spec_hallu_base_kind
+        _bp       = self._spec_hallu_base_params.get(_cur_base, {})
+
+        if _cur_base == "circle":
+            _morph_rot_init    = float(_bp.get("rotDeg",      5.0))
+            _morph_spread_init = float(_bp.get("spreadRange", 0.70))
+            _morph_auto_rot_init    = bool(_bp.get("auto_rot",    True))
+            _morph_auto_spread_init = bool(_bp.get("auto_spread", True))
+
+            _morph_rot_lbl    = ft.Text(f"{_morph_rot_init:+.1f}°",  size=11, color="#ff9800", width=42)
+            _morph_spread_lbl = ft.Text(f"{_morph_spread_init:.2f}", size=11, color="#ff9800", width=42)
+
+            def _on_morph_rot(e):
+                v = round(float(e.control.value), 2)
+                _base_param_set("circle", "rotDeg", v)
+                _morph_rot_lbl.value = f"{v:+.1f}°"; _morph_rot_lbl.update()
+            def _on_morph_spread(e):
+                v = round(float(e.control.value), 2)
+                _base_param_set("circle", "spreadRange", v)
+                _morph_spread_lbl.value = f"{v:.2f}"; _morph_spread_lbl.update()
+
+            _morph_sliders_col = ft.Column([
+                ft.Row([ft.Text("Ghost Spread:", size=11, color="grey400", width=100),
+                        ft.Slider(min=0.0, max=1.0, value=_morph_spread_init,
+                                  divisions=20, on_change=_on_morph_spread, width=140),
+                        _morph_spread_lbl,
+                        ft.Checkbox(label="Auto", value=_morph_auto_spread_init,
+                            on_change=lambda e: _base_param_set("circle","auto_spread", bool(e.control.value)),
+                            active_color="#ff9800", scale=0.8)], spacing=4),
+                ft.Row([ft.Text("Rotation:",    size=11, color="grey400", width=100),
+                        ft.Slider(min=-10.0, max=10.0, value=_morph_rot_init,
+                                  divisions=80, on_change=_on_morph_rot, width=140),
+                        _morph_rot_lbl,
+                        ft.Checkbox(label="Auto", value=_morph_auto_rot_init,
+                            on_change=lambda e: _base_param_set("circle","auto_rot", bool(e.control.value)),
+                            active_color="#ff9800", scale=0.8)], spacing=4),
+                _make_beat_params_col(True, src=self._spec_hallu_params_per_submode.get("morph", {})),
+            ], spacing=2, visible=(_is_hallu and _cur_sub == "morph"))
+
+        elif _cur_base == "waveform":
+            _h_amp_init   = float(_bp.get("helix_amp",   0.36))
+            _h_k_init     = float(_bp.get("helix_k",     0.045))
+            _h_rungs_init = int(_bp.get("helix_rungs", 18))
+            _h_amp_auto   = bool(_bp.get("helix_amp_auto",   False))
+            _h_k_auto     = bool(_bp.get("helix_k_auto",     False))
+            _h_rungs_auto = bool(_bp.get("helix_rungs_auto", False))
+
+            _h_amp_lbl   = ft.Text(f"{_h_amp_init:.2f}", size=11, color="#ff9800", width=42)
+            _h_k_lbl     = ft.Text(f"{_h_k_init:.3f}",  size=11, color="#ff9800", width=42)
+            _h_rungs_lbl = ft.Text(f"{_h_rungs_init}",   size=11, color="#ff9800", width=42)
+
+            def _on_h_amp(e):
+                v = round(float(e.control.value), 2)
+                _base_param_set("waveform", "helix_amp", v)
+                _h_amp_lbl.value = f"{v:.2f}"; _h_amp_lbl.update()
+            def _on_h_k(e):
+                v = round(float(e.control.value), 3)
+                _base_param_set("waveform", "helix_k", v)
+                _h_k_lbl.value = f"{v:.3f}"; _h_k_lbl.update()
+            def _on_h_rungs(e):
+                v = int(round(float(e.control.value)))
+                _base_param_set("waveform", "helix_rungs", v)
+                _h_rungs_lbl.value = f"{v}"; _h_rungs_lbl.update()
+
+            _morph_sliders_col = ft.Column([
+                ft.Row([ft.Text("Helix Amplitude:", size=11, color="grey400", width=100),
+                        ft.Slider(min=0.15, max=0.5, value=_h_amp_init,
+                                  divisions=35, on_change=_on_h_amp, width=140),
+                        _h_amp_lbl,
+                        ft.Checkbox(label="Auto", value=_h_amp_auto,
+                            on_change=lambda e: _base_param_set("waveform","helix_amp_auto", bool(e.control.value)),
+                            active_color="#ff9800", scale=0.8)], spacing=4),
+                ft.Row([ft.Text("Twist Density:", size=11, color="grey400", width=100),
+                        ft.Slider(min=0.02, max=0.10, value=_h_k_init,
+                                  divisions=80, on_change=_on_h_k, width=140),
+                        _h_k_lbl,
+                        ft.Checkbox(label="Auto", value=_h_k_auto,
+                            on_change=lambda e: _base_param_set("waveform","helix_k_auto", bool(e.control.value)),
+                            active_color="#ff9800", scale=0.8)], spacing=4),
+                ft.Row([ft.Text("Rung Count:", size=11, color="grey400", width=100),
+                        ft.Slider(min=8, max=32, value=_h_rungs_init,
+                                  divisions=24, on_change=_on_h_rungs, width=140),
+                        _h_rungs_lbl,
+                        ft.Checkbox(label="Auto", value=_h_rungs_auto,
+                            on_change=lambda e: _base_param_set("waveform","helix_rungs_auto", bool(e.control.value)),
+                            active_color="#ff9800", scale=0.8)], spacing=4),
+                _make_beat_params_col(True, src=self._spec_hallu_params_per_submode.get("morph", {})),
+            ], spacing=2, visible=(_is_hallu and _cur_sub == "morph"))
+
+        elif _cur_base == "particles":
+            _sf_spd_init = float(_bp.get("sf_m_speed", 0.25))
+            _sf_max_init = float(_bp.get("sf_m_max",   8.0))
+            _sf_n1_init  = float(_bp.get("sf_n1",      0.55))
+            _sf_spd_auto = bool(_bp.get("sf_m_speed_auto", False))
+            _sf_max_auto = bool(_bp.get("sf_m_max_auto",   False))
+            _sf_n1_auto  = bool(_bp.get("sf_n1_auto",      False))
+
+            _sf_spd_lbl = ft.Text(f"{_sf_spd_init:.2f}", size=11, color="#ff9800", width=42)
+            _sf_max_lbl = ft.Text(f"{_sf_max_init:.1f}", size=11, color="#ff9800", width=42)
+            _sf_n1_lbl  = ft.Text(f"{_sf_n1_init:.2f}",  size=11, color="#ff9800", width=42)
+
+            def _on_sf_spd(e):
+                v = round(float(e.control.value), 2)
+                _base_param_set("particles", "sf_m_speed", v)
+                _sf_spd_lbl.value = f"{v:.2f}"; _sf_spd_lbl.update()
+            def _on_sf_max(e):
+                v = round(float(e.control.value), 1)
+                _base_param_set("particles", "sf_m_max", v)
+                _sf_max_lbl.value = f"{v:.1f}"; _sf_max_lbl.update()
+            def _on_sf_n1(e):
+                v = round(float(e.control.value), 2)
+                _base_param_set("particles", "sf_n1", v)
+                _sf_n1_lbl.value = f"{v:.2f}"; _sf_n1_lbl.update()
+
+            _morph_sliders_col = ft.Column([
+                ft.Row([ft.Text("M Sweep Speed:", size=11, color="grey400", width=100),
+                        ft.Slider(min=0.05, max=1.0, value=_sf_spd_init,
+                                  divisions=19, on_change=_on_sf_spd, width=140),
+                        _sf_spd_lbl,
+                        ft.Checkbox(label="Auto", value=_sf_spd_auto,
+                            on_change=lambda e: _base_param_set("particles","sf_m_speed_auto", bool(e.control.value)),
+                            active_color="#ff9800", scale=0.8)], spacing=4),
+                ft.Row([ft.Text("M Sweep Range:", size=11, color="grey400", width=100),
+                        ft.Slider(min=4, max=12, value=_sf_max_init,
+                                  divisions=16, on_change=_on_sf_max, width=140),
+                        _sf_max_lbl,
+                        ft.Checkbox(label="Auto", value=_sf_max_auto,
+                            on_change=lambda e: _base_param_set("particles","sf_m_max_auto", bool(e.control.value)),
+                            active_color="#ff9800", scale=0.8)], spacing=4),
+                ft.Row([ft.Text("Puffiness Bias:", size=11, color="grey400", width=100),
+                        ft.Slider(min=0.4, max=1.5, value=_sf_n1_init,
+                                  divisions=22, on_change=_on_sf_n1, width=140),
+                        _sf_n1_lbl,
+                        ft.Checkbox(label="Auto", value=_sf_n1_auto,
+                            on_change=lambda e: _base_param_set("particles","sf_n1_auto", bool(e.control.value)),
+                            active_color="#ff9800", scale=0.8)], spacing=4),
+                _make_beat_params_col(True, src=self._spec_hallu_params_per_submode.get("morph", {})),
+            ], spacing=2, visible=(_is_hallu and _cur_sub == "morph"))
+
+        else:  # "bars" — Lissajous Ribbon
+            _ls_a_init   = float(_bp.get("liss_a",        3.0))
+            _ls_b_init   = float(_bp.get("liss_b",        2.0))
+            _ls_phi_init = float(_bp.get("liss_phi_rate",  0.5))
+            _ls_a_auto   = bool(_bp.get("liss_a_auto",        False))
+            _ls_b_auto   = bool(_bp.get("liss_b_auto",        False))
+            _ls_phi_auto = bool(_bp.get("liss_phi_rate_auto", False))
+
+            _ls_a_lbl   = ft.Text(f"{_ls_a_init:.1f}",   size=11, color="#ff9800", width=42)
+            _ls_b_lbl   = ft.Text(f"{_ls_b_init:.1f}",   size=11, color="#ff9800", width=42)
+            _ls_phi_lbl = ft.Text(f"{_ls_phi_init:.2f}",  size=11, color="#ff9800", width=42)
+
+            def _on_ls_a(e):
+                v = round(float(e.control.value), 1)
+                _base_param_set("bars", "liss_a", v)
+                _ls_a_lbl.value = f"{v:.1f}"; _ls_a_lbl.update()
+            def _on_ls_b(e):
+                v = round(float(e.control.value), 1)
+                _base_param_set("bars", "liss_b", v)
+                _ls_b_lbl.value = f"{v:.1f}"; _ls_b_lbl.update()
+            def _on_ls_phi(e):
+                v = round(float(e.control.value), 2)
+                _base_param_set("bars", "liss_phi_rate", v)
+                _ls_phi_lbl.value = f"{v:.2f}"; _ls_phi_lbl.update()
+
+            _morph_sliders_col = ft.Column([
+                ft.Row([ft.Text("Ratio a:", size=11, color="grey400", width=100),
+                        ft.Slider(min=1, max=7, value=_ls_a_init,
+                                  divisions=12, on_change=_on_ls_a, width=140),
+                        _ls_a_lbl,
+                        ft.Checkbox(label="Auto", value=_ls_a_auto,
+                            on_change=lambda e: _base_param_set("bars","liss_a_auto", bool(e.control.value)),
+                            active_color="#ff9800", scale=0.8)], spacing=4),
+                ft.Row([ft.Text("Ratio b:", size=11, color="grey400", width=100),
+                        ft.Slider(min=1, max=7, value=_ls_b_init,
+                                  divisions=12, on_change=_on_ls_b, width=140),
+                        _ls_b_lbl,
+                        ft.Checkbox(label="Auto", value=_ls_b_auto,
+                            on_change=lambda e: _base_param_set("bars","liss_b_auto", bool(e.control.value)),
+                            active_color="#ff9800", scale=0.8)], spacing=4),
+                ft.Row([ft.Text("Tumble Rate:", size=11, color="grey400", width=100),
+                        ft.Slider(min=0, max=2, value=_ls_phi_init,
+                                  divisions=40, on_change=_on_ls_phi, width=140),
+                        _ls_phi_lbl,
+                        ft.Checkbox(label="Auto", value=_ls_phi_auto,
+                            on_change=lambda e: _base_param_set("bars","liss_phi_rate_auto", bool(e.control.value)),
+                            active_color="#ff9800", scale=0.8)], spacing=4),
+                _make_beat_params_col(True, src=self._spec_hallu_params_per_submode.get("morph", {})),
+            ], spacing=2, visible=(_is_hallu and _cur_sub == "morph"))
 
         _chroma_p          = self._spec_hallu_params_per_submode.get("chroma", {})
         _chroma_off_init   = float(_chroma_p.get("maxSplit", 14))
@@ -5665,6 +5885,33 @@ class SpectrumController:
                 pass
         return img
 
+    def _run_rot_state(self, rot_deg, _rot_dt):
+        """Excite-driven rotation state machine shared by mirror and morph.
+        Updates self._sa_rot_current (degrees). rot_deg = slider magnitude."""
+        _rot_level = self._sa_rot_level
+        _rot_max   = abs(float(rot_deg)) * _ROT_EXCITE_SLIDER_PCT[_rot_level]
+        self._sa_rot_target = max(-_rot_max, min(_rot_max, self._sa_rot_target))
+        _beat_edge = self._sa_beat_detected and not self._sa_rot_prev_beat
+        self._sa_rot_prev_beat = self._sa_beat_detected
+        if _beat_edge and _rot_level > 0 and _rot_max > 0:
+            if random.random() < _ROT_EXCITE_CENTER_PROB[_rot_level]:
+                self._sa_rot_target = 0.0
+            else:
+                _cur_sign = math.copysign(1.0, self._sa_rot_current) if self._sa_rot_current != 0.0 else 1.0
+                _sign     = -_cur_sign if random.random() < _ROT_BEAT_FLIP_PROB else _cur_sign
+                if abs(self._sa_rot_target) < _rot_max * 0.95 and random.random() < _ROT_MAX_HIT_PROB:
+                    self._sa_rot_target = _sign * _rot_max
+                else:
+                    self._sa_rot_target = _sign * _rot_max * random.uniform(0.5, 1.0)
+        if _rot_max > 0 and abs(self._sa_rot_current - self._sa_rot_target) < max(0.15, _rot_max * 0.04):
+            if random.random() < _ROT_EXCITE_CENTER_PROB[_rot_level]:
+                self._sa_rot_target = 0.0
+            else:
+                _sign = -math.copysign(1.0, self._sa_rot_target) if self._sa_rot_target != 0.0 else 1.0
+                self._sa_rot_target = -_sign * _rot_max * random.uniform(0.4, 1.0)
+        _alpha = 1.0 - math.exp(-self._sa_rot_lerp_rate * _rot_dt)
+        self._sa_rot_current += (self._sa_rot_target - self._sa_rot_current) * _alpha
+
     def _hallu_mirror(self, W, H, bass, mid, treble, beat, peak, p, _dt=None):
         """Droste tunnel (particles base) / Ghost ribbon (waveform/circle/image bases).
 
@@ -5704,35 +5951,8 @@ class SpectrumController:
             return st["pos"]
 
         # ── Excitement-driven rotation state machine ──────────────────────────
-        _rot_dt    = min((_dt if _dt is not None and _dt > 0 else 1.0 / 30.0), 0.1)
-        _rot_level = self._sa_rot_level
-        _rot_max   = abs(float(p.get("rotDeg", 2.0))) * _ROT_EXCITE_SLIDER_PCT[_rot_level]
-        # Clamp target to current rot_max bounds (level may have changed)
-        self._sa_rot_target = max(-_rot_max, min(_rot_max, self._sa_rot_target))
-        # Beat rising edge → direction control only (stop, center, or flip)
-        _beat_edge = self._sa_beat_detected and not self._sa_rot_prev_beat
-        self._sa_rot_prev_beat = self._sa_beat_detected
-        if _beat_edge and _rot_level > 0 and _rot_max > 0:
-            if random.random() < _ROT_EXCITE_CENTER_PROB[_rot_level]:
-                self._sa_rot_target = 0.0
-            else:
-                _cur_sign  = math.copysign(1.0, self._sa_rot_current) if self._sa_rot_current != 0.0 else 1.0
-                _sign      = -_cur_sign if random.random() < _ROT_BEAT_FLIP_PROB else _cur_sign
-                _was_below_max = abs(self._sa_rot_target) < _rot_max * 0.95
-                if _was_below_max and random.random() < _ROT_MAX_HIT_PROB:
-                    self._sa_rot_target = _sign * _rot_max
-                else:
-                    self._sa_rot_target = _sign * _rot_max * random.uniform(0.5, 1.0)
-        # Target reached → pick next random target in opposite direction
-        if _rot_max > 0 and abs(self._sa_rot_current - self._sa_rot_target) < max(0.15, _rot_max * 0.04):
-            if random.random() < _ROT_EXCITE_CENTER_PROB[_rot_level]:
-                self._sa_rot_target = 0.0
-            else:
-                _sign = -math.copysign(1.0, self._sa_rot_target) if self._sa_rot_target != 0.0 else 1.0
-                self._sa_rot_target = -_sign * _rot_max * random.uniform(0.4, 1.0)
-        # Excite level controls speed only — lerp rate is ramped in _compute_audio_frame
-        _alpha = 1.0 - math.exp(-self._sa_rot_lerp_rate * _rot_dt)
-        self._sa_rot_current += (self._sa_rot_target - self._sa_rot_current) * _alpha
+        _rot_dt = min((_dt if _dt is not None and _dt > 0 else 1.0 / 30.0), 0.1)
+        self._run_rot_state(p.get("rotDeg", 2.0), _rot_dt)
 
         # ================================================================
         # PARTICLES PATH -- single-buffer Droste feedback
@@ -6791,22 +7011,189 @@ class SpectrumController:
 
     def _hallu_morph(self, W, H, bass, mid, treble, beat, peak, p, _dt=None):
         """Geometry morphing: layered polygon rings with audio-driven vertex jitter."""
-        aux = self._spec_hallu_aux
+        aux  = self._spec_hallu_aux
+        kind = self._spec_hallu_base_kind
 
         _ts_m = (_dt if _dt is not None else (1.0 / 30.0)) * 30.0
         dt = (0.005 + peak * 0.18) * _ts_m  # time-normalised animation step
         t = aux.get("t", 0.0) + dt
         aux["t"] = t
 
-        layers = max(1, int(p.get("layers", 3)))
-        jitter = float(p.get("jitter", 1.0))
+        h_val = self._spec_display_hue
+        bp    = self._spec_hallu_base_params.get(kind, {})
+
+        # ── DNA Helix ─────────────────────────────────────────────────────────
+        if kind == "waveform":
+            faded = _PILImage.blend(_PILImage.new("RGBA", (W, H), (0, 0, 0, 255)),
+                                    self._spec_hallu_prev_frame, 0.78)
+            draw  = _PILDraw.Draw(faded, "RGBA")
+            cy    = H / 2
+            A     = H * bp.get("helix_amp", 0.36) * (1 + bass * 0.4)
+            k     = bp.get("helix_k", 0.045) + mid * 0.025
+            tt    = t * 1.6
+            rungs = max(4, int(bp.get("helix_rungs", 18)))
+
+            # rungs first so strands draw on top
+            rung_hue = (h_val + 0.08) % 1.0
+            for i in range(rungs):
+                rx  = ((i + 0.5) / rungs) * W
+                yt  = cy + A * math.sin(k * rx + tt)
+                yb  = cy - A * math.sin(k * rx + tt)
+                depth = abs(yt - yb) / (2 * A) if A > 0 else 0.0
+                v   = 0.18 + depth * 0.52
+                rc, gc, bc = colorsys.hsv_to_rgb(rung_hue, 0.80, v)
+                draw.line([(rx, yt), (rx, yb)],
+                          fill=(int(rc*255), int(gc*255), int(bc*255), 200), width=1)
+
+            # strands
+            rc, gc, bc = colorsys.hsv_to_rgb(h_val, 0.95, 0.85)
+            top_col = (int(rc*255), int(gc*255), int(bc*255), 255)
+            rc, gc, bc = colorsys.hsv_to_rgb((h_val + 0.56) % 1.0, 0.90, 0.80)
+            bot_col = (int(rc*255), int(gc*255), int(bc*255), 255)
+            pts_top, pts_bot = [], []
+            x = 0.0
+            while x <= W:
+                s = math.sin(k * x + tt)
+                pts_top.append((x, cy + A * s))
+                pts_bot.append((x, cy - A * s))
+                x += 1.5
+            if len(pts_top) >= 2:
+                draw.line(pts_top, fill=top_col, width=2)
+                draw.line(pts_bot, fill=bot_col, width=2)
+
+            # treble sparkles
+            if treble > 0.45:
+                rc, gc, bc = colorsys.hsv_to_rgb(h_val, 0.60, 1.0)
+                sp_col = (int(rc*255), int(gc*255), int(bc*255), 255)
+                for _ in range(3):
+                    i  = int(random.random() * rungs)
+                    rx = ((i + 0.5) / rungs) * W
+                    draw.rectangle((rx-1, cy-1, rx+1, cy+1), fill=sp_col)
+            return faded
+
+        # ── Superformula ──────────────────────────────────────────────────────
+        if kind == "particles":
+            try:
+                import numpy as np
+                _np_ok = True
+            except ImportError:
+                _np_ok = False
+            faded = _PILImage.blend(_PILImage.new("RGBA", (W, H), (0, 0, 0, 255)),
+                                    self._spec_hallu_prev_frame, 0.78)
+            draw  = _PILDraw.Draw(faded, "RGBA")
+            cx, cy   = W / 2, H / 2
+            base_rx  = W * 0.46
+            base_ry  = H * 0.44
+            sf_speed = bp.get("sf_m_speed", 0.25)
+            sf_max   = bp.get("sf_m_max",   8.0)
+            sf_n1    = bp.get("sf_n1",       0.55)
+            m  = 3 + (math.sin(t * sf_speed) * 0.5 + 0.5) * sf_max + mid * 0.8
+            n1 = sf_n1 + bass * 0.30
+            n2 = 1.50 + treble * 0.50
+            n3 = n2
+            N  = 360
+            if _np_ok:
+                theta = np.linspace(0, 2 * math.pi, N + 1, dtype=np.float32)
+                t1 = np.abs(np.cos(m * theta / 4)) ** n2
+                t2 = np.abs(np.sin(m * theta / 4)) ** n3
+                s  = t1 + t2
+                with np.errstate(divide="ignore", invalid="ignore"):
+                    r_arr = np.where(s > 1e-9, s ** (-1.0 / n1), 0.0)
+                r_arr = np.where(np.isfinite(r_arr), r_arr, 0.0)
+                max_r = float(r_arr.max()) or 1.0
+                raw   = list(zip(theta.tolist(), r_arr.tolist()))
+            else:
+                raw   = []
+                max_r = 0.0
+                for i in range(N + 1):
+                    th  = (i / N) * 2 * math.pi
+                    t1  = abs(math.cos(m * th / 4)) ** n2
+                    t2  = abs(math.sin(m * th / 4)) ** n3
+                    sv  = t1 + t2
+                    r   = (sv ** (-1.0 / n1)) if sv > 1e-9 else 0.0
+                    if not math.isfinite(r):
+                        r = 0.0
+                    raw.append((th, r))
+                    if r > max_r:
+                        max_r = r
+                if max_r == 0.0:
+                    max_r = 1.0
+            norm = 1.0 / max_r
+            for layer in range(2):
+                shrink = 1.0 - layer * 0.18
+                hue    = (h_val + layer * 0.08) % 1.0
+                v      = 0.85 - layer * 0.10
+                rc, gc, bc = colorsys.hsv_to_rgb(hue, 0.95, v)
+                col = (int(rc*255), int(gc*255), int(bc*255), 220 - layer * 40)
+                pts = []
+                for th, r in raw:
+                    rn = r * norm * shrink
+                    pts.append((cx + base_rx * rn * math.cos(th),
+                                 cy + base_ry * rn * math.sin(th)))
+                if len(pts) >= 2:
+                    draw.line(pts, fill=col, width=2)
+            return faded
+
+        # ── Lissajous Ribbon ──────────────────────────────────────────────────
+        if kind == "bars":
+            faded = _PILImage.blend(_PILImage.new("RGBA", (W, H), (0, 0, 0, 255)),
+                                    self._spec_hallu_prev_frame, 0.78)
+            draw = _PILDraw.Draw(faded, "RGBA")
+            cx, cy = W / 2, H / 2
+            A_x  = W * 0.45 * (1 + bass * 0.05)
+            A_y  = H * 0.42 * (1 + bass * 0.15)
+            a    = bp.get("liss_a", 3.0) + bass * 0.6
+            b    = bp.get("liss_b", 2.0) + mid  * 0.4
+            phi  = t * bp.get("liss_phi_rate", 0.5)
+            psi  = t * 0.2 + math.sin(t * 0.15) * 0.4
+            N    = 320
+            for layer in range(2):
+                phase = layer * 0.25
+                hue   = (h_val + layer * 0.06) % 1.0
+                rc, gc, bc = colorsys.hsv_to_rgb(hue, 0.95, 0.85 - layer * 0.12)
+                col = (int(rc*255), int(gc*255), int(bc*255), 220 - layer * 40)
+                pts = []
+                for i in range(N + 1):
+                    u = (i / N) * 2 * math.pi
+                    pts.append((cx + A_x * math.sin(a * u + phi + phase),
+                                 cy + A_y * math.sin(b * u + psi)))
+                if len(pts) >= 2:
+                    draw.line(pts, fill=col, width=2)
+            if treble > 0.4:
+                rc, gc, bc = colorsys.hsv_to_rgb(h_val, 0.60, 1.0)
+                sp_col = (int(rc*255), int(gc*255), int(bc*255), 255)
+                for _ in range(4):
+                    u = random.random() * 2 * math.pi
+                    sx = cx + A_x * math.sin(a * u + phi)
+                    sy = cy + A_y * math.sin(b * u + psi)
+                    draw.rectangle((sx-1, sy-1, sx+1, sy+1), fill=sp_col)
+            return faded
+
+        # ── Circle / polygon rings ────────────────────────────────────────────
+        _cp      = self._spec_hallu_base_params.get("circle", {})
+        layers   = max(1, int(_cp.get("layers", 3)))
+        jitter   = float(_cp.get("jitter", 1.0))
+        _rot_dt  = min((_dt if _dt is not None and _dt > 0 else 1.0 / 30.0), 0.1)
+        auto_rot = bool(_cp.get("auto_rot", True))
+        if auto_rot:
+            self._run_rot_state(_cp.get("rotDeg", 5.0), _rot_dt)
+            _spin_rate = self._sa_rot_current * _ROT_MORPH_SPEED_SCALE   # deg/sec
+        else:
+            _spin_rate = float(_cp.get("rotDeg", 5.0))                   # deg/sec directly
+        spin_angle   = (aux.get("morph_spin", 0.0) + math.radians(_spin_rate) * _rot_dt) % (2 * math.pi)
+        aux["morph_spin"] = spin_angle
+
+        spread_range = float(_cp.get("spreadRange", 0.70))
+        if bool(_cp.get("auto_spread", True)):
+            s_eff = spread_range * (0.15 + 0.85 * bass)
+        else:
+            s_eff = spread_range
 
         faded = _PILImage.blend(_PILImage.new("RGBA", (W, H), (0, 0, 0, 255)),
                                 self._spec_hallu_prev_frame, 0.78)
         draw = _PILDraw.Draw(faded, "RGBA")
         cx, cy = W // 2, H // 2
         R_max  = min(cx, cy) - 2
-        h_val  = self._spec_display_hue
         N      = 120
 
         beat_kick = 1.0 + (0.18 if self._sa_beat_detected else 0.0)
@@ -6815,20 +7202,21 @@ class SpectrumController:
         A_treble =  6.0 * jitter
 
         for L in range(layers):
-            R_base = R_max * (0.30 + 0.70 * (L + 1) / layers) * beat_kick
+            R_base = R_max * (0.30 + s_eff * (L + 1) / layers) * beat_kick
             hue = (h_val + L / max(1, layers) * 0.25) % 1.0
             rc, gc, bc = colorsys.hsv_to_rgb(hue, 1.0, 0.7 + bass * 0.3)
             alpha = max(70, 200 - L * 45)
             color = (int(rc*255), int(gc*255), int(bc*255), alpha)
             pts = []
             for i in range(N):
-                theta = 2 * math.pi * i / N
+                theta     = 2 * math.pi * i / N
+                theta_rot = theta + spin_angle
                 rv = (R_base
                     + math.sin(5  * theta + 2 * t + L * 0.7) * A_bass   * bass
                     + math.sin(11 * theta + 4 * t + L * 1.3) * A_mid    * mid
                     + math.sin(23 * theta + 7 * t + L * 2.1) * A_treble * treble)
-                pts.append((int(cx + rv * math.cos(theta)),
-                            int(cy + rv * math.sin(theta))))
+                pts.append((int(cx + rv * math.cos(theta_rot)),
+                            int(cy + rv * math.sin(theta_rot))))
             if len(pts) >= 3:
                 draw.polygon(pts, outline=color)
         return faded
