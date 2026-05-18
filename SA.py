@@ -504,6 +504,10 @@ _SA_NATIVE_W  = 300   # spectrum box native width  (scale reference)
 _SA_NATIVE_H  = 62    # spectrum box native height (scale reference)
 _SA_MAX_FPS      = 60    # sliding-window audio loop supports up to 60 fps
 _IDLE_REF_FPS    = 30.0  # FPS at which idle-effect per-frame constants were tuned
+_HALLU_PARTICLE_HUE_RATE_MIN = 0.04  # raw hue drift at silence (cycles/sec) — apparent speed = rate × cycles
+_HALLU_PARTICLE_HUE_RATE_MAX = 01.21  # raw hue drift at peak VU
+_HALLU_PARTICLE_HUE_CYCLES   = 4     # rainbow cycles packed into the visible trail; more = thinner bands, all colors visible at lower drift rate
+_HALLU_BARS_LOOP_DEPTH_SPREAD = 0.5  # hue shift front→back in bars loop mode (0.5 = complementary)
 
 # ── Beat detection constants ──────────────────────────────────────────────────
 _BEAT_HISTORY_FRAMES = 12     # 12 rolling window length (~200 ms at 60 fps)
@@ -564,9 +568,15 @@ _CM_RANDOM_POOL = {
 #   base_layers: list of {"key","label"}
 _HALLU_BASE_LAYERS = [
     {"key": "waveform",  "label": "Waveform"},
-    {"key": "circle",    "label": "Circular Waveform"},
+    {"key": "circle",    "label": "Circular"},
     {"key": "particles", "label": "Particles"},
-    {"key": "bars",      "label": "Spectrum Bars"},
+    {"key": "bars",      "label": "Bars"},
+]
+_HALLU_MORPH_BASE_LAYERS = [
+    {"key": "waveform",  "label": "DNA"},
+    {"key": "circle",    "label": "Rings"},
+    {"key": "particles", "label": "Super"},
+    {"key": "bars",      "label": "Ribbon"},
 ]
 _MODE_HIERARCHY = [
     {
@@ -601,10 +611,10 @@ _MODE_HIERARCHY = [
         "key": "hallucination",
         "label": "Hallucination",
         "submodes": [
-            {"key": "mirror",   "label": "Recursive Mirror",       "base_layers": _HALLU_BASE_LAYERS},
-            {"key": "chroma",   "label": "Chromatic Aberration",   "base_layers": _HALLU_BASE_LAYERS},
-            {"key": "perlin",   "label": "Perlin Flow Fields",     "base_layers": _HALLU_BASE_LAYERS},
-            {"key": "morph",    "label": "Geometry Morphing",      "base_layers": _HALLU_BASE_LAYERS},
+            {"key": "mirror",   "label": "Mirror",     "base_layers": _HALLU_BASE_LAYERS},
+            {"key": "chroma",   "label": "Chromatic",  "base_layers": _HALLU_BASE_LAYERS},
+            {"key": "perlin",   "label": "Fish Tank",  "base_layers": _HALLU_BASE_LAYERS},
+            {"key": "morph",    "label": "Morphing",   "base_layers": _HALLU_MORPH_BASE_LAYERS},
         ],
     },
 ]
@@ -843,7 +853,7 @@ class SpectrumController:
         # ── Hallucination state ───────────────────────────────────────────
         self._spec_hallu_submode               = "mirror"
         self._spec_hallu_params_per_submode    = {
-            "mirror":   {"zoom": 0.85,   "rotDeg": 10.0,   "opacity": 1.0,    "beat_sens": 2.0,  "dim_thresh": 0.25},
+            "mirror":   {"zoom": 0.85,   "rotDeg": 10.0,   "opacity": 1.0,    "beat_sens": 2.0,  "dim_thresh": 0.08},
             "chroma":   {"maxSplit": 14, "trail": 0.18, "speed": 1.0, "auto_speed": True},
             "perlin":   {"noiseScale": 0.012, "evolveRate": 0.30},
             "morph":    {"beat_sens": 1.0},
@@ -1456,7 +1466,7 @@ class SpectrumController:
 
         _hallu_sub_defaults = {
             "mirror": {"zoom": 0.85, "rotDeg": 10.0, "opacity": 1.0,
-                       "beat_sens": 2.0, "dim_thresh": 0.25},
+                       "beat_sens": 2.0, "dim_thresh": 0.08},
             "chroma": {"maxSplit": 14, "trail": 0.18, "speed": 1.0, "auto_speed": True, "beat_sens": 1.0},
             "perlin": {"noiseScale": 0.012, "evolveRate": 0.30},
             "morph":  {"beat_sens": 1.0},
@@ -2846,10 +2856,10 @@ class SpectrumController:
                 self._spec_mode_transitioning = False
 
         _hallu_options = [
-            ft.dropdown.Option("mirror",   "1. Recursive Mirror"),
-            ft.dropdown.Option("chroma",   "2. Chromatic Aberration"),
-            ft.dropdown.Option("perlin",   "3. Perlin Flow Fields"),
-            ft.dropdown.Option("morph",    "4. Geometry Morphing"),
+            ft.dropdown.Option("mirror",   "1. Mirror"),
+            ft.dropdown.Option("chroma",   "2. Chromatic"),
+            ft.dropdown.Option("perlin",   "3. Fish Tank"),
+            ft.dropdown.Option("morph",    "4. Morphing"),
         ]
         _valid_dd_sub = [o.key for o in _hallu_options]
         _hallu_dd_val = self._spec_hallu_submode if self._spec_hallu_submode in _valid_dd_sub else "mirror"
@@ -2859,8 +2869,14 @@ class SpectrumController:
             on_select=on_hallu_submode_change,
             text_size=12, dense=True,
         )
+        _cur_sub_entry = next(
+            (s for g in _MODE_HIERARCHY if g["key"] == "hallucination"
+             for s in g["submodes"] if s["key"] == self._spec_hallu_submode),
+            None,
+        )
+        _cur_base_layers = _cur_sub_entry["base_layers"] if _cur_sub_entry else _HALLU_BASE_LAYERS
         _hallu_base_options = [
-            ft.dropdown.Option(bl["key"], bl["label"]) for bl in _HALLU_BASE_LAYERS
+            ft.dropdown.Option(bl["key"], bl["label"]) for bl in _cur_base_layers
         ]
         _hallu_base_dd = ft.Dropdown(
             width=200,
@@ -3746,13 +3762,36 @@ class SpectrumController:
             style=ft.ButtonStyle(padding=ft.Padding.all(4)),
             on_click=lambda _: self._cycle_spec_mode(1),
         )
+
+        def _build_mode_name():
+            m = self._spec_mode
+            if m == "hallucination":
+                _sub_entry  = next((s for g in _MODE_HIERARCHY if g["key"] == "hallucination"
+                                    for s in g["submodes"] if s["key"] == self._spec_hallu_submode),
+                                   None)
+                _sub_label  = _sub_entry["label"] if _sub_entry else self._spec_hallu_submode
+                _bl_list    = _sub_entry["base_layers"] if _sub_entry else _HALLU_BASE_LAYERS
+                _base_label = next((b["label"] for b in _bl_list
+                                    if b["key"] == self._spec_hallu_base_kind),
+                                   self._spec_hallu_base_kind)
+                return f"Hallucination / {_sub_label} / {_base_label}"
+            for g in _MODE_HIERARCHY:
+                for s in g.get("submodes", []):
+                    if s["key"] == m:
+                        return f"{g['label']} / {s['label']}"
+                if g["key"] == m:
+                    return g["label"]
+            return m
+
+        _mode_name_lbl = ft.Text(_build_mode_name(), size=11, color="grey500", italic=True)
+
         panel = ft.Container(
             content=ft.Column([
                 ft.Row([
+                    _mode_name_lbl,
                     ft.Container(expand=True),
                     _menu_prev_btn,
                     _menu_next_btn,
-                    ft.Container(expand=True),
                     _make_beat_indicators(),
                     _close_btn,
                 ], spacing=4, vertical_alignment=ft.CrossAxisAlignment.CENTER),
@@ -5789,7 +5828,10 @@ class SpectrumController:
             _hallu_cm = self._tick_random_cm("hallucination", beat) or "loop"
         if _hallu_cm == "loop":
             self._spec_display_hue = (_now_render / 20.0) % 1.0
+        elif _hallu_cm == "gradient":
+            self._spec_display_hue = (_now_render / 40.0) % 1.0
         self._spec_hallu_gradient = (_hallu_cm == "gradient")
+        self._spec_hallu_loop     = (_hallu_cm == "loop")
 
         params = self._spec_hallu_params_per_submode.get(sub, {})
         fn = {
@@ -5988,6 +6030,7 @@ class SpectrumController:
         N      = 26
         kind   = self._spec_hallu_base_kind
         _grad  = getattr(self, "_spec_hallu_gradient", False)
+        _loop  = getattr(self, "_spec_hallu_loop",     True)
         h_val  = self._spec_display_hue
         cx, cy = W / 2.0, H / 2.0
         t_auto = time.monotonic()
@@ -6035,12 +6078,13 @@ class SpectrumController:
             aux["_local_bass"] = local_bass
 
             # ── Brightness / dim floor ────────────────────────────────
-            dim_thresh  = max(0.0, min(0.5, float(p.get("dim_thresh", 0.25))))
+            dim_thresh  = max(0.0, min(0.5, float(p.get("dim_thresh", 0.08))))
             bright_held = aux.get("_bright_held", 0.0)
-            if fast_vu > dim_thresh:
+            _dim_vu = max(fast_vu, local_vu)   # any signal (bass OR overall) keeps dots lit
+            if _dim_vu > dim_thresh:
                 bright_held = bright_held * 0.4 + fast_vu * 0.6
             else:
-                bright_held = bright_held * 0.97          # ~2s fade at 30fps
+                bright_held = bright_held * (0.97 ** (_rot_dt * 30.0))  # time-normalised fade
             aux["_bright_held"] = bright_held
             brightness = min(1.0, bright_held)
 
@@ -6121,13 +6165,26 @@ class SpectrumController:
                 if pt["py"] < -edge:      pt["py"] = H + edge
                 elif pt["py"] > H + edge: pt["py"] = -edge
 
+            # Fresh-dot hue: slow drift for gradient mode; trail rainbow comes from
+            # buffer rotation below so no cycles multiplier needed here.
+            _hue_rate = 0.0
+            if _grad:
+                _hue_rate = (_HALLU_PARTICLE_HUE_RATE_MIN
+                             + local_vu * (_HALLU_PARTICLE_HUE_RATE_MAX - _HALLU_PARTICLE_HUE_RATE_MIN))
+                _part_hue = aux.get("_part_hue", 0.0)
+                _part_hue = (_part_hue + _hue_rate * _rot_dt) % 1.0
+                aux["_part_hue"] = _part_hue
+                _frame_hue = (h_val + _part_hue) % 1.0
+            else:
+                _frame_hue = h_val
+
             # ── Draw fresh dots (transparent bg) ──────────────────────
             frame = _PILImage.new("RGBA", (W, H), (0, 0, 0, 0))
             if brightness > 0.01:
                 fdraw      = _PILDraw.Draw(frame, "RGBA")
-                rv, gv, bv = colorsys.hsv_to_rgb(h_val, 1.0, brightness)
+                rv, gv, bv = colorsys.hsv_to_rgb(_frame_hue, 1.0, brightness)
                 col        = (int(rv * 255), int(gv * 255), int(bv * 255))
-                cr, cg, cb = colorsys.hsv_to_rgb(h_val, 0.4, brightness)
+                cr, cg, cb = colorsys.hsv_to_rgb(_frame_hue, 0.4, brightness)
                 wh         = (int(cr * 255), int(cg * 255), int(cb * 255))
                 r3 = dot_r + 3;  r1 = dot_r + 1
                 for pt in particles:
@@ -6159,6 +6216,24 @@ class SpectrumController:
             r2, g2, b2, a2 = warped.split()
             a2 = a2.point(lambda v, op=trail_fade: int(v * op))
             warped = _PILImage.merge("RGBA", (r2, g2, b2, a2))
+
+            # Gradient mode: rotate the hue of the warped buffer each frame.
+            # Older (deeper) copies accumulate more rotation → spatial depth rainbow
+            # independent of Droste zoom speed. Rate = hue_rate × cycles multiplier.
+            if _grad and _hue_rate > 0:
+                import numpy as np
+                _theta = -_hue_rate * _HALLU_PARTICLE_HUE_CYCLES * _rot_dt * 2.0 * math.pi
+                _cos_h = math.cos(_theta);  _sin_h = math.sin(_theta)
+                _mh    = (1.0 - _cos_h) / 3.0;  _sh = _sin_h / math.sqrt(3.0)
+                _hmat  = np.array([
+                    [_cos_h + _mh, _mh - _sh,    _mh + _sh   ],
+                    [_mh + _sh,    _cos_h + _mh,  _mh - _sh   ],
+                    [_mh - _sh,    _mh + _sh,    _cos_h + _mh ],
+                ], dtype=np.float32)
+                _wa    = np.asarray(warped, dtype=np.float32)
+                _out   = _wa.copy()
+                _out[:, :, :3] = (_wa[:, :, :3].reshape(-1, 3) @ _hmat.T).clip(0, 255).reshape(_wa.shape[0], _wa.shape[1], 3)
+                warped = _PILImage.fromarray(_out.astype(np.uint8), "RGBA")
 
             # Composite: history + fresh dots on top
             canvas = _PILImage.new("RGBA", (W, H), (0, 0, 0, 255))
@@ -6395,12 +6470,15 @@ class SpectrumController:
                 _frames.append((corners, fhue, fbars, alpha))
 
             # Draw oldest → newest so newer frames land on top
+            _n_depth = max(1, len(_frames) - 1)
             for fi in range(len(_frames) - 1, -1, -1):
                 if _frames[fi] is None:
                     continue
                 corners, fhue, fbars, alpha = _frames[fi]
                 newer_corners = (_frames[fi - 1][0]
                                  if fi > 0 and _frames[fi - 1] is not None else None)
+                # Loop mode: shift hue by depth so front and back bars differ
+                _draw_hue = (fhue + fi / _n_depth * _HALLU_BARS_LOOP_DEPTH_SPREAD) % 1.0 if _loop else fhue
 
                 for i in range(min(n, len(corners))):
                     c = corners[i]
@@ -6409,7 +6487,7 @@ class SpectrumController:
                     TL, TR, BR, BL = c
                     _bv = fbars[i] if i < len(fbars) else 0.0
                     _rv, _gv, _bvv = colorsys.hsv_to_rgb(
-                        (fhue + i / n * _hue_spread) % 1.0, 1.0, 0.5 + _bv * 0.5)
+                        (_draw_hue + i / n * _hue_spread) % 1.0, 1.0, 0.5 + _bv * 0.5)
                     col = (int(_rv * alpha), int(_gv * alpha), int(_bvv * alpha))
 
                     # Fill gaps between this frame and the next newer frame
