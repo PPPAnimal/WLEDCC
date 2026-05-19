@@ -536,6 +536,187 @@ _ROT_BEAT_FLIP_PROB     = 0.70                        # on beat, chance of flipp
 _ROT_MORPH_SPEED_SCALE  = 15.0                        # deg/sec per unit of _sa_rot_current for morph global spin
 _BEAT_SUB_BASS_FRAC  = 0.05   # .1 fraction of FFT bands used as sub-bass tap (~20-80 Hz)
 
+# ── Beat Scanner (BSC) constants ──────────────────────────────────────────────
+_BAC_BEAT_FLASH_S       = 0.08   # beat-confirmed flash duration (seconds)
+_BAC_UI_UPDATE_INTERVAL = 0.25   # min seconds between BAC UI refreshes
+_BSC_TRAIL_LEN          = 18     # comet trail history points
+_BSC_CANVAS_W           = 42     # mini comet track width (px)
+_BSC_CANVAS_H           = 8      # mini comet track height (px)
+_BSC_HEAD_R             = 3.5    # comet head radius
+
+# ── Beat Scanner engine classes ───────────────────────────────────────────────
+
+class _BeatClock:
+    """Phase-locked beat clock. Audio thread marks onsets; render thread ticks."""
+    _DEFAULT_BPM = 120.0
+    _PLL_RATE    = 0.25
+    _BPM_MIN     = 60.0
+    _BPM_MAX     = 200.0
+
+    def __init__(self):
+        self.bpm        = self._DEFAULT_BPM
+        self.period     = 60.0 / self._DEFAULT_BPM
+        self.phase      = 0.0
+        self._cum       = 0.0
+        self._ts        = time.perf_counter()
+        self.jitter     = 0.5
+        self.beat_fired = False
+
+    def tick(self):
+        """Advance clock one display frame. Call from render thread."""
+        now             = time.perf_counter()
+        inc             = (now - self._ts) / self.period
+        self._ts        = now
+        new_phase       = self.phase + inc
+        self.beat_fired = new_phase >= 1.0
+        self.phase      = new_phase % 1.0
+        self._cum      += inc
+
+    def nudge(self):
+        """Pull phase toward nearest beat boundary on onset."""
+        err            = self.phase if self.phase < 0.5 else self.phase - 1.0
+        correction     = err * self._PLL_RATE
+        self.phase    -= correction
+        self._cum     -= correction
+        self.jitter    = 0.9 * self.jitter + 0.1 * abs(err)
+
+    def set_bpm(self, bpm):
+        bpm         = max(self._BPM_MIN, min(self._BPM_MAX, bpm))
+        self.bpm    = 0.25 * bpm + 0.75 * self.bpm
+        self.period = 60.0 / self.bpm
+
+    @property
+    def scan_pos(self):
+        """0.0=left, 1.0=right. Hits an edge on every beat."""
+        p = self._cum % 2.0
+        return 1.0 - abs(p - 1.0)
+
+
+class _BeatDetector:
+    """Spectral-flux onset detector + autocorrelation BPM estimator.
+    feed() is called from the audio thread; all other access from render thread."""
+    _ODF_HISTORY_S  = 7.0
+    _BPM_MIN        = 60.0
+    _BPM_MAX        = 200.0
+    _ONSET_K        = 1.5
+    _ONSET_COOLDOWN = 0.20
+    _RETRIGGER_S    = 2.0
+    _BAND_HZ        = [0, 80, 300, 2000, 11025]
+    _BAND_W         = [2.0, 3.5, 1.0, 0.3]
+
+    def __init__(self, clock, sr=48000, block_size=512):
+        import numpy as np
+        self._clock      = clock
+        self._sr         = int(sr)
+        self._block_size = int(block_size)
+        self._hann       = np.hanning(self._block_size)
+        self._prev_mags  = None
+        self._local      = collections.deque(maxlen=43)
+        self._hist       = collections.deque()
+        self._last_onset = 0.0
+        self._last_bpm_t = 0.0
+        self._lock       = threading.Lock()
+        self.confidence  = 0.0
+        self._wave_buf   = collections.deque(maxlen=int(sr * 2))
+        self._bands      = [
+            (max(0, round(lo * self._block_size / self._sr)),
+             min(self._block_size // 2,
+                 max(1, round(hi * self._block_size / self._sr))))
+            for lo, hi in zip(self._BAND_HZ, self._BAND_HZ[1:])
+        ]
+
+    def feed(self, block):
+        """Process one mono audio block. Called from audio thread."""
+        import numpy as np
+        now = time.perf_counter()
+        self._wave_buf.extend(block)
+        _n  = self._block_size
+        _b  = np.asarray(block, dtype=np.float32)
+        if len(_b) >= _n:
+            _b = _b[:_n]
+        else:
+            _b = np.pad(_b, (0, _n - len(_b)))
+        mags = np.abs(np.fft.rfft(_b * self._hann))
+
+        odf = 0.0
+        if self._prev_mags is not None:
+            for (lo, hi), w in zip(self._bands, self._BAND_W):
+                odf += w * float(np.sum(np.maximum(0.0, mags[lo:hi] - self._prev_mags[lo:hi])))
+        self._prev_mags = mags
+
+        self._local.append(odf)
+        mean = float(np.mean(self._local))
+        std  = float(np.std(self._local)) if len(self._local) > 2 else 1e-6
+        if (odf > mean + self._ONSET_K * std
+                and odf > mean * 1.2
+                and now - self._last_onset > self._ONSET_COOLDOWN):
+            self._last_onset = now
+            self._clock.nudge()   # called directly from audio thread, like original
+
+        with self._lock:
+            self._hist.append((now, odf))
+            cutoff = now - self._ODF_HISTORY_S
+            while self._hist and self._hist[0][0] < cutoff:
+                self._hist.popleft()
+
+        if now - self._last_bpm_t > self._RETRIGGER_S:
+            self._last_bpm_t = now
+            self._reestimate()
+
+    @property
+    def bpm(self):
+        return self._clock.bpm
+
+    def get_waveform(self, n):
+        """Return n display points from the most recent audio in the rolling buffer.
+
+        Uses a short recent window (~1/8 s) and averages each stride so aliasing
+        from high-frequency content doesn't make the line flicker every frame.
+        """
+        buf = list(self._wave_buf)
+        total = len(buf)
+        if total < 2:
+            return [0.0] * n
+        window = min(total, max(n * 2, self._sr // 8))
+        recent = buf[total - window:]
+        step = max(1, len(recent) // n)
+        result = []
+        for i in range(min(n, len(recent) // step)):
+            chunk = recent[i * step: i * step + step]
+            result.append(sum(chunk) / len(chunk))
+        return result
+
+    def _reestimate(self):
+        import numpy as np
+        with self._lock:
+            if len(self._hist) < 64:
+                return
+            times, vals = zip(*self._hist)
+        arr  = np.array(vals, dtype=float)
+        arr -= arr.mean()
+        corr = np.correlate(arr, arr, mode='full')[len(arr) - 1:]
+        dur  = times[-1] - times[0]
+        if dur <= 0:
+            return
+        rate    = len(times) / dur
+        lag_min = max(2, int(rate * 60.0 / self._BPM_MAX))
+        lag_max = min(len(corr) - 1, int(rate * 60.0 / self._BPM_MIN))
+        if lag_min >= lag_max:
+            return
+        search   = corr[lag_min:lag_max]
+        peak_idx = int(np.argmax(search))
+        bpm      = 60.0 * rate / (peak_idx + lag_min)
+        noise    = float(np.mean(search)) + 1e-9
+        new_conf = min(1.0, max(0.0, (float(search[peak_idx]) / noise - 1.0) / 5.0))
+        self.confidence = 0.15 * new_conf + 0.85 * self.confidence
+        for mult in (2.0, 0.5):
+            candidate = bpm * mult
+            if self._BPM_MIN <= candidate <= self._BPM_MAX:
+                if abs(candidate - self._clock.bpm) < abs(bpm - self._clock.bpm):
+                    bpm = candidate
+        self._clock.set_bpm(bpm)
+
+
 # ── Paths ────────────────────────────────────────────────────────────────────
 _VERSION_DIR = os.path.dirname(sys.executable if getattr(sys, "frozen", False) else os.path.abspath(__file__))
 _DATA_DIR    = os.path.join(os.environ.get("APPDATA", _VERSION_DIR), "WLEDCC")
@@ -587,6 +768,7 @@ _MODE_HIERARCHY = [
             {"key": "vu",           "label": "VU (L/R)"},
             {"key": "cyber_city",   "label": "Cyber City"},
             {"key": "hud_reactor",  "label": "HUD Reactor"},
+            {"key": "waveform",     "label": "Waveform"},
         ],
     },
     {
@@ -786,6 +968,9 @@ class SpectrumController:
                                                      maxlen=_BEAT_HISTORY_FRAMES)
         self._sa_beat_last_ts    = 0.0   # monotonic time of last fired beat (refractory)
         self._sa_raw_bass_energy = 0.0   # pre-whitening sub-bass log-power, written by audio loop
+        self._sa_onset_flux     = 0.0   # aubio-style full-spectrum specdiff, written by audio loop
+        self._sa_onset_flux_gen = 0     # incremented each audio block so render thread can dedup
+        self._sa_prev_spec_vals = None  # previous block's per-band log-energy for spectral diff
         self._sa_beat_sens      = 1.0   # loaded from active mode's per-mode config
         # Per-mode beat detection params (replace global constants at runtime)
         self._sa_beat_min_vu       = _BEAT_MIN_VU
@@ -796,6 +981,26 @@ class SpectrumController:
         self._beat_ind_lit_until      = 0.0   # hold beat indicator lit until this monotonic time
         self._sa_beat_ind_containers  = []    # all beat-dot Container refs (updated in _sync_render)
         self._sa_excited_ind_containers = []  # all excited-dot Container refs
+        # ── Beat Scanner (BSC) engine ─────────────────────────────────────────
+        self._bac_enabled       = False
+        self._bac_state         = "SEARCHING"
+        self._bac_bpm           = 0.0
+        self._bac_beat_flash_ts = 0.0   # monotonic ts of last confirmed beat
+        self._bac_prev_bar_ts   = 0.0
+        self._bac_ui_dirty      = False
+        self._bac_ui_last_ts    = 0.0
+        self._bac_bpm_label     = None   # ft.Text "BPM: 124.3"
+        self._bac_state_label   = None   # ft.Text state chip
+        self._bac_bs_slider     = None
+        self._bac_rf_slider     = None
+        self._beat_clock        = _BeatClock()
+        _bsc_sr = int(self._spec_sample_rate or 48000)
+        self._beat_detector     = _BeatDetector(
+            self._beat_clock, sr=_bsc_sr,
+            block_size=1024 if _bsc_sr >= 44100 else 512)
+        self._bsc_trail: list      = []   # one deque per panel instance (comet trail)
+        self._bsc_canvases: list   = []   # ft.Canvas refs, one per panel
+        self._bsc_conf_labels: list = []  # ft.Text confidence % refs, one per panel
         self._spec_idle_enabled     = True
         self._spec_idle_timeout     = 5.0
         self._spec_idle_effect      = "random"
@@ -1039,7 +1244,7 @@ class SpectrumController:
                 _mode = "classic"
             self._spec_mode = _mode if _mode in (
                 "classic", "vu", "cyber_city", "beat_saber", "neon_drift", "retro_tech",
-                "custom_vu", "hud_reactor", "neon_cascade", "rock_stage", "hallucination") else "classic"
+                "custom_vu", "hud_reactor", "waveform", "neon_cascade", "rock_stage", "hallucination") else "classic"
 
         self._spec_nvu_drift_bg  = c.get("spec_nvu_drift_bg",  _NVU_BG_DEFAULTS["drift"])
         self._spec_nvu_retro_bg  = c.get("spec_nvu_retro_bg",  _NVU_BG_DEFAULTS["retro"])
@@ -1080,7 +1285,7 @@ class SpectrumController:
             self._spec_mode, self._spec_color_mode_per_mode.get("beat_saber", "random"))
 
         _nvu = str(c.get("spec_neon_vu_theme", "neon_drift")).lower()
-        self._neon_vu_theme = _nvu if _nvu in ("neon_drift", "retro_tech", "custom_vu", "hud_reactor", "beat_saber", "neon_cascade", "rock_stage") else "neon_drift"
+        self._neon_vu_theme = _nvu if _nvu in ("neon_drift", "retro_tech", "custom_vu", "hud_reactor", "waveform", "beat_saber", "neon_cascade", "rock_stage") else "neon_drift"
 
         # ── Random playlist tree ──────────────────────────────────────────────
         _raw_tree = c.get("spec_random_tree")
@@ -1172,6 +1377,8 @@ class SpectrumController:
                 _bk_bp = {k: _old[k] for k in ("rotDeg","spreadRange","layers","jitter","auto_rot","auto_spread") if k in _old}
             self._spec_hallu_base_params[_kind] = {
                 **_bp_defaults[_kind], **((_bk_bp) if isinstance(_bk_bp, dict) else {})}
+        # ── Beat Auto-Calibration persisted state ────────────────────────────
+        self._bac_enabled = bool(c.get("bac_enabled", False))
         # ── Beat detection test values ────────────────────────────────────────
         _bt = c.get("beat_test", {})
         if isinstance(_bt, dict) and _bt:
@@ -1240,6 +1447,7 @@ class SpectrumController:
                 "spec_hallu_base_kind":            str(self._spec_hallu_base_kind),
                 "spec_mode_configs":               json.loads(json.dumps(self._spec_mode_configs)),
                 "aspect_lock":                     bool(self._aspect_lock),
+                "bac_enabled":                     bool(self._bac_enabled),
                 # ── Beat detection test (remove this section when tuning is done) ──
                 "beat_test": {
                     "min_vu":        round(_BEAT_MIN_VU,        3),
@@ -1925,6 +2133,51 @@ class SpectrumController:
                     try: _c.update()
                     except Exception: pass
 
+            # Beat scanner comet: scan_pos drives a mini comet across the P-row canvas.
+            _scan_x = self._beat_clock.scan_pos   # 0.0–1.0
+            _bright  = min(1.0, max(0.0, self._sa_smth_vu / 0.05 * 1.5))
+            _flash   = (_now_ind - self._bac_beat_flash_ts) < _BAC_BEAT_FLASH_S
+
+            for _trail, _canvas in zip(self._bsc_trail, self._bsc_canvases):
+                if not self._bac_enabled or _bright < 0.04:
+                    if _canvas.shapes:
+                        _canvas.shapes = []
+                        try: _canvas.update()
+                        except Exception: pass
+                    continue
+                _hx  = _scan_x * (_BSC_CANVAS_W - 1)
+                _trail.append(_hx)
+                _cy  = _BSC_CANVAS_H / 2.0
+                _pts = list(_trail)
+                _n   = len(_pts)
+                _shapes = []
+                for _i in range(1, _n):
+                    _t = (_i / _n) ** 1.5
+                    if _t < 0.05:
+                        continue
+                    _r = int(0x4f * _bright * _t)
+                    _g = int(0xc3 * _bright * _t)
+                    _b = int(0xf7 * _bright * _t)
+                    _shapes.append(cv.Line(
+                        x1=_pts[_i - 1], y1=_cy, x2=_pts[_i], y2=_cy,
+                        paint=ft.Paint(color=f"#{_r:02x}{_g:02x}{_b:02x}",
+                                       stroke_width=max(1.0, _t * 3.5))))
+                _r_head = int(0x4f * _bright)
+                _g_head = int(0xc3 * _bright)
+                _b_head = int(0xf7 * _bright)
+                _head_col = "#ff3333" if _flash else f"#{_r_head:02x}{_g_head:02x}{_b_head:02x}"
+                _shapes.append(cv.Circle(
+                    x=_hx, y=_cy, radius=_BSC_HEAD_R,
+                    paint=ft.Paint(color=_head_col,
+                                   style=ft.PaintingStyle.FILL)))
+                _canvas.shapes = _shapes
+                try: _canvas.update()
+                except Exception: pass
+
+            if self._bac_ui_dirty and (_now_ind - self._bac_ui_last_ts) >= _BAC_UI_UPDATE_INTERVAL:
+                self._bac_ui_last_ts = _now_ind
+                self._bac_update_ui()
+
             _now = time.monotonic()
             if self._spec_fps_track_ts > 0:
                 self._spec_fps_frame_count += 1
@@ -2334,15 +2587,26 @@ class SpectrumController:
         # Reset indicator refs so stale containers from prior open aren't updated
         self._sa_beat_ind_containers.clear()
         self._sa_excited_ind_containers.clear()
+        self._bsc_canvases.clear()
+        self._bsc_trail.clear()
+        self._bsc_conf_labels.clear()
 
         def _make_beat_indicators():
-            """Two small status dots: beat (orange) and excited (cyan)."""
+            """Beat (B), excited (E), and beat scanner (P) comet indicators."""
             _bt = ft.Container(width=10, height=10, border_radius=5, bgcolor="#2a2a2a",
                                tooltip="Beat detected")
             _ex = ft.Container(width=10, height=10, border_radius=5, bgcolor="#2a2a2a",
                                tooltip="Excited state")
             self._sa_beat_ind_containers.append(_bt)
             self._sa_excited_ind_containers.append(_ex)
+            # P scanner: mini comet track canvas
+            _trail  = collections.deque(maxlen=_BSC_TRAIL_LEN)
+            _canvas = cv.Canvas(shapes=[], width=_BSC_CANVAS_W, height=_BSC_CANVAS_H)
+            _conf_lbl = ft.Text("0%", size=9, color="grey500", width=28,
+                                text_align=ft.TextAlign.RIGHT)
+            self._bsc_trail.append(_trail)
+            self._bsc_canvases.append(_canvas)
+            self._bsc_conf_labels.append(_conf_lbl)
             return ft.Row([
                 ft.Column([_bt, ft.Text("B", size=7, color="grey600",
                                         text_align=ft.TextAlign.CENTER)],
@@ -2350,6 +2614,10 @@ class SpectrumController:
                 ft.Column([_ex, ft.Text("E", size=7, color="grey600",
                                         text_align=ft.TextAlign.CENTER)],
                           spacing=1, horizontal_alignment=ft.CrossAxisAlignment.CENTER),
+                ft.Column([_canvas, ft.Text("P", size=7, color="grey600",
+                                            text_align=ft.TextAlign.CENTER)],
+                          spacing=1, horizontal_alignment=ft.CrossAxisAlignment.CENTER),
+                _conf_lbl,
             ], spacing=6, vertical_alignment=ft.CrossAxisAlignment.CENTER)
 
         _sens_slider = _react_slider = None
@@ -2522,13 +2790,14 @@ class SpectrumController:
                 self._capture_per_mode_settings(_old_mode)
                 self._spec_mode = _mode if _mode in (
                     "classic", "vu", "cyber_city", "beat_saber", "neon_drift", "retro_tech",
-                    "custom_vu", "hud_reactor", "neon_cascade", "rock_stage", "hallucination") else "classic"
+                    "custom_vu", "hud_reactor", "waveform", "neon_cascade", "rock_stage", "hallucination") else "classic"
                 if self._spec_mode_random_enabled or self._spec_mode_random_on_song:
                     self._spec_mode_random_current = self._spec_mode
                 if   _mode == "neon_drift":   self._neon_vu_theme = "neon_drift"
                 elif _mode == "retro_tech":   self._neon_vu_theme = "retro_tech"
                 elif _mode == "custom_vu":    self._neon_vu_theme = "custom_vu"
                 elif _mode == "hud_reactor":  self._neon_vu_theme = "hud_reactor"
+                elif _mode == "waveform":     self._neon_vu_theme = "waveform"
                 elif _mode == "beat_saber":   self._neon_vu_theme = "beat_saber"
                 elif _mode == "neon_cascade": self._neon_vu_theme = "neon_cascade"
                 elif _mode == "rock_stage":   self._neon_vu_theme = "rock_stage"
@@ -2790,18 +3059,44 @@ class SpectrumController:
                 ft.Row([
                     ft.Text("Beat Detection", size=11, color="#ff9800", weight=ft.FontWeight.BOLD),
                     ft.TextButton("→ All", on_click=_on_copy_beat_to_all,
-                        style=ft.ButtonStyle(padding=ft.padding.symmetric(horizontal=6, vertical=0))),
+                        style=ft.ButtonStyle(padding=ft.Padding.symmetric(horizontal=6, vertical=0))),
                 ], spacing=0, vertical_alignment=ft.CrossAxisAlignment.CENTER),
             ]
             if _flash_cb:
                 _rows.append(_flash_cb)
+            # ── Auto BPM row ─────────────────────────────────────────────────
+            async def _on_bac_toggle(e):
+                self._bac_enabled = bool(e.control.value)
+                if not self._bac_enabled:
+                    self._bac_state = "SEARCHING"
+                    self._bac_bpm   = 0.0
+                    self._beat_clock    = _BeatClock()
+                    _bsc_sr = int(self._spec_sample_rate or 48000)
+                    self._beat_detector = _BeatDetector(
+                        self._beat_clock, sr=_bsc_sr,
+                        block_size=1024 if _bsc_sr >= 44100 else 512)
+                self._bac_ui_dirty = True
+                self._config_dirty = True; self._update_save_buttons()
+            self._bac_bpm_label   = ft.Text(
+                f"BPM: {self._bac_bpm:.1f}" if self._bac_bpm > 0 else "BPM: --",
+                size=11, color="#4fc3f7", width=70)
+            self._bac_state_label = ft.Text(
+                self._bac_state, size=10, color="grey500", italic=True)
+            _rows.append(ft.Row([
+                ft.Checkbox(label="Auto BPM", scale=0.85, value=self._bac_enabled,
+                            active_color="#ff9800", on_change=_on_bac_toggle),
+                self._bac_bpm_label,
+                self._bac_state_label,
+            ], spacing=6, vertical_alignment=ft.CrossAxisAlignment.CENTER))
+            self._bac_bs_slider = ft.Slider(min=0.2, max=5.0, value=_bs_i, divisions=48,
+                                             on_change=_on_bs, width=140)
+            self._bac_rf_slider = ft.Slider(min=0.05, max=2.0, value=_rf_i, divisions=39,
+                                             on_change=_on_rf, width=140)
             _rows += [
                 ft.Row([ft.Text("Beat Sens:",   size=11, color="grey400", width=100),
-                        ft.Slider(min=0.2, max=5.0, value=_bs_i, divisions=48,
-                                  on_change=_on_bs, width=140), _lbs], spacing=4),
+                        self._bac_bs_slider, _lbs], spacing=4),
                 ft.Row([ft.Text("Refractory:",  size=11, color="grey400", width=100),
-                        ft.Slider(min=0.05, max=2.0, value=_rf_i, divisions=39,
-                                  on_change=_on_rf, width=140), _lrf], spacing=4),
+                        self._bac_rf_slider, _lrf], spacing=4),
                 ft.Row([ft.Text("Min VU:",      size=11, color="grey400", width=100),
                         ft.Slider(min=0.0, max=1.0,  value=_vu_i, divisions=20,
                                   on_change=_on_vu, width=140), _lvu], spacing=4),
@@ -3877,11 +4172,12 @@ class SpectrumController:
             else:                        self._render_spectrum_idle_pulse()
             return
 
-        if _mode in ("neon_drift", "retro_tech", "custom_vu", "hud_reactor", "beat_saber", "neon_cascade", "rock_stage", "neon_vu"):
+        if _mode in ("neon_drift", "retro_tech", "custom_vu", "hud_reactor", "waveform", "beat_saber", "neon_cascade", "rock_stage", "neon_vu"):
             if   _mode == "neon_drift":   self._neon_vu_theme = "neon_drift";   _bg = self._spec_nvu_drift_bg
             elif _mode == "retro_tech":   self._neon_vu_theme = "retro_tech";   _bg = self._spec_nvu_retro_bg
             elif _mode == "custom_vu":    self._neon_vu_theme = "custom_vu";    _bg = self._spec_nvu_custom_bg
             elif _mode == "hud_reactor":  self._neon_vu_theme = "hud_reactor";  _bg = self._spec_nvu_hud_bg
+            elif _mode == "waveform":     self._neon_vu_theme = "waveform";     _bg = "BLANK"
             elif _mode == "beat_saber":   self._neon_vu_theme = "beat_saber";   _bg = self._spec_nvu_bs_bg
             elif _mode == "neon_cascade": self._neon_vu_theme = "neon_cascade"; _bg = self._spec_nvu_cascade_bg
             elif _mode == "rock_stage":   self._neon_vu_theme = "rock_stage";   _bg = self._spec_nvu_rock_bg
@@ -3906,6 +4202,7 @@ class SpectrumController:
                     except: pass
             self._set_spectrum_render_mode("neon_vu")
             if   self._neon_vu_theme == "hud_reactor":  self._render_spectrum_hud_reactor()
+            elif self._neon_vu_theme == "waveform":     self._render_spectrum_waveform()
             elif self._neon_vu_theme == "beat_saber":   self._render_spectrum_beatsaber()
             elif self._neon_vu_theme == "neon_cascade": self._render_spectrum_neon_cascade()
             elif self._neon_vu_theme == "rock_stage":   self._render_spectrum_rock_stage()
@@ -5109,6 +5406,41 @@ class SpectrumController:
         except Exception:
             pass
 
+    def _render_spectrum_waveform(self):
+        """Raw audio oscilloscope on the 300×62 neon_vu canvas."""
+        if cv is None or self._neon_vu_canvas is None:
+            return
+        _W, _H = 300.0, 62.0
+        _cy    = _H / 2.0
+        if self._beat_detector is None:
+            self._neon_vu_canvas.shapes = []
+            try: self._neon_vu_canvas.update()
+            except Exception: pass
+            return
+        samples = self._beat_detector.get_waveform(int(_W / 2))
+        self._status(f"Waveform mode: render {len(samples)} pts", "grey500", debug_only=True)
+        if len(samples) < 2:
+            return
+        _amp  = _cy - 4.0
+        _pts  = []
+        for _i, _s in enumerate(samples):
+            _x = _i * _W / len(samples)
+            _y = _cy + max(-_amp, min(_amp, float(_s) * _amp))
+            _pts.append((_x, _y))
+        _elems = [cv.Path.MoveTo(*_pts[0])]
+        for _px, _py in _pts[1:]:
+            _elems.append(cv.Path.LineTo(_px, _py))
+        shapes = [
+            cv.Path(elements=_elems,
+                    paint=ft.Paint(color="#4fc3f7", stroke_width=1.5,
+                                   style=ft.PaintingStyle.STROKE)),
+        ]
+        try:
+            self._neon_vu_canvas.shapes = shapes
+            self._neon_vu_canvas.update()
+        except Exception:
+            pass
+
     def _render_spectrum_hud_reactor(self):
         if cv is None or self._neon_vu_canvas is None: return
         _W, _H   = 300.0, 62.0
@@ -5679,6 +6011,36 @@ class SpectrumController:
 
     # ── Hallucination mode ────────────────────────────────────────────────────
 
+    def _bac_update_ui(self):
+        """Push current BAC state to UI widgets. Called on the event loop thread from _sync_render."""
+        _state  = self._bac_state
+        _bpm    = self._bac_bpm
+        _colors = {
+            "SEARCHING": "grey500",
+            "LOCKING":   "#ff9800",
+            "LOCKED":    "#4fc3f7",
+        }
+        _lbl = self._bac_bpm_label
+        if _lbl is not None:
+            _lbl.value = f"BPM: {_bpm:.1f}" if _bpm > 0 else "BPM: --"
+            try: _lbl.update()
+            except Exception: pass
+        _chip = self._bac_state_label
+        if _chip is not None:
+            _chip.value = _state
+            _chip.color = _colors.get(_state, "grey500")
+            try: _chip.update()
+            except Exception: pass
+        _conf_pct = int(round((self._beat_detector.confidence if self._beat_detector else 0.0) * 100))
+        _conf_col = _colors.get(_state, "grey500")
+        for _cl in self._bsc_conf_labels:
+            _cl.value = f"{_conf_pct}%"
+            _cl.color = _conf_col
+            try: _cl.update()
+            except Exception: pass
+        # Sliders always enabled — no auto-disable in PLL mode
+        self._bac_ui_dirty = False
+
     def _compute_audio_frame(self):
         """Called once per render frame. Writes shared audio values all modes can read."""
         self._sa_raw_bass = self._bar(0)
@@ -5711,6 +6073,24 @@ class SpectrumController:
             )
             if self._sa_beat_detected:
                 self._sa_beat_last_ts = _now_bt
+        # ── Beat Scanner: tick clock, flash on predicted beat ─────────────────
+        if self._bac_enabled and self._beat_detector is not None:
+            self._beat_clock.tick()
+            if self._beat_clock.beat_fired:
+                self._bac_beat_flash_ts = time.monotonic()
+            self._bac_bpm = self._beat_clock.bpm
+            _conf = self._beat_detector.confidence
+            _jit  = self._beat_clock.jitter
+            _prev_state = self._bac_state
+            if _conf > 0.6 and _jit < 0.08:
+                self._bac_state = "LOCKED"
+            elif _conf > 0.3 or _jit < 0.15:
+                self._bac_state = "LOCKING"
+            else:
+                self._bac_state = "SEARCHING"
+            if self._bac_state != _prev_state:
+                self._status(f"BeatScanner: state → {self._bac_state}", "grey500", debug_only=True)
+            self._bac_ui_dirty = True
         self._sa_prev_smth_bass = self._sa_smth_bass
 
         # ── Unified excited state: broad spectral activity across all bars ────
@@ -7563,6 +7943,8 @@ class SpectrumController:
                         _nc = min(len(_arr), _n)
                         _roll_mono[:_n - _nc] = _roll_mono[_nc:]
                         _roll_mono[_n - _nc:] = _arr[-_nc:]
+                        if self._beat_detector is not None:
+                            self._beat_detector.feed(_arr)
 
                         _vu_n = min(_n, len(_left), len(_right))
                         if _vu_n > 0:
@@ -7577,6 +7959,14 @@ class SpectrumController:
                         _vals = _np.log1p(_np.sqrt(_sums / _bin_sizes) * 30.0)
                         _nb   = max(1, int(_ab * _BEAT_SUB_BASS_FRAC))
                         self._sa_raw_bass_energy = float(_np.mean(_vals[:_nb]))
+                        _amps = _np.sqrt(_sums)  # linear amplitude, matches aubio specdiff
+                        _prev = self._sa_prev_spec_vals
+                        if _prev is not None and len(_prev) == len(_amps):
+                            self._sa_onset_flux = float(_np.sum(_np.maximum(0.0, _amps - _prev)))
+                        else:
+                            self._sa_onset_flux = 0.0
+                        self._sa_prev_spec_vals = _amps
+                        self._sa_onset_flux_gen += 1
 
                         _avg_arr = _np.asarray(self._spec_band_avg, dtype=float)
                         if _avg_arr.size != _vals.size:
@@ -7746,7 +8136,20 @@ class SpectrumApp:
         page.window.bgcolor   = "#0a0a0a"
         # ── Debug mode state (for standalone mode) ──
         _argv = sys.argv
-        self._debug_mode = "--debug-mode" in _argv
+        if "--debug-mode" in _argv:
+            self._debug_mode = True
+        else:
+            # Fall back to wledcc_cache.json debug_on_open so the user can
+            # flip the flag in WLEDCC.py settings without touching the CLI.
+            try:
+                _cache_path = os.path.join(
+                    os.environ.get("APPDATA", os.path.dirname(os.path.abspath(__file__))),
+                    "WLEDCC", "wledcc_cache.json")
+                with open(_cache_path, "r", encoding="utf-8") as _cf:
+                    _cc = json.load(_cf)
+                self._debug_mode = bool(_cc.get("debug_on_open", False))
+            except Exception:
+                self._debug_mode = False
 
         def _on_screen(x, y):
             """Return True if (x, y) is within the virtual desktop (handles multi-monitor)."""

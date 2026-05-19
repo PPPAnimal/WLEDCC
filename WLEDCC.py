@@ -472,7 +472,8 @@ class WLEDApp:
         # All threads enqueue here; the Flet timer (_start_log_flush_timer)
         # drains the queue in one page-safe batch update per flush interval.
         # This prevents WebSocket pipe saturation when many threads log simultaneously.
-        timestamp = datetime.now().strftime("%H:%M:%S")
+        _dt = datetime.now()
+        timestamp = _dt.strftime("%H:%M:%S") + f".{_dt.microsecond // 1000:03d}"
         # Always write to file immediately — debug flag never suppresses disk output.
         if self.save_logs_to_disk and self._log_fh:
             try:
