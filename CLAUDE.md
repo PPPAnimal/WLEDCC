@@ -83,7 +83,7 @@ Discovery uses mDNS (`zeroconf`) for `_http._tcp` services. Device state is cach
 
 Hallucination BASE LAYER keys: `waveform`, `circle`, `particles`, `bars`
 
-Per-mode config stored in `_spec_mode_configs`: flat key (e.g. `"classic"`) for non-hallu, three-level path `"hallucination/{submode}/{base}"` for hallu, computed by `_config_path_for()`. Active state tracked in `_spec_mode`, `_spec_hallu_submode`, `_spec_hallu_base_kind`. See memory `sa_config_saveload.md` for full save/load/dirty flag flow.
+Per-mode config stored in `_spec_mode_configs`: flat key (e.g. `"classic"`) for non-hallu, three-level path `"hallucination/{submode}/{base}"` for hallu, computed by `_config_path_for()`. Active state tracked in `_spec_mode`, `_spec_hallu_submode`, `_spec_hallu_base_kind`.
 
 **Hallucination state mutation — required pattern:**
 Any code that mutates `_spec_hallu_submode` or `_spec_hallu_base_kind` MUST use this exact sequence:
@@ -107,6 +107,20 @@ The flag blocks the render loop. Skipping it causes the wrong effect to render w
 - All exponential smoothing normalized by `_tscale = actual_block_duration * 24.0` (measured wall-clock, not target FPS) so slider feel is identical at any FPS
 - Fast modes (Classic, VU, Hallucination): 50–57fps. PIL modes (NeonCascade, RockStage, BeatSaber, HUDReactor): ~29fps ceiling due to 18–23ms render time
 - `_SA_MAX_FPS = 60` in constants block
+
+**SA Config Save/Load Flow:**
+`_do_mode_switch()` sequence: `_capture_per_mode_settings(old)` → swap state vars → `_apply_per_mode_settings(new)` → rebuild panel → `_config_dirty = True`. Dirty flag also set on any slider/dropdown/checkbox change; save button turns red. Unsaved changes persist in-session (can test across modes without committing); discarded on close without save. `save_config()` writes all `_spec_mode_configs` with timestamped backup. `load_config(preserve_mode=True)` re-reads disk, discards all in-memory changes.
+
+**Adding a New SA Mode — Checklist:**
+When adding any new type key to `_MODE_HIERARCHY`, update ALL FOUR locations in one edit pass or the mode silently falls back to classic spectrum:
+1. `_MODE_HIERARCHY` — add `{"key": "...", "label": "..."}` to the group's `submodes`
+2. Config-load allowlist (~line 1267) — `_spec_mode = _mode if _mode in (..., "YOUR_KEY", ...) else "classic"`
+3. UI mode-selection allowlist (~line 2826) — identical guard in the dropdown `on_change` handler
+4. `_neon_vu_theme` setter block (~line 2835) — `elif _mode == "YOUR_KEY": self._neon_vu_theme = "YOUR_KEY"`
+
+Then update `_render_spectrum()`: add key to the membership test, add the `_neon_vu_theme` assignment, add the dispatch `elif`. This bug has been hit 3 times (Waveform, Oscilloscope, XY Scope modes).
+
+**`log_unique` freeze trap (SA.py):** `log_unique` exists on `WLEDApp` only — NOT on `SpectrumController`. Calling `self.log_unique(...)` inside any `_render_spectrum_*` method throws `AttributeError` every frame; `_sync_render` catches it silently so no crash, but the canvas is never updated and the display appears permanently frozen. Use `self._status(msg, debug_only=True)` for SA-side logging.
 
 ### Flet Layout Rules
 - **Controls cannot live in two layout trees at once.** Only controls explicitly placed in both the wide and narrow master bar rows need `_wide` / `_narrow` paired instances — this is not a blanket rule for all controls. Each pair needs its own `ft.Text` / `ft.Icon` refs so updates reach whichever layout is visible. See `ledfx_btn_wide` / `ledfx_btn_narrow` (~line 3149) as the established pattern.

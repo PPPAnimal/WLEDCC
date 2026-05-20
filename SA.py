@@ -503,6 +503,8 @@ _SA_IDLE_H    = 760   # height for idle-effects panel   (SA + ~600px panel)
 _SA_NATIVE_W  = 300   # spectrum box native width  (scale reference)
 _SA_NATIVE_H  = 62    # spectrum box native height (scale reference)
 _SA_MAX_FPS      = 60    # sliding-window audio loop supports up to 60 fps
+_XY_SCOPE_SAMPLES  = 800    # one 60fps figure loop at 48 kHz (set to 1600 if SA captures at 96 kHz)
+_LR_WF_SAMPLES     = 300    # display points per channel for L/R waveform
 _IDLE_REF_FPS    = 30.0  # FPS at which idle-effect per-frame constants were tuned
 _HALLU_PARTICLE_HUE_RATE_MIN = 0.04  # raw hue drift at silence (cycles/sec) — apparent speed = rate × cycles
 _HALLU_PARTICLE_HUE_RATE_MAX = 01.21  # raw hue drift at peak VU
@@ -535,6 +537,8 @@ _ROT_MAX_HIT_PROB       = 0.30                        # on beat, chance of targe
 _ROT_BEAT_FLIP_PROB     = 0.70                        # on beat, chance of flipping direction vs pushing further in same direction
 _ROT_MORPH_SPEED_SCALE  = 15.0                        # deg/sec per unit of _sa_rot_current for morph global spin
 _BEAT_SUB_BASS_FRAC  = 0.05   # .1 fraction of FFT bands used as sub-bass tap (~20-80 Hz)
+
+_OSC_ZOOM_DEFAULT       = 0.35   # ~9ms window at 48kHz; shows mid-freq content well
 
 # ── Beat Scanner (BSC) constants ──────────────────────────────────────────────
 _BAC_BEAT_FLASH_S       = 0.08   # beat-confirmed flash duration (seconds)
@@ -572,13 +576,16 @@ class _BeatClock:
         self.phase      = new_phase % 1.0
         self._cum      += inc
 
-    def nudge(self):
-        """Pull phase toward nearest beat boundary on onset."""
+    def nudge(self, confidence=0.0):
+        """Pull phase toward nearest beat boundary on onset.
+        Scale by (1-confidence): at full lock the correction and jitter impact
+        are both near-zero so false onsets cannot disrupt a good lock."""
         err            = self.phase if self.phase < 0.5 else self.phase - 1.0
-        correction     = err * self._PLL_RATE
+        _scale         = max(0.05, 1.0 - confidence)
+        correction     = err * self._PLL_RATE * _scale
         self.phase    -= correction
         self._cum     -= correction
-        self.jitter    = 0.9 * self.jitter + 0.1 * abs(err)
+        self.jitter    = 0.9 * self.jitter + 0.1 * abs(err) * _scale
 
     def set_bpm(self, bpm):
         bpm         = max(self._BPM_MIN, min(self._BPM_MAX, bpm))
@@ -651,7 +658,7 @@ class _BeatDetector:
                 and odf > mean * 1.2
                 and now - self._last_onset > self._ONSET_COOLDOWN):
             self._last_onset = now
-            self._clock.nudge()   # called directly from audio thread, like original
+            self._clock.nudge(self.confidence)
 
         with self._lock:
             self._hist.append((now, odf))
@@ -685,6 +692,13 @@ class _BeatDetector:
             chunk = recent[i * step: i * step + step]
             result.append(sum(chunk) / len(chunk))
         return result
+
+    def get_raw_samples(self, n):
+        """Return last n raw samples from the audio buffer (no averaging)."""
+        buf = list(self._wave_buf)
+        if len(buf) < 2:
+            return [0.0] * n
+        return buf[-min(n, len(buf)):]
 
     def _reestimate(self):
         import numpy as np
@@ -769,6 +783,9 @@ _MODE_HIERARCHY = [
             {"key": "cyber_city",   "label": "Cyber City"},
             {"key": "hud_reactor",  "label": "HUD Reactor"},
             {"key": "waveform",     "label": "Waveform"},
+            {"key": "lr_waveform",  "label": "L/R Wave"},
+            {"key": "oscilloscope", "label": "Oscilloscope"},
+            {"key": "xy_scope",     "label": "XY Scope"},
         ],
     },
     {
@@ -943,6 +960,9 @@ class SpectrumController:
         self._spec_color_mode_per_mode = {"beat_saber": "random", "neon_cascade": "random", "rock_stage": "random", "hallucination": "random"}
         self._spec_display_hue      = 0.0          # 0-1 HSV hue of current render
         self._spec_capture_channels = 2
+        self._spec_raw_left         = collections.deque(maxlen=96000)  # 2 s at 48 kHz
+        self._spec_raw_right        = collections.deque(maxlen=96000)
+        self._xy_scope_swap         = False
         self._spec_sample_rate      = 48000
         self._spec_sampling_enabled = True
         self._spec_vu_gain          = 0.18
@@ -979,6 +999,9 @@ class SpectrumController:
         self._sa_beat_refractory_s = _BEAT_REFRACTORY_S
         self._sa_beat_flash_enabled = True   # white circle flash on beat hit
         self._beat_ind_lit_until      = 0.0   # hold beat indicator lit until this monotonic time
+        self._spec_osc_zoom        = _OSC_ZOOM_DEFAULT
+        self._spec_osc_zoom_slider = None
+        self._spec_osc_zoom_lbl    = None
         self._sa_beat_ind_containers  = []    # all beat-dot Container refs (updated in _sync_render)
         self._sa_excited_ind_containers = []  # all excited-dot Container refs
         # ── Beat Scanner (BSC) engine ─────────────────────────────────────────
@@ -989,8 +1012,8 @@ class SpectrumController:
         self._bac_prev_bar_ts   = 0.0
         self._bac_ui_dirty      = False
         self._bac_ui_last_ts    = 0.0
-        self._bac_bpm_label     = None   # ft.Text "BPM: 124.3"
-        self._bac_state_label   = None   # ft.Text state chip
+        self._bac_bpm_labels:   list = []  # ft.Text "BPM: 124.3" — one per _make_beat_params_col call
+        self._bac_state_labels: list = []  # ft.Text state chip — one per _make_beat_params_col call
         self._bac_bs_slider     = None
         self._bac_rf_slider     = None
         self._beat_clock        = _BeatClock()
@@ -1244,7 +1267,8 @@ class SpectrumController:
                 _mode = "classic"
             self._spec_mode = _mode if _mode in (
                 "classic", "vu", "cyber_city", "beat_saber", "neon_drift", "retro_tech",
-                "custom_vu", "hud_reactor", "waveform", "neon_cascade", "rock_stage", "hallucination") else "classic"
+                "custom_vu", "hud_reactor", "waveform", "oscilloscope", "xy_scope", "lr_waveform",
+                "neon_cascade", "rock_stage", "hallucination") else "classic"
 
         self._spec_nvu_drift_bg  = c.get("spec_nvu_drift_bg",  _NVU_BG_DEFAULTS["drift"])
         self._spec_nvu_retro_bg  = c.get("spec_nvu_retro_bg",  _NVU_BG_DEFAULTS["retro"])
@@ -1626,6 +1650,8 @@ class SpectrumController:
                 "params":      _sub_params,
                 "base_params": dict(self._spec_hallu_base_params.get(self._spec_hallu_base_kind, {})),
             }
+        elif mode == "oscilloscope":
+            _entry["extras"] = {"osc_zoom": float(self._spec_osc_zoom)}
         elif mode in self._spec_color_mode_per_mode:
             _entry["extras"] = {
                 "color_mode":        str(self._spec_color_mode_per_mode.get(mode, "gradient")),
@@ -1709,6 +1735,17 @@ class SpectrumController:
                 _sub, _hallu_sub_defaults.get(_sub, {}))
             _default_bs = 2.0 if _sub == "mirror" else 1.0
             _load_beat_params(_merged, _default_bs)
+        elif mode == "oscilloscope":
+            _e = _x
+            self._spec_osc_zoom = _c(_e.get("osc_zoom", _OSC_ZOOM_DEFAULT), 0.0, 1.0, _OSC_ZOOM_DEFAULT)
+            if self._spec_osc_zoom_slider is not None:
+                self._spec_osc_zoom_slider.value = self._spec_osc_zoom
+                try: self._spec_osc_zoom_slider.update()
+                except Exception: pass
+            if self._spec_osc_zoom_lbl is not None:
+                self._spec_osc_zoom_lbl.value = f"{self._spec_osc_zoom:.2f}"
+                try: self._spec_osc_zoom_lbl.update()
+                except Exception: pass
         elif mode in self._spec_color_mode_per_mode:
             _valid_cm = ("loop", "gradient", "loop_smoke", "gradient_smoke", "random")
             _cm = str(_x.get("color_mode", "gradient")).lower()
@@ -1860,13 +1897,21 @@ class SpectrumController:
             style=_btn_style,
             on_click=lambda _: self._cycle_spec_mode(1),
         )
+        self._xy_scope_swap_btn = ft.IconButton(
+            icon=ft.Icons.SWAP_HORIZ, icon_size=12,
+            icon_color="#39ff14",
+            tooltip="Swap L/R channels",
+            style=_btn_style,
+            visible=False,
+            on_click=self._toggle_xy_scope_swap,
+        )
         self._sync_spec_quick_buttons()
 
         # ── Button overlay (inside the display face, visible on hover) ────
         self._spec_btn_overlay = ft.Container(
             content=ft.Row([
                 ft.Row([self._spec_sampling_btn, self._spec_idle_quick_btn], spacing=0),
-                ft.Row([self._spec_prev_mode_btn, self._spec_next_mode_btn], spacing=0),
+                ft.Row([self._spec_prev_mode_btn, self._spec_next_mode_btn, self._xy_scope_swap_btn], spacing=0),
                 ft.Row([self._spec_combined_settings_btn, self._spec_detach_btn], spacing=0),
             ], alignment=ft.MainAxisAlignment.SPACE_BETWEEN),
             opacity=0,
@@ -2308,11 +2353,19 @@ class SpectrumController:
             else:
                 self._spec_idle_quick_btn.icon_color = _off
                 self._spec_idle_quick_btn.tooltip    = "Idle effects OFF"
+            _is_xy = self._spec_mode == "xy_scope"
+            self._xy_scope_swap_btn.visible    = _is_xy
+            self._xy_scope_swap_btn.icon_color = "#ffffff" if (self._xy_scope_swap and _is_xy) else "#39ff14"
             self._spec_sampling_btn.update()
             self._spec_idle_quick_btn.update()
             self._spec_combined_settings_btn.update()
+            self._xy_scope_swap_btn.update()
         except Exception:
             pass
+
+    async def _toggle_xy_scope_swap(self, _=None):
+        self._xy_scope_swap = not self._xy_scope_swap
+        self._sync_spec_quick_buttons()
 
     def _toggle_spec_sampling(self, _=None):
         self._spec_sampling_enabled = not self._spec_sampling_enabled
@@ -2590,6 +2643,8 @@ class SpectrumController:
         self._bsc_canvases.clear()
         self._bsc_trail.clear()
         self._bsc_conf_labels.clear()
+        self._bac_bpm_labels.clear()
+        self._bac_state_labels.clear()
 
         def _make_beat_indicators():
             """Beat (B), excited (E), and beat scanner (P) comet indicators."""
@@ -2790,7 +2845,8 @@ class SpectrumController:
                 self._capture_per_mode_settings(_old_mode)
                 self._spec_mode = _mode if _mode in (
                     "classic", "vu", "cyber_city", "beat_saber", "neon_drift", "retro_tech",
-                    "custom_vu", "hud_reactor", "waveform", "neon_cascade", "rock_stage", "hallucination") else "classic"
+                    "custom_vu", "hud_reactor", "waveform", "oscilloscope", "xy_scope", "lr_waveform",
+                    "neon_cascade", "rock_stage", "hallucination") else "classic"
                 if self._spec_mode_random_enabled or self._spec_mode_random_on_song:
                     self._spec_mode_random_current = self._spec_mode
                 if   _mode == "neon_drift":   self._neon_vu_theme = "neon_drift"
@@ -2798,6 +2854,9 @@ class SpectrumController:
                 elif _mode == "custom_vu":    self._neon_vu_theme = "custom_vu"
                 elif _mode == "hud_reactor":  self._neon_vu_theme = "hud_reactor"
                 elif _mode == "waveform":     self._neon_vu_theme = "waveform"
+                elif _mode == "oscilloscope": self._neon_vu_theme = "oscilloscope"
+                elif _mode == "xy_scope":     self._neon_vu_theme = "xy_scope"
+                elif _mode == "lr_waveform":  self._neon_vu_theme = "lr_waveform"
                 elif _mode == "beat_saber":   self._neon_vu_theme = "beat_saber"
                 elif _mode == "neon_cascade": self._neon_vu_theme = "neon_cascade"
                 elif _mode == "rock_stage":   self._neon_vu_theme = "rock_stage"
@@ -2812,6 +2871,7 @@ class SpectrumController:
                     self._spec_hallu_prev_frame = None
                     self._spec_hallu_aux = {}
                 self._config_dirty = True
+                self._sync_spec_quick_buttons()
                 _tab = _tabs.selected_index
                 _clear_panel_refs()
                 self._show_combined_settings(initial_tab=_tab)
@@ -3077,16 +3137,18 @@ class SpectrumController:
                         block_size=1024 if _bsc_sr >= 44100 else 512)
                 self._bac_ui_dirty = True
                 self._config_dirty = True; self._update_save_buttons()
-            self._bac_bpm_label   = ft.Text(
+            _bac_bpm_lbl   = ft.Text(
                 f"BPM: {self._bac_bpm:.1f}" if self._bac_bpm > 0 else "BPM: --",
                 size=11, color="#4fc3f7", width=70)
-            self._bac_state_label = ft.Text(
+            _bac_state_lbl = ft.Text(
                 self._bac_state, size=10, color="grey500", italic=True)
+            self._bac_bpm_labels.append(_bac_bpm_lbl)
+            self._bac_state_labels.append(_bac_state_lbl)
             _rows.append(ft.Row([
                 ft.Checkbox(label="Auto BPM", scale=0.85, value=self._bac_enabled,
                             active_color="#ff9800", on_change=_on_bac_toggle),
-                self._bac_bpm_label,
-                self._bac_state_label,
+                _bac_bpm_lbl,
+                _bac_state_lbl,
             ], spacing=6, vertical_alignment=ft.CrossAxisAlignment.CENTER))
             self._bac_bs_slider = ft.Slider(min=0.2, max=5.0, value=_bs_i, divisions=48,
                                              on_change=_on_bs, width=140)
@@ -3112,6 +3174,23 @@ class SpectrumController:
         _canvas_beat_params = _make_beat_params_col(
             self._spec_mode in ("beat_saber", "neon_cascade", "rock_stage"),
             show_flash_toggle=True)
+
+        def _make_osc_params_col(visible_cond):
+            _lbl = ft.Text(f"{self._spec_osc_zoom:.2f}", size=11, color="#4fc3f7", width=42)
+            def _on_zoom(e):
+                self._spec_osc_zoom = round(float(e.control.value), 2)
+                _lbl.value = f"{self._spec_osc_zoom:.2f}"; _lbl.update()
+                self._config_dirty = True; self._update_save_buttons()
+            self._spec_osc_zoom_lbl    = _lbl
+            self._spec_osc_zoom_slider = ft.Slider(min=0.0, max=1.0,
+                                                   value=self._spec_osc_zoom,
+                                                   divisions=40, on_change=_on_zoom, width=140)
+            return ft.Column([
+                ft.Row([ft.Text("Zoom:", size=11, color="grey400", width=100),
+                        self._spec_osc_zoom_slider, _lbl], spacing=4),
+            ], spacing=3, visible=visible_cond)
+
+        _osc_params = _make_osc_params_col(self._spec_mode == "oscilloscope")
 
         # ── Hallucination sub-mode dropdown ──────────────────────────────
         async def on_hallu_submode_change(e):
@@ -3625,6 +3704,7 @@ class SpectrumController:
                 _hallu_row,
                 _color_mode_col,
                 _canvas_beat_params,
+                _osc_params,
                 ft.Divider(height=1, color="grey800"),
                 ft.Row([_fps_txt,
                         ft.Slider(min=8, max=_SA_MAX_FPS, value=float(self._spec_target_fps),
@@ -4172,12 +4252,15 @@ class SpectrumController:
             else:                        self._render_spectrum_idle_pulse()
             return
 
-        if _mode in ("neon_drift", "retro_tech", "custom_vu", "hud_reactor", "waveform", "beat_saber", "neon_cascade", "rock_stage", "neon_vu"):
+        if _mode in ("neon_drift", "retro_tech", "custom_vu", "hud_reactor", "waveform", "oscilloscope", "xy_scope", "lr_waveform", "beat_saber", "neon_cascade", "rock_stage", "neon_vu"):
             if   _mode == "neon_drift":   self._neon_vu_theme = "neon_drift";   _bg = self._spec_nvu_drift_bg
             elif _mode == "retro_tech":   self._neon_vu_theme = "retro_tech";   _bg = self._spec_nvu_retro_bg
             elif _mode == "custom_vu":    self._neon_vu_theme = "custom_vu";    _bg = self._spec_nvu_custom_bg
             elif _mode == "hud_reactor":  self._neon_vu_theme = "hud_reactor";  _bg = self._spec_nvu_hud_bg
             elif _mode == "waveform":     self._neon_vu_theme = "waveform";     _bg = "BLANK"
+            elif _mode == "oscilloscope": self._neon_vu_theme = "oscilloscope"; _bg = "BLANK"
+            elif _mode == "xy_scope":     self._neon_vu_theme = "xy_scope";     _bg = "BLANK"
+            elif _mode == "lr_waveform":  self._neon_vu_theme = "lr_waveform";  _bg = "BLANK"
             elif _mode == "beat_saber":   self._neon_vu_theme = "beat_saber";   _bg = self._spec_nvu_bs_bg
             elif _mode == "neon_cascade": self._neon_vu_theme = "neon_cascade"; _bg = self._spec_nvu_cascade_bg
             elif _mode == "rock_stage":   self._neon_vu_theme = "rock_stage";   _bg = self._spec_nvu_rock_bg
@@ -4203,6 +4286,9 @@ class SpectrumController:
             self._set_spectrum_render_mode("neon_vu")
             if   self._neon_vu_theme == "hud_reactor":  self._render_spectrum_hud_reactor()
             elif self._neon_vu_theme == "waveform":     self._render_spectrum_waveform()
+            elif self._neon_vu_theme == "oscilloscope": self._render_spectrum_oscilloscope()
+            elif self._neon_vu_theme == "xy_scope":     self._render_spectrum_xy_scope()
+            elif self._neon_vu_theme == "lr_waveform":  self._render_spectrum_lr_waveform()
             elif self._neon_vu_theme == "beat_saber":   self._render_spectrum_beatsaber()
             elif self._neon_vu_theme == "neon_cascade": self._render_spectrum_neon_cascade()
             elif self._neon_vu_theme == "rock_stage":   self._render_spectrum_rock_stage()
@@ -5418,7 +5504,7 @@ class SpectrumController:
             except Exception: pass
             return
         samples = self._beat_detector.get_waveform(int(_W / 2))
-        self._status(f"Waveform mode: render {len(samples)} pts", "grey500", debug_only=True)
+
         if len(samples) < 2:
             return
         _amp  = _cy - 4.0
@@ -5435,6 +5521,177 @@ class SpectrumController:
                     paint=ft.Paint(color="#4fc3f7", stroke_width=1.5,
                                    style=ft.PaintingStyle.STROKE)),
         ]
+        try:
+            self._neon_vu_canvas.shapes = shapes
+            self._neon_vu_canvas.update()
+        except Exception:
+            pass
+
+    def _render_spectrum_oscilloscope(self):
+        """Triggered oscilloscope on the 300×62 neon_vu canvas.
+        Each frame locks to a positive-slope zero-crossing so the waveform
+        appears stationary. Zoom slider controls the time window (5–100ms)."""
+        if cv is None or self._neon_vu_canvas is None:
+            return
+        _W, _H = 300.0, 62.0
+        _cy    = _H / 2.0
+        if self._beat_detector is None:
+            self._neon_vu_canvas.shapes = []
+            try: self._neon_vu_canvas.update()
+            except Exception: pass
+            return
+        _sr       = int(self._spec_sample_rate or 48000)
+        _window_n = max(32, int(0.005 * (20.0 ** self._spec_osc_zoom) * _sr))
+        _margin   = _window_n // 4
+        _raw      = self._beat_detector.get_raw_samples(_window_n + _margin)
+        if len(_raw) < _window_n + 2:
+            return
+        # Normalize by peak so display always fills canvas
+        _peak = max(abs(s) for s in _raw) or 1.0
+        _norm = [s / _peak for s in _raw]
+        # Find first positive-slope zero-crossing in the leading margin
+        _trigger = 0
+        for _i in range(_margin - 1):
+            if _norm[_i] < 0 and _norm[_i + 1] >= 0:
+                _trigger = _i + 1
+                break
+        _win = _norm[_trigger: _trigger + _window_n]
+        if len(_win) < 2:
+            _win = _norm[:_window_n]
+        # Downsample to canvas width
+        _n_pts = int(_W)
+        _step  = max(1, len(_win) / _n_pts)
+        _pts   = []
+        for _i in range(_n_pts):
+            _idx = min(int(_i * _step), len(_win) - 1)
+            _x   = float(_i)
+            _y   = _cy + max(-(_cy - 4), min(_cy - 4, _win[_idx] * (_cy - 4)))
+            _pts.append((_x, _y))
+        _elems = [cv.Path.MoveTo(*_pts[0])]
+        for _px, _py in _pts[1:]:
+            _elems.append(cv.Path.LineTo(_px, _py))
+        shapes = [
+            cv.Line(x1=0, y1=_cy, x2=_W, y2=_cy,
+                    paint=ft.Paint(color="#1a2a3a", stroke_width=1.0)),
+            cv.Path(elements=_elems,
+                    paint=ft.Paint(color="#4fc3f7", stroke_width=1.5,
+                                   style=ft.PaintingStyle.STROKE)),
+        ]
+        try:
+            self._neon_vu_canvas.shapes = shapes
+            self._neon_vu_canvas.update()
+        except Exception:
+            pass
+
+    def _render_spectrum_xy_scope(self):
+        """Lissajous XY oscilloscope: right channel → X axis, left channel → Y axis.
+        Traces recent raw samples as a parametric curve, producing oscilloscope-music-
+        style vector figures when audio is routed from a stereo source."""
+        if cv is None or self._neon_vu_canvas is None:
+            return
+        _W, _H = 300.0, 62.0
+        _cx, _cy = _W / 2.0, _H / 2.0
+        _raw_l = list(self._spec_raw_left)
+        _raw_r = list(self._spec_raw_right)
+        _n = min(len(_raw_l), len(_raw_r), _XY_SCOPE_SAMPLES)
+        if _n < 2:
+            return
+        _left  = _raw_l[-_n:]
+        _right = _raw_r[-_n:]
+        if self._xy_scope_swap:
+            _left, _right = _right, _left
+        # Silence gate: clear canvas when signal drops below threshold.
+        _peak = max(max(abs(s) for s in _right), max(abs(s) for s in _left), 1e-9)
+        if _peak < 0.005:
+            try:
+                self._neon_vu_canvas.shapes = []
+                self._neon_vu_canvas.update()
+            except Exception:
+                pass
+            return
+        # Joint normalization: one shared scale for both axes so geometry is preserved.
+        # Constrained by Y (±28px) since it is the shorter dimension on the 300×62 canvas.
+        # Both axes use the same pixels-per-unit → circles look circular, squares square.
+        _x_scale = (_cy - 3.0) / _peak   # 28 / peak  (Y-constrained for both)
+        _y_scale = (_cy - 3.0) / _peak
+        # Build decimated point list: skip points closer than _MIN_STEP px to the
+        # previous kept point. Sub-pixel segments cause PIL to produce visible
+        # angular joins, making smooth curves look like low-poly shapes.
+        _MIN_STEP_SQ = 2.0   # 1px minimum step squared
+        _pts = []
+        _px_prev = _py_prev = None
+        for _sl, _sr in zip(_left, _right):
+            _x = _cx + _sr * _x_scale
+            _y = _cy - _sl * _y_scale
+            if _px_prev is None:
+                _pts.append((_x, _y)); _px_prev, _py_prev = _x, _y
+            else:
+                _dx, _dy = _x - _px_prev, _y - _py_prev
+                if _dx * _dx + _dy * _dy >= _MIN_STEP_SQ:
+                    _pts.append((_x, _y)); _px_prev, _py_prev = _x, _y
+        if len(_pts) < 2:
+            return
+        _elems = [cv.Path.MoveTo(*_pts[0])]
+        for _px, _py in _pts[1:]:
+            _elems.append(cv.Path.LineTo(_px, _py))
+        shapes = [
+            cv.Line(x1=_cx, y1=0,   x2=_cx, y2=_H,
+                    paint=ft.Paint(color="#112211", stroke_width=1.0)),
+            cv.Line(x1=0,   y1=_cy, x2=_W,  y2=_cy,
+                    paint=ft.Paint(color="#112211", stroke_width=1.0)),
+            cv.Path(elements=_elems,
+                    paint=ft.Paint(color="#39ff14", stroke_width=1.0,
+                                   style=ft.PaintingStyle.STROKE)),
+        ]
+        try:
+            self._neon_vu_canvas.shapes = shapes
+            self._neon_vu_canvas.update()
+        except Exception:
+            pass
+
+    def _render_spectrum_lr_waveform(self):
+        """Split waveform: left channel on top half, right channel on bottom half."""
+        if cv is None or self._neon_vu_canvas is None:
+            return
+        _W, _H = 300.0, 62.0
+        _cy_top = _H / 4.0        # 15.5 — centre of top half
+        _cy_bot = 3.0 * _H / 4.0  # 46.5 — centre of bottom half
+        _amp    = _cy_top - 3.0   # max pixel excursion per half
+        _n_pts  = int(_W)
+        _raw_l = list(self._spec_raw_left)
+        _raw_r = list(self._spec_raw_right)
+
+        def _build_path(raw, cy):
+            _src_n = min(len(raw), _LR_WF_SAMPLES)
+            if _src_n < 2:
+                return []
+            _src = raw[-_src_n:]
+            _step = max(1, _src_n / _n_pts)
+            _pts = []
+            for _i in range(_n_pts):
+                _idx = min(int(_i * _step), _src_n - 1)
+                _x = float(_i)
+                _y = cy + max(-_amp, min(_amp, float(_src[_idx]) * _amp))
+                _pts.append((_x, _y))
+            _elems = [cv.Path.MoveTo(*_pts[0])]
+            for _px, _py in _pts[1:]:
+                _elems.append(cv.Path.LineTo(_px, _py))
+            return _elems
+
+        _elems_l = _build_path(_raw_l, _cy_top)
+        _elems_r = _build_path(_raw_r, _cy_bot)
+        shapes = [
+            cv.Line(x1=0, y1=_H / 2.0, x2=_W, y2=_H / 2.0,
+                    paint=ft.Paint(color="#2a2a2a", stroke_width=1.0)),
+        ]
+        if _elems_l:
+            shapes.append(cv.Path(elements=_elems_l,
+                                  paint=ft.Paint(color="#4fc3f7", stroke_width=1.5,
+                                                 style=ft.PaintingStyle.STROKE)))
+        if _elems_r:
+            shapes.append(cv.Path(elements=_elems_r,
+                                  paint=ft.Paint(color="#ff6e6e", stroke_width=1.5,
+                                                 style=ft.PaintingStyle.STROKE)))
         try:
             self._neon_vu_canvas.shapes = shapes
             self._neon_vu_canvas.update()
@@ -6020,13 +6277,11 @@ class SpectrumController:
             "LOCKING":   "#ff9800",
             "LOCKED":    "#4fc3f7",
         }
-        _lbl = self._bac_bpm_label
-        if _lbl is not None:
+        for _lbl in self._bac_bpm_labels:
             _lbl.value = f"BPM: {_bpm:.1f}" if _bpm > 0 else "BPM: --"
             try: _lbl.update()
             except Exception: pass
-        _chip = self._bac_state_label
-        if _chip is not None:
+        for _chip in self._bac_state_labels:
             _chip.value = _state
             _chip.color = _colors.get(_state, "grey500")
             try: _chip.update()
@@ -6088,8 +6343,6 @@ class SpectrumController:
                 self._bac_state = "LOCKING"
             else:
                 self._bac_state = "SEARCHING"
-            if self._bac_state != _prev_state:
-                self._status(f"BeatScanner: state → {self._bac_state}", "grey500", debug_only=True)
             self._bac_ui_dirty = True
         self._sa_prev_smth_bass = self._sa_smth_bass
 
@@ -7938,6 +8191,9 @@ class SpectrumController:
                         else:
                             _arr = _raw.reshape(-1)
                             _left = _right = _arr
+
+                        self._spec_raw_left.extend(_left.tolist())
+                        self._spec_raw_right.extend(_right.tolist())
 
                         # slide rolling window forward with the new mono samples
                         _nc = min(len(_arr), _n)
