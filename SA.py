@@ -7202,6 +7202,24 @@ class SpectrumController:
         kind    = self._spec_hallu_base_kind
         base_img = self._draw_hallu_base(W, H, bass, mid, treble)
 
+        # ── Shared line-drawing constants — edit here to affect all 4 render paths ──
+        _CHROMA_FILLS  = (35, 100, 210)   # glow outer → core brightness
+        _CHROMA_WIDTHS = (6,  4,  2)      # glow outer → core width
+
+        def _chroma_mask(pts, joint=None):
+            """Draw pts as a glow line; return float32 L-array (0–255)."""
+            _ch  = _PILImage.new("L", (W, H), 0)
+            _dch = _PILDraw.Draw(_ch)
+            _kw  = {"joint": joint} if joint is not None else {}
+            for _f, _w in zip(_CHROMA_FILLS, _CHROMA_WIDTHS):
+                _dch.line(pts, fill=_f, width=_w, **_kw)
+            return np.array(_ch, dtype=np.float32)
+
+        # Frequency → line assignment (same for all 4 paths)
+        # r_pts/g_pts/b_pts are defined per-kind block below
+        _CHROMA_HUE_OFFSETS = (0.0, 1/3, 2/3)
+        _CHROMA_FREQS       = (bass, treble, mid)   # R=bass, G=treble, B=mid
+
         if kind == "waveform":
             _dt_c     = min(0.1, _dt if _dt is not None else 1.0 / 30.0)
             max_split = float(p.get("maxSplit", 14))
@@ -7244,26 +7262,16 @@ class SpectrumController:
                     pts.append((x, y))
                 return pts
 
-            r_pts = _wave_pts( off, -offY)
+            r_pts = _wave_pts(-off,  offY)
             g_pts = _wave_pts(   0,     0)
-            b_pts = _wave_pts(-off,  offY)
+            b_pts = _wave_pts( off, -offY)
 
             _cm = self._tick_random_cm("hallucination", beat)
 
             if _cm == "gradient":
-                # Pure R/G/B channels drawn separately → additive mixing at overlaps.
-                def _draw_ch_rgb(pts):
-                    ch  = _PILImage.new("L", (W, H), 0)
-                    dch = _PILDraw.Draw(ch)
-                    dch.line(pts, fill=35,  width=6, joint="curve")
-                    dch.line(pts, fill=100, width=6, joint="curve")
-                    dch.line(pts, fill=210, width=6)
-                    return np.array(ch, dtype=np.float32)
-
                 out = np.zeros((H, W, 4), dtype=np.float32)
-                out[..., 0] = _draw_ch_rgb(r_pts)
-                out[..., 1] = _draw_ch_rgb(g_pts)
-                out[..., 2] = _draw_ch_rgb(b_pts)
+                for _ch_idx, (pts, fv) in enumerate(zip([r_pts, g_pts, b_pts], _CHROMA_FREQS)):
+                    out[..., _ch_idx] = _chroma_mask(pts, joint="curve") * fv
                 out[..., 3] = 255
 
             else:  # "loop" — beat-driven hue; three lines at hue, hue+⅓, hue+⅔
@@ -7282,16 +7290,13 @@ class SpectrumController:
                 aux["_chroma_hue_t"] = min(1.0, aux["_chroma_hue_t"] + _dt_c / 0.55)
                 h = self._lerp_h(aux["_chroma_hue_from"], aux["_chroma_hue_to"],
                                  self._ease(aux["_chroma_hue_t"]))
-                canvas = _PILImage.new("RGBA", (W, H), (0, 0, 0, 255))
-                d      = _PILDraw.Draw(canvas, "RGBA")
-                for pts, hue_off in [(r_pts, 0.0), (g_pts, 1/3), (b_pts, 2/3)]:
-                    hue = (h + hue_off) % 1.0
-                    rc, gc, bc = colorsys.hsv_to_rgb(hue, 1.0, 1.0)
-                    col = (int(rc*255), int(gc*255), int(bc*255))
-                    d.line(pts, fill=(*col, 20),  width=5, joint="curve")
-                    d.line(pts, fill=(*col, 65),  width=3, joint="curve")
-                    d.line(pts, fill=(*col, 185), width=1)
-                out = np.array(canvas, dtype=np.float32)
+                out = np.zeros((H, W, 4), dtype=np.float32)
+                for pts, hue_off, fv in zip([r_pts, g_pts, b_pts], _CHROMA_HUE_OFFSETS, _CHROMA_FREQS):
+                    rc, gc, bc = colorsys.hsv_to_rgb((h + hue_off) % 1.0, 1.0, 1.0)
+                    mask = _chroma_mask(pts, joint="curve") * fv
+                    out[..., 0] = np.clip(out[..., 0] + rc * mask, 0, 255)
+                    out[..., 1] = np.clip(out[..., 1] + gc * mask, 0, 255)
+                    out[..., 2] = np.clip(out[..., 2] + bc * mask, 0, 255)
                 out[..., 3] = 255
 
         elif kind == "circle":
@@ -7369,25 +7374,16 @@ class SpectrumController:
                     pts.append((int(cx_c + r * math.cos(ang)), int(cy_c + r * math.sin(ang))))
                 return pts + [pts[0]]
 
-            r_pts = _circle_pts( _rdx,  _rdy)
+            r_pts = _circle_pts(-_rdx, -_rdy)
             g_pts = _circle_pts(    0,     0)
-            b_pts = _circle_pts(-_rdx, -_rdy)
+            b_pts = _circle_pts( _rdx,  _rdy)
 
             _cm = self._tick_random_cm("hallucination", beat)
 
             if _cm == "gradient":
-                def _draw_ch_rgb_circle(pts):
-                    ch  = _PILImage.new("L", (W, H), 0)
-                    dch = _PILDraw.Draw(ch)
-                    dch.line(pts, fill=35,  width=6)
-                    dch.line(pts, fill=100, width=4)
-                    dch.line(pts, fill=210, width=2)
-                    return np.array(ch, dtype=np.float32)
-
                 out = np.zeros((H, W, 4), dtype=np.float32)
-                out[..., 0] = _draw_ch_rgb_circle(r_pts)
-                out[..., 1] = _draw_ch_rgb_circle(g_pts)
-                out[..., 2] = _draw_ch_rgb_circle(b_pts)
+                for _ch_idx, (pts, fv) in enumerate(zip([r_pts, g_pts, b_pts], _CHROMA_FREQS)):
+                    out[..., _ch_idx] = _chroma_mask(pts) * fv
                 out[..., 3] = 255
 
             else:  # loop — beat-driven hue; three circles at hue, hue+⅓, hue+⅔
@@ -7406,16 +7402,13 @@ class SpectrumController:
                 aux["_chroma_hue_t"] = min(1.0, aux["_chroma_hue_t"] + _dt_c / 0.55)
                 h = self._lerp_h(aux["_chroma_hue_from"], aux["_chroma_hue_to"],
                                  self._ease(aux["_chroma_hue_t"]))
-                canvas = _PILImage.new("RGBA", (W, H), (0, 0, 0, 255))
-                d      = _PILDraw.Draw(canvas, "RGBA")
-                for pts, hue_off in [(r_pts, 0.0), (g_pts, 1/3), (b_pts, 2/3)]:
-                    hue = (h + hue_off) % 1.0
-                    rc, gc, bc = colorsys.hsv_to_rgb(hue, 1.0, 1.0)
-                    col = (int(rc*255), int(gc*255), int(bc*255))
-                    d.line(pts, fill=(*col, 20),  width=5)
-                    d.line(pts, fill=(*col, 65),  width=3)
-                    d.line(pts, fill=(*col, 185), width=1)
-                out = np.array(canvas, dtype=np.float32)
+                out = np.zeros((H, W, 4), dtype=np.float32)
+                for pts, hue_off, fv in zip([r_pts, g_pts, b_pts], _CHROMA_HUE_OFFSETS, _CHROMA_FREQS):
+                    rc, gc, bc = colorsys.hsv_to_rgb((h + hue_off) % 1.0, 1.0, 1.0)
+                    mask = _chroma_mask(pts) * fv
+                    out[..., 0] = np.clip(out[..., 0] + rc * mask, 0, 255)
+                    out[..., 1] = np.clip(out[..., 1] + gc * mask, 0, 255)
+                    out[..., 2] = np.clip(out[..., 2] + bc * mask, 0, 255)
                 out[..., 3] = 255
 
         else:
