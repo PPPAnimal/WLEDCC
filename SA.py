@@ -6582,26 +6582,61 @@ class SpectrumController:
                 parts.append([cx, cy,
                             math.cos(ang) * spd, math.sin(ang) * spd,
                             random.randint(40, 90)])
-            energy = bass + mid * 0.5
             _alpha = 130 if mirror_mode else 200
+
+            # Beat burst: detect rising edge, scatter particles for an explosive pop
+            _beat_now  = self._sa_beat_detected
+            _beat_edge = _beat_now and not aux.get("_bp_was_beat", False)
+            aux["_bp_was_beat"] = _beat_now
+            _now_bp    = time.monotonic()
+            _dt_bp     = min(0.1, _now_bp - aux.get("_bp_ts", _now_bp))
+            aux["_bp_ts"] = _now_bp
+            _burst_mul = aux.get("_bp_burst_mul", 1.0)
+            if _beat_edge:
+                _burst_mul = 2.5 + bass * 2.0
+            _burst_mul = max(1.0, _burst_mul * math.exp(-6.0 * _dt_bp))
+            aux["_bp_burst_mul"] = _burst_mul
+
+            # Smoothed energy level: fast attack (~100ms), slow decay (~500ms)
+            # Gives sustained feel that tracks overall intensity, not just transients.
+            _energy_raw = min(1.0, bass * 1.2 + mid * 0.5 + treble * 0.3)
+            _bp_energy  = aux.get("_bp_energy", _energy_raw)
+            _att        = 1.0 - math.exp(-10.0 * _dt_bp)
+            _dec        = 1.0 - math.exp(-2.0  * _dt_bp)
+            _bp_energy += (_energy_raw - _bp_energy) * (_att if _energy_raw > _bp_energy else _dec)
+            aux["_bp_energy"] = _bp_energy
+
+            # Wide-range visual parameters driven by sustained energy (not raw transients).
+            # _sa_excited_score sets the speed ceiling so calm songs stay calm even
+            # when loud; intense songs unlock higher max speeds.
+            _max_spd    = 0.12 + self._sa_excited_score * 0.88   # ceiling: 0.12 (calm) → 1.0 (intense)
+            _drift_rate = _bp_energy * 0.04                       # 0 (linger) → 0.04/frame
+            _spd_scale  = 0.06 + _bp_energy * (_max_spd - 0.06)  # scales within [0.06, _max_spd]
+            _brightness = 0.08 + _bp_energy * 0.92               # 0.08 (near-dark) → 1.0 (full bright)
+            _dot_alpha  = int(_alpha * (0.35 + _bp_energy * 0.65))
+
             new_p = []
             for pt in parts:
                 px, py, vx, vy, life = pt
-                vx *= (1.0 + energy * 0.06)
-                vy *= (1.0 + energy * 0.06)
-                px += vx * (1 + bass * 1.5)
-                py += vy * (1 + bass * 1.5)
+                vx *= (1.0 + _drift_rate)
+                vy *= (1.0 + _drift_rate)
+                px += vx * _spd_scale * (1 + bass * 0.4)
+                py += vy * _spd_scale * (1 + bass * 0.4)
                 life -= 1
-                if life <= 0 or px < -2 or px > W + 2 or py < -2 or py > H + 2:
-                    ang = random.uniform(0, 2 * math.pi)
-                    spd = 0.4 + random.random() * 0.6 + bass * 0.4
+                if (life <= 0 or px < -2 or px > W + 2 or py < -2 or py > H + 2
+                        or (_beat_edge and random.random() < 0.28)):
+                    ang  = random.uniform(0, 2 * math.pi)
+                    spd  = ((1.5 + random.random() * 2.0) if _beat_edge
+                            else (0.4 + random.random() * 0.6 + bass * 0.4))
                     px, py = cx, cy
                     vx, vy = math.cos(ang) * spd, math.sin(ang) * spd
-                    life = random.randint(40, 90)
+                    life   = (random.randint(20, 55) if _beat_edge
+                              else random.randint(40, 90))
                 new_p.append([px, py, vx, vy, life])
-                r_px = max(1, int(1 + bass * 2 + treble * 1.5))
-                _ph = (h_val + math.atan2(py - cy, px - cx) / (2 * math.pi)) % 1.0
-                col = _col(_ph, 1.0, 0.6 + peak_alpha_helper(bass, mid, treble), _alpha)
+                r_px = max(1, int((0.5 + _bp_energy * 1.5 + bass * 1.5 + treble * 0.8) * min(_burst_mul, 2.5)))
+                _ph  = (h_val + math.atan2(py - cy, px - cx) / (2 * math.pi)) % 1.0
+                _brt = min(1.0, _brightness + peak_alpha_helper(bass, mid, treble))
+                col  = _col(_ph, 1.0, _brt, _dot_alpha)
                 draw.ellipse([px - r_px, py - r_px, px + r_px, py + r_px], fill=col)
             aux["bp"] = new_p
 
@@ -7220,20 +7255,27 @@ class SpectrumController:
         _CHROMA_HUE_OFFSETS = (0.0, 1/3, 2/3)
         _CHROMA_FREQS       = (bass, treble, mid)   # R=bass, G=treble, B=mid
 
+        # ── Shared preamble: one place to tune waveform, circle, and particles ───────────────
+        _dt_c      = min(0.1, _dt if _dt is not None else 1.0 / 30.0)
+        aux        = self._spec_hallu_aux
+        max_split  = float(p.get("maxSplit", 14))
+        # Beat burst — same magnitude for all three (circle baseline: 0.7)
+        beat_split = aux.get("_chroma_beat_split", 0.0)
+        if beat:
+            beat_split = max_split * 0.7
+        beat_split *= math.exp(-8.0 * _dt_c)
+        aux["_chroma_beat_split"] = beat_split
+        # Separation offset — circle formula; maxSplit slider is the sole range control
+        _off_base  = 4.0 + (bass * 2.0 + treble * 0.4) * max_split + beat_split
+        _offY_base = (mid - 0.5) * max_split * 0.4
+        # Per-channel brightness — circle baseline: raw frequency, zero floor, cap 1.0
+        _CHROMA_FREQS_CH = tuple(min(1.0, fv) for fv in _CHROMA_FREQS)  # R=bass, G=treble, B=mid
+        _f_r, _f_g, _f_b = _CHROMA_FREQS_CH
+        # ─────────────────────────────────────────────────────────────────────────────────────
+
         if kind == "waveform":
-            _dt_c     = min(0.1, _dt if _dt is not None else 1.0 / 30.0)
-            max_split = float(p.get("maxSplit", 14))
-            aux       = self._spec_hallu_aux
-
-            # Beat burst: inflates split for ~125 ms then decays
-            beat_split = aux.get("_chroma_beat_split", 0.0)
-            if beat:
-                beat_split = max_split * 0.7
-            beat_split *= math.exp(-8.0 * _dt_c)
-            aux["_chroma_beat_split"] = beat_split
-
-            off  = int(4 + (bass * 2 + treble * 0.4) * max_split + beat_split)
-            offY = int((mid - 0.5) * max_split * 0.4)
+            off  = int(_off_base)
+            offY = int(_offY_base)
 
             # Slider (0–2) sets how much excitement multiplies wave speed.
             # auto_speed off → constant 1×; on → 1× + excited × slider.
@@ -7270,7 +7312,7 @@ class SpectrumController:
 
             if _cm == "gradient":
                 out = np.zeros((H, W, 4), dtype=np.float32)
-                for _ch_idx, (pts, fv) in enumerate(zip([r_pts, g_pts, b_pts], _CHROMA_FREQS)):
+                for _ch_idx, (pts, fv) in enumerate(zip([r_pts, g_pts, b_pts], _CHROMA_FREQS_CH)):
                     out[..., _ch_idx] = _chroma_mask(pts, joint="curve") * fv
                 out[..., 3] = 255
 
@@ -7291,7 +7333,7 @@ class SpectrumController:
                 h = self._lerp_h(aux["_chroma_hue_from"], aux["_chroma_hue_to"],
                                  self._ease(aux["_chroma_hue_t"]))
                 out = np.zeros((H, W, 4), dtype=np.float32)
-                for pts, hue_off, fv in zip([r_pts, g_pts, b_pts], _CHROMA_HUE_OFFSETS, _CHROMA_FREQS):
+                for pts, hue_off, fv in zip([r_pts, g_pts, b_pts], _CHROMA_HUE_OFFSETS, _CHROMA_FREQS_CH):
                     rc, gc, bc = colorsys.hsv_to_rgb((h + hue_off) % 1.0, 1.0, 1.0)
                     mask = _chroma_mask(pts, joint="curve") * fv
                     out[..., 0] = np.clip(out[..., 0] + rc * mask, 0, 255)
@@ -7300,18 +7342,8 @@ class SpectrumController:
                 out[..., 3] = 255
 
         elif kind == "circle":
-            _dt_c     = min(0.1, _dt if _dt is not None else 1.0 / 30.0)
-            max_split = float(p.get("maxSplit", 14))
-            aux       = self._spec_hallu_aux
-
-            beat_split = aux.get("_chroma_beat_split", 0.0)
-            if beat:
-                beat_split = max_split * 0.7
-            beat_split *= math.exp(-8.0 * _dt_c)
-            aux["_chroma_beat_split"] = beat_split
-
-            off  = int(4 + (bass * 2 + treble * 0.4) * max_split + beat_split)
-            offY = int((mid - 0.5) * max_split * 0.4)
+            off  = int(_off_base)
+            offY = int(_offY_base)
 
             _excited_mult = float(p.get("speed", 1.0))
             _auto         = bool(p.get("auto_speed", True))
@@ -7382,7 +7414,7 @@ class SpectrumController:
 
             if _cm == "gradient":
                 out = np.zeros((H, W, 4), dtype=np.float32)
-                for _ch_idx, (pts, fv) in enumerate(zip([r_pts, g_pts, b_pts], _CHROMA_FREQS)):
+                for _ch_idx, (pts, fv) in enumerate(zip([r_pts, g_pts, b_pts], _CHROMA_FREQS_CH)):
                     out[..., _ch_idx] = _chroma_mask(pts) * fv
                 out[..., 3] = 255
 
@@ -7403,13 +7435,65 @@ class SpectrumController:
                 h = self._lerp_h(aux["_chroma_hue_from"], aux["_chroma_hue_to"],
                                  self._ease(aux["_chroma_hue_t"]))
                 out = np.zeros((H, W, 4), dtype=np.float32)
-                for pts, hue_off, fv in zip([r_pts, g_pts, b_pts], _CHROMA_HUE_OFFSETS, _CHROMA_FREQS):
+                for pts, hue_off, fv in zip([r_pts, g_pts, b_pts], _CHROMA_HUE_OFFSETS, _CHROMA_FREQS_CH):
                     rc, gc, bc = colorsys.hsv_to_rgb((h + hue_off) % 1.0, 1.0, 1.0)
                     mask = _chroma_mask(pts) * fv
                     out[..., 0] = np.clip(out[..., 0] + rc * mask, 0, 255)
                     out[..., 1] = np.clip(out[..., 1] + gc * mask, 0, 255)
                     out[..., 2] = np.clip(out[..., 2] + bc * mask, 0, 255)
                 out[..., 3] = 255
+
+        elif kind == "particles":
+            # Offset from shared preamble (circle formula) + treble micro-jitter
+            off_mag  = int(_off_base) + int(random.uniform(-1, 1) * treble * max_split * 0.12)
+            off_mag  = max(0, off_mag)
+
+            # Rotating aberration axis: drifts with excitement, snaps to 45° on beat
+            _excited_mult = float(p.get("speed", 1.0))
+            _auto         = bool(p.get("auto_speed", True))
+            _rot_speed    = ((0.25 + self._sa_excited_score * _excited_mult) if _auto
+                             else _excited_mult * 0.25) * _dt_c
+            _p_angle      = aux.get("_chroma_p_angle", 0.0)
+            if beat:
+                _snap    = random.choice([0, 1, 2, 3, 4, 5, 6, 7]) * math.pi / 4
+                _p_angle = _p_angle * 0.35 + _snap * 0.65
+            _p_angle = (_p_angle + _rot_speed) % (2 * math.pi)
+            aux["_chroma_p_angle"] = _p_angle
+
+            _rdx_r = int(off_mag * math.cos(_p_angle))
+            _rdy_r = int(off_mag * math.sin(_p_angle))
+            _rdx_g = int(off_mag * math.cos(_p_angle + 2 * math.pi / 3))
+            _rdy_g = int(off_mag * math.sin(_p_angle + 2 * math.pi / 3))
+            _rdx_b = int(off_mag * math.cos(_p_angle + 4 * math.pi / 3))
+            _rdy_b = int(off_mag * math.sin(_p_angle + 4 * math.pi / 3))
+
+            base = np.array(base_img, dtype=np.float32)
+
+            # Beat scale-pop: zoom base outward on kick for a punch feel
+            _zoom_pop = aux.get("_chroma_zoom_pop", 0.0)
+            if beat:
+                _zoom_pop = 0.04 + bass * 0.10
+            _zoom_pop *= math.exp(-14.0 * _dt_c)
+            aux["_chroma_zoom_pop"] = _zoom_pop
+            if _zoom_pop > 0.003:
+                _bi  = getattr(_PILImage, "Resampling", _PILImage).BILINEAR
+                _zf  = 1.0 + _zoom_pop
+                _nw, _nh = int(W * _zf), int(H * _zf)
+                _ox, _oy = (_nw - W) // 2, (_nh - H) // 2
+                _tmp = _PILImage.fromarray(np.clip(base, 0, 255).astype(np.uint8))
+                _tmp = _tmp.resize((_nw, _nh), _bi).crop((_ox, _oy, _ox + W, _oy + H))
+                base = np.array(_tmp, dtype=np.float32)
+
+            # Per-channel brightness tracks its mapped frequency band in both color modes
+            # (R=bass, G=mid, B=treble) — same pattern as waveform/circle chroma paths.
+            # gradient/loop distinction is already handled by hue-cycle speed in _draw_hallu_base.
+            self._tick_random_cm("hallucination", beat)  # advance state machine
+            # _f_r, _f_g, _f_b from shared preamble (R=bass, G=treble, B=mid, zero floor)
+            out = np.zeros_like(base)
+            out[..., 0] = np.roll(base[..., 0], (_rdy_r, _rdx_r), axis=(0, 1)) * _f_r
+            out[..., 1] = np.roll(base[..., 1], (_rdy_g, _rdx_g), axis=(0, 1)) * _f_g
+            out[..., 2] = np.roll(base[..., 2], (_rdy_b, _rdx_b), axis=(0, 1)) * _f_b
+            out[..., 3] = 255
 
         else:
             base = np.array(base_img, dtype=np.float32)
