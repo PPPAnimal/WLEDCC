@@ -510,6 +510,10 @@ _HALLU_PARTICLE_HUE_RATE_MIN = 0.04  # raw hue drift at silence (cycles/sec) —
 _HALLU_PARTICLE_HUE_RATE_MAX = 01.21  # raw hue drift at peak VU
 _HALLU_PARTICLE_HUE_CYCLES   = 4     # rainbow cycles packed into the visible trail; more = thinner bands, all colors visible at lower drift rate
 _HALLU_BARS_LOOP_DEPTH_SPREAD = 0.5  # hue shift front→back in bars loop mode (0.5 = complementary)
+_SAVE_BTN_DIRTY_COLOR  = "#27ae60"   # green — save/save&exit when unsaved changes exist
+_SAVE_BTN_CLEAN_COLOR  = "#1a1a2e"   # save buttons at rest
+_CLOSE_BTN_DIRTY_COLOR = "#c0392b"   # red — close button when unsaved changes exist
+_CLOSE_BTN_CLEAN_COLOR = "#1a1a2e"   # close button at rest
 
 # ── Beat detection constants ──────────────────────────────────────────────────
 _BEAT_HISTORY_FRAMES = 12     # 12 rolling window length (~200 ms at 60 fps)
@@ -524,9 +528,9 @@ _EXCITED_BAR_THRESH = 0.18   # raw bar value to count as "active"
 _EXCITED_ON_SCORE   = 0.50   # integrator must reach this to latch excited ON
 _EXCITED_OFF_SCORE  = 0.22   # integrator must fall below this to latch excited OFF
 # Indicator color breakpoints (score thresholds for black → green → orange → red)
-_EXCITED_IND_GREEN  = 0.15
-_EXCITED_IND_ORANGE = 0.35
-_EXCITED_IND_RED    = 0.60
+_EXCITED_IND_GREEN  = 0.15  #15
+_EXCITED_IND_ORANGE = 0.50  #35
+_EXCITED_IND_RED    = 0.60  #60
 
 # Rotation state machine constants (index = excite level 0=black 1=green 2=orange 3=red)
 _ROT_EXCITE_SLIDER_PCT  = (0.0,  0.25, 0.50, 1.00)  # fraction of slider magnitude allowed as rot_max
@@ -1012,6 +1016,7 @@ class SpectrumController:
         self._bac_prev_bar_ts   = 0.0
         self._bac_ui_dirty      = False
         self._bac_ui_last_ts    = 0.0
+        self._bac_was_bright    = False  # for silence-transition reset
         self._bac_bpm_labels:   list = []  # ft.Text "BPM: 124.3" — one per _make_beat_params_col call
         self._bac_state_labels: list = []  # ft.Text state chip — one per _make_beat_params_col call
         self._bac_bs_slider     = None
@@ -1055,8 +1060,10 @@ class SpectrumController:
         self._sa_session_backup_written  = False
         self._menu_open             = False
         self._menu_panel_gen        = 0
-        self._settings_save_btn     = None
-        self._settings_dirty_label  = None
+        self._settings_save_btn      = None
+        self._settings_save_exit_btn = None
+        self._settings_close_btn     = None
+        self._settings_dirty_label   = None
         self._current_sf            = 1.0
         self._cm_rand_current       = {}   # mode_name -> active non-random cm
         self._cm_rand_beats         = {}   # mode_name -> beats since last change
@@ -1524,17 +1531,23 @@ class SpectrumController:
                 pass
 
     def _update_save_buttons(self):
-        """Refresh dirty indicator and save-button style in the open settings panel."""
+        """Refresh save/close button colors based on dirty state."""
         try:
-            if self._settings_dirty_label is not None:
-                self._settings_dirty_label.value = "Unsaved" if self._config_dirty else ""
-                self._settings_dirty_label.update()
-            if self._settings_save_btn is not None:
-                self._settings_save_btn.style = ft.ButtonStyle(
-                    bgcolor="#c0392b" if self._config_dirty else "#1a1a2e",
-                    color="white",
+            _dirty    = self._config_dirty
+            _save_bg  = _SAVE_BTN_DIRTY_COLOR  if _dirty else _SAVE_BTN_CLEAN_COLOR
+            _close_bg = _CLOSE_BTN_DIRTY_COLOR if _dirty else _CLOSE_BTN_CLEAN_COLOR
+            def _style(bg):
+                return ft.ButtonStyle(
+                    bgcolor=bg, color="white", elevation=4,
+                    shadow_color=ft.Colors.with_opacity(0.5, "black"),
+                    shape=ft.RoundedRectangleBorder(radius=4),
                 )
-                self._settings_save_btn.update()
+            for _btn in (self._settings_save_btn, self._settings_save_exit_btn):
+                if _btn is not None:
+                    _btn.style = _style(_save_bg); _btn.update()
+            if self._settings_close_btn is not None:
+                self._settings_close_btn.style = _style(_close_bg)
+                self._settings_close_btn.update()
         except Exception:
             pass
 
@@ -1847,7 +1860,6 @@ class SpectrumController:
             width=self._spec_box_grid_size[0],
             height=self._spec_box_grid_size[1],
             content=self._spec_grid_content,
-            tooltip=ft.Tooltip(message="Click to open settings", prefer_below=False, wait_duration=700),
             ink=True,
             on_click=self._open_spectrum_source_selector,
         )
@@ -1860,48 +1872,41 @@ class SpectrumController:
         )
         self._spec_sampling_btn = ft.IconButton(
             icon=ft.Icons.MIC, icon_size=12,
-            tooltip="Sampling ON",
             style=_btn_style,
             on_click=self._toggle_spec_sampling,
         )
         self._spec_idle_quick_btn = ft.IconButton(
             icon=ft.Icons.AUTO_AWESOME, icon_size=12,
-            tooltip="Idle effects ON",
             style=_btn_style,
             on_click=self._toggle_spec_idle_quick,
         )
         self._spec_combined_settings_btn = ft.IconButton(
             icon=ft.Icons.SETTINGS, icon_size=12,
             icon_color="#ff9800",
-            tooltip="SA Settings",
             style=_btn_style,
             on_click=self._open_combined_settings,
         )
         self._spec_detach_btn = ft.IconButton(
             icon=ft.Icons.OPEN_IN_NEW, icon_size=12,
             icon_color="#ff9800",
-            tooltip="Detach — open SA in its own window",
             style=_btn_style,
             on_click=self._launch_sa_detached,
         )
         self._spec_prev_mode_btn = ft.IconButton(
             icon=ft.Icons.SKIP_PREVIOUS, icon_size=12,
             icon_color="#aaaaaa",
-            tooltip="Previous mode",
             style=_btn_style,
             on_click=lambda _: self._cycle_spec_mode(-1),
         )
         self._spec_next_mode_btn = ft.IconButton(
             icon=ft.Icons.SKIP_NEXT, icon_size=12,
             icon_color="#aaaaaa",
-            tooltip="Next mode",
             style=_btn_style,
             on_click=lambda _: self._cycle_spec_mode(1),
         )
         self._xy_scope_swap_btn = ft.IconButton(
             icon=ft.Icons.SWAP_HORIZ, icon_size=12,
             icon_color="#39ff14",
-            tooltip="Swap L/R channels",
             style=_btn_style,
             visible=False,
             on_click=self._toggle_xy_scope_swap,
@@ -2181,11 +2186,23 @@ class SpectrumController:
 
             # Beat scanner comet: scan_pos drives a mini comet across the P-row canvas.
             _scan_x = self._beat_clock.scan_pos   # 0.0–1.0
-            _bright  = min(1.0, max(0.0, self._sa_smth_vu / 0.05 * 1.5))
+            _bright    = min(1.0, max(0.0, self._sa_smth_vu / 0.05 * 1.5))
+            _is_bright = self._bac_enabled and _bright >= 0.04
+            if not _is_bright and self._bac_was_bright:
+                _bsc_sr             = int(self._spec_sample_rate or 48000)
+                self._beat_clock    = _BeatClock()
+                self._beat_detector = _BeatDetector(
+                    self._beat_clock, sr=_bsc_sr,
+                    block_size=1024 if _bsc_sr >= 44100 else 512)
+                self._bac_state         = "SEARCHING"
+                self._bac_bpm           = 0.0
+                self._bac_beat_flash_ts = 0.0
+                self._bac_ui_dirty      = True
+            self._bac_was_bright = _is_bright
             _flash   = (_now_ind - self._bac_beat_flash_ts) < _BAC_BEAT_FLASH_S
 
             for _trail, _canvas in zip(self._bsc_trail, self._bsc_canvases):
-                if not self._bac_enabled or _bright < 0.04:
+                if not _is_bright:
                     if _canvas.shapes:
                         _canvas.shapes = []
                         try: _canvas.update()
@@ -2344,16 +2361,12 @@ class SpectrumController:
             self._spec_combined_settings_btn.icon_color = _on
             if self._spec_sampling_enabled:
                 self._spec_sampling_btn.icon_color = _on
-                self._spec_sampling_btn.tooltip    = "Sampling ON"
             else:
                 self._spec_sampling_btn.icon_color = _off
-                self._spec_sampling_btn.tooltip    = "Sampling OFF"
             if self._spec_idle_enabled:
                 self._spec_idle_quick_btn.icon_color = _on
-                self._spec_idle_quick_btn.tooltip    = "Idle effects ON"
             else:
                 self._spec_idle_quick_btn.icon_color = _off
-                self._spec_idle_quick_btn.tooltip    = "Idle effects OFF"
             _is_xy = self._spec_mode == "xy_scope"
             self._xy_scope_swap_btn.visible    = _is_xy
             self._xy_scope_swap_btn.icon_color = "#ffffff" if (self._xy_scope_swap and _is_xy) else "#39ff14"
@@ -2651,10 +2664,8 @@ class SpectrumController:
 
         def _make_beat_indicators():
             """Beat (B), excited (E), and beat scanner (P) comet indicators."""
-            _bt = ft.Container(width=10, height=10, border_radius=5, bgcolor="#2a2a2a",
-                               tooltip="Beat detected")
-            _ex = ft.Container(width=10, height=10, border_radius=5, bgcolor="#2a2a2a",
-                               tooltip="Excited state")
+            _bt = ft.Container(width=10, height=10, border_radius=5, bgcolor="#2a2a2a")
+            _ex = ft.Container(width=10, height=10, border_radius=5, bgcolor="#2a2a2a")
             self._sa_beat_ind_containers.append(_bt)
             self._sa_excited_ind_containers.append(_ex)
             # P scanner: mini comet track canvas
@@ -2682,8 +2693,10 @@ class SpectrumController:
         _bar_decay_slider = _peak_decay_slider = None
 
         def _clear_panel_refs():
-            self._settings_save_btn    = None
-            self._settings_dirty_label = None
+            self._settings_save_btn      = None
+            self._settings_save_exit_btn = None
+            self._settings_close_btn     = None
+            self._settings_dirty_label   = None
 
         def _do_close(_=None):
             _clear_panel_refs()
@@ -3028,7 +3041,7 @@ class SpectrumController:
                 _bg_dd,
             ], spacing=8, vertical_alignment=ft.CrossAxisAlignment.CENTER),
             _bg_contain_cb,
-        ], spacing=2,
+        ], spacing=2, horizontal_alignment=ft.CrossAxisAlignment.START,
         visible=(self._spec_mode in ("neon_drift", "retro_tech", "custom_vu", "hud_reactor", "rock_stage", "beat_saber", "neon_cascade")))
 
         def _color_mode_options(mode):
@@ -3125,8 +3138,6 @@ class SpectrumController:
                         style=ft.ButtonStyle(padding=ft.Padding.symmetric(horizontal=6, vertical=0))),
                 ], spacing=0, vertical_alignment=ft.CrossAxisAlignment.CENTER),
             ]
-            if _flash_cb:
-                _rows.append(_flash_cb)
             # ── Auto BPM row ─────────────────────────────────────────────────
             async def _on_bac_toggle(e):
                 self._bac_enabled = bool(e.control.value)
@@ -3153,6 +3164,8 @@ class SpectrumController:
                 _bac_bpm_lbl,
                 _bac_state_lbl,
             ], spacing=6, vertical_alignment=ft.CrossAxisAlignment.CENTER))
+            if _flash_cb:
+                _rows.append(_flash_cb)
             self._bac_bs_slider = ft.Slider(min=0.2, max=5.0, value=_bs_i, divisions=48,
                                              on_change=_on_bs, width=140)
             self._bac_rf_slider = ft.Slider(min=0.05, max=2.0, value=_rf_i, divisions=39,
@@ -4120,14 +4133,24 @@ class SpectrumController:
             on_click=_do_close,
         )
 
-        _dirty_lbl = ft.Text("", size=11, color="#e67e22", italic=True)
-        self._settings_dirty_label = _dirty_lbl
+        self._settings_dirty_label = None
 
-        _save_btn = ft.Button(
-            "SAVE", on_click=_do_save,
-            bgcolor="#1a1a2e", color="white",
+        _btn_3d = ft.ButtonStyle(
+            bgcolor=_SAVE_BTN_CLEAN_COLOR, color="white", elevation=4,
+            shadow_color=ft.Colors.with_opacity(0.5, "black"),
+            shape=ft.RoundedRectangleBorder(radius=4),
         )
-        self._settings_save_btn = _save_btn
+        _close_3d = ft.ButtonStyle(
+            bgcolor=_CLOSE_BTN_CLEAN_COLOR, color="white", elevation=4,
+            shadow_color=ft.Colors.with_opacity(0.5, "black"),
+            shape=ft.RoundedRectangleBorder(radius=4),
+        )
+        _save_btn      = ft.Button("SAVE",       on_click=_do_save,            style=_btn_3d)
+        _save_exit_btn = ft.Button("Save & Exit", on_click=_do_save_and_exit,  style=_btn_3d)
+        _close_row_btn = ft.Button("Close",       on_click=_do_close,          style=_close_3d)
+        self._settings_save_btn      = _save_btn
+        self._settings_save_exit_btn = _save_exit_btn
+        self._settings_close_btn     = _close_row_btn
 
         # Reflect current dirty state immediately in case menu was reopened while dirty
         self._update_save_buttons()
@@ -4180,12 +4203,10 @@ class SpectrumController:
                 _tabs,
                 ft.Divider(height=1, color="grey700"),
                 ft.Row([
-                    _dirty_lbl,
                     ft.TextButton("UNDO", on_click=_do_reload),
                     _save_btn,
-                    ft.Button("Save & Exit", on_click=_do_save_and_exit,
-                                    bgcolor="#1a1a2e", color="white"),
-                    ft.TextButton("Close", on_click=_do_close),
+                    _save_exit_btn,
+                    _close_row_btn,
                 ], alignment=ft.MainAxisAlignment.END, spacing=8),
             ], tight=True, spacing=4),
             bgcolor="#0c0c18",
@@ -5581,7 +5602,7 @@ class SpectrumController:
             cv.Line(x1=0, y1=_cy, x2=_W, y2=_cy,
                     paint=ft.Paint(color="#1a2a3a", stroke_width=1.0)),
             cv.Path(elements=_elems,
-                    paint=ft.Paint(color="#4fc3f7", stroke_width=1.5,
+                    paint=ft.Paint(color="#33cc55", stroke_width=1.5,
                                    style=ft.PaintingStyle.STROKE)),
         ]
         try:
@@ -5693,11 +5714,11 @@ class SpectrumController:
         ]
         if _elems_l:
             shapes.append(cv.Path(elements=_elems_l,
-                                  paint=ft.Paint(color="#4fc3f7", stroke_width=1.5,
+                                  paint=ft.Paint(color="#3377ff", stroke_width=1.5,
                                                  style=ft.PaintingStyle.STROKE)))
         if _elems_r:
             shapes.append(cv.Path(elements=_elems_r,
-                                  paint=ft.Paint(color="#ff6e6e", stroke_width=1.5,
+                                  paint=ft.Paint(color="#ff3333", stroke_width=1.5,
                                                  style=ft.PaintingStyle.STROKE)))
         try:
             self._neon_vu_canvas.shapes = shapes
@@ -8105,14 +8126,18 @@ class SpectrumController:
         _cp      = self._spec_hallu_base_params.get("circle", {})
         layers   = max(1, int(_cp.get("layers", 3)))
         jitter   = float(_cp.get("jitter", 1.0))
-        _rot_dt  = min((_dt if _dt is not None and _dt > 0 else 1.0 / 30.0), 0.1)
-        auto_rot = bool(_cp.get("auto_rot", True))
+        _rot_dt    = min((_dt if _dt is not None and _dt > 0 else 1.0 / 30.0), 0.1)
+        _rot_speed = float(_cp.get("rotDeg", 5.0))   # slider ±10
+        auto_rot   = bool(_cp.get("auto_rot", True))
+        _spin_angle = aux.get("morph_spin", 0.0)
         if auto_rot:
-            self._run_rot_state(_cp.get("rotDeg", 5.0), _rot_dt)
-            _spin_rate = self._sa_rot_current * _ROT_MORPH_SPEED_SCALE   # deg/sec
+            # Same shared state machine as mirror — excite-level speed + beat-driven left/right/stop
+            self._run_rot_state(_rot_speed, _rot_dt)
+            _spin_angle += math.radians(self._sa_rot_current * _ROT_MORPH_SPEED_SCALE) * _rot_dt
         else:
-            _spin_rate = float(_cp.get("rotDeg", 5.0))                   # deg/sec directly
-        spin_angle   = (aux.get("morph_spin", 0.0) + math.radians(_spin_rate) * _rot_dt) % (2 * math.pi)
+            # Manual: sign of slider controls direction, magnitude controls speed
+            _spin_angle += (_rot_speed / 10.0) * math.pi * _rot_dt
+        spin_angle = _spin_angle % (2 * math.pi)
         aux["morph_spin"] = spin_angle
 
         spread_range = float(_cp.get("spreadRange", 0.70))
@@ -8140,13 +8165,18 @@ class SpectrumController:
             alpha = max(70, 200 - L * 45)
             color = (int(rc*255), int(gc*255), int(bc*255), alpha)
             pts = []
+            # t modulates amplitude only — keeps deformation fixed in ring-local
+            # coords so spin_angle has symmetric directional control (no drift)
+            _t_bass   = 1.0 + 0.6 * math.sin(2 * t + L * 0.7)
+            _t_mid    = 1.0 + 0.6 * math.sin(4 * t + L * 1.3)
+            _t_treble = 1.0 + 0.6 * math.sin(7 * t + L * 2.1)
             for i in range(N):
                 theta     = 2 * math.pi * i / N
                 theta_rot = theta + spin_angle
                 rv = (R_base
-                    + math.sin(5  * theta + 2 * t + L * 0.7) * A_bass   * bass
-                    + math.sin(11 * theta + 4 * t + L * 1.3) * A_mid    * mid
-                    + math.sin(23 * theta + 7 * t + L * 2.1) * A_treble * treble)
+                    + math.sin(5  * theta + L * 0.7) * A_bass   * bass   * _t_bass
+                    + math.sin(11 * theta + L * 1.3) * A_mid    * mid    * _t_mid
+                    + math.sin(23 * theta + L * 2.1) * A_treble * treble * _t_treble)
                 pts.append((int(cx + rv * math.cos(theta_rot)),
                             int(cy + rv * math.sin(theta_rot))))
             if len(pts) >= 3:

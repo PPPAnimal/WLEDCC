@@ -933,7 +933,8 @@ class WLEDApp:
                     c["live_badge"].visible = True
                     c["live_icon"].color = "grey500"
                     c["live_text"].color = "grey500"
-                    c["live_badge"].bgcolor = "#1e1e2a"
+                    c["live_badge"].bgcolor = None
+                    c["live_badge"].gradient = ft.LinearGradient(begin=ft.Alignment.TOP_CENTER, end=ft.Alignment.BOTTOM_CENTER, colors=["#363650", "#0f0f1a"])
                     c["live_badge"].border = ft.Border.all(1, "grey700")
                     c["live_badge"].tooltip = "Click to re-activate in LedFx"
                     try: c["live_badge"].update()
@@ -949,9 +950,10 @@ class WLEDApp:
                         lb.visible  = True
                         c["live_icon"].color = "grey500"
                         c["live_text"].color = "grey500"
-                        lb.bgcolor  = "#1e1e2a"
-                        lb.border   = ft.Border.all(1, "grey700")
-                        lb.tooltip  = "Click to sync this MagicHome device with LedFx"
+                        lb.bgcolor   = None
+                        lb.gradient  = ft.LinearGradient(begin=ft.Alignment.TOP_CENTER, end=ft.Alignment.BOTTOM_CENTER, colors=["#363650", "#0f0f1a"])
+                        lb.border    = ft.Border.all(1, "grey700")
+                        lb.tooltip   = "Click to sync this MagicHome device with LedFx"
                         try: lb.update()
                         except: pass
                 # Start bridge socket when LedFx starts so it's ready for any
@@ -6320,8 +6322,20 @@ class WLEDApp:
                 # ROW 1: favicon tag | name | ✏ | ✕ | spacer | OPEN/CLOSE
                 ft.Row([
                     type_tag, name_label, edit_btn,
-                    ft.IconButton(ft.Icons.CLOSE, icon_size=13, icon_color="red400",
-                        tooltip="Remove", on_click=lambda _, k=key: self._remove_custom_card(k)),
+                    ft.GestureDetector(
+                        on_tap=lambda _, k=key: self._remove_custom_card(k),
+                        mouse_cursor=ft.MouseCursor.CLICK,
+                        content=ft.Container(
+                            width=24, height=24, border_radius=5,
+                            alignment=ft.Alignment.CENTER, ink=True,
+                            tooltip="Remove",
+                            gradient=ft.LinearGradient(
+                                begin=ft.Alignment.TOP_CENTER, end=ft.Alignment.BOTTOM_CENTER,
+                                colors=["#6b0000", "#380000"],
+                            ),
+                            content=ft.Icon(ft.Icons.CLOSE, size=12, color="white"),
+                        ),
+                    ),
                     ft.Container(expand=True),
                     action_btn,
                 ], vertical_alignment="center", spacing=3),
@@ -7686,7 +7700,10 @@ class WLEDApp:
         # ── shared widgets ────────────────────────────────────────────────────
         type_tag = ft.Container(
             content=ft.Text("WLED" if is_wled else "MH", size=9, weight="bold", color="white"),
-            bgcolor="blue900" if is_wled else "green900",
+            gradient=ft.LinearGradient(
+                begin=ft.Alignment.TOP_CENTER, end=ft.Alignment.BOTTOM_CENTER,
+                colors=["#1565c0", "#0a2060"] if is_wled else ["#2e7d32", "#0d3312"],
+            ),
             padding=ft.Padding.symmetric(horizontal=3, vertical=5), border_radius=4,
             ink=is_wled,
             tooltip="Open Web UI" if is_wled else None,
@@ -7702,16 +7719,20 @@ class WLEDApp:
         name_label = ft.Text(display_name, weight="bold", size=16)
         edit_btn   = ft.IconButton(ft.Icons.EDIT, icon_size=13, icon_color="grey500",
                          tooltip="Rename", on_click=lambda _, i=ip: self.show_rename_dialog(i))
-        _update_ver_text = ft.Text("", size=9, weight=ft.FontWeight.BOLD, color="black", text_align="center")
+        _update_ver_text = ft.Text("", size=9, weight=ft.FontWeight.BOLD, color="white", text_align="center")
         update_btn = ft.Container(
-            visible=False, bgcolor="yellow700", border_radius=5,
+            visible=False, border_radius=5,
+            gradient=ft.LinearGradient(
+                begin=ft.Alignment.TOP_CENTER, end=ft.Alignment.BOTTOM_CENTER,
+                colors=["#c47c00", "#5c3600"],
+            ),
             padding=ft.Padding.symmetric(horizontal=8, vertical=4),
             alignment=ft.Alignment.CENTER,
             ink=True,
             tooltip="Flash latest firmware",
             on_click=lambda _, i=ip: threading.Thread(target=self.push_ota_update, args=(i,), daemon=True).start(),
             content=ft.Column([
-                ft.Text("UPDATE", size=9, weight=ft.FontWeight.BOLD, color="black", text_align="center"),
+                ft.Text("UPDATE", size=9, weight=ft.FontWeight.BOLD, color="white", text_align="center"),
                 _update_ver_text,
             ], spacing=0, tight=True, horizontal_alignment=ft.CrossAxisAlignment.CENTER),
         )
@@ -7723,7 +7744,10 @@ class WLEDApp:
             ink=True,
             border_radius=6,
             on_click=lambda _, i=ip: self.toggle_live_badge(i),
-            bgcolor="#3a1a00",
+            gradient=ft.LinearGradient(
+                begin=ft.Alignment.TOP_CENTER, end=ft.Alignment.BOTTOM_CENTER,
+                colors=["#7c3300", "#2a1000"],
+            ),
             border=ft.Border.all(1, "#ff6600"),
             padding=ft.Padding.symmetric(horizontal=6, vertical=3),
             content=ft.Row([_live_icon, _live_text], spacing=3, tight=True),
@@ -7752,6 +7776,7 @@ class WLEDApp:
                 begin=ft.Alignment.TOP_LEFT, end=ft.Alignment.BOTTOM_RIGHT,
                 colors=["#FF0000","#FF8800","#FFFF00","#00FF00","#00FFFF","#0000FF","#FF00FF","#FF0000"],
             ),
+            shadow=[ft.BoxShadow(blur_radius=8, offset=ft.Offset(0, 3), color=ft.Colors.with_opacity(0.5, "black"))],
             tooltip="Pick color",
             ink=True,
             on_click=lambda _, i=ip: self.show_color_picker(i),
@@ -7763,8 +7788,11 @@ class WLEDApp:
         if is_wled:
             action_btn = ft.Container(
                 width=54, height=54, border_radius=10,
-                bgcolor="#1e2133",
-                border=ft.Border.only(top=ft.BorderSide(1, "white10")),
+                gradient=ft.LinearGradient(
+                    begin=ft.Alignment.TOP_CENTER, end=ft.Alignment.BOTTOM_CENTER,
+                    colors=["#2a2f4a", "#0d0f1e"],
+                ),
+                border=None,
                 shadow=[ft.BoxShadow(blur_radius=10, color=ft.Colors.with_opacity(0.4, "black"))],
                 tooltip="Select preset",
                 ink=True,
@@ -7778,8 +7806,11 @@ class WLEDApp:
             preset_label = ft.Text("MODES", size=7, color="#00f2ff", weight="bold")
             action_btn = ft.Container(
                 width=54, height=54, border_radius=10,
-                bgcolor="#1e2133",
-                border=ft.Border.only(top=ft.BorderSide(1, "white10")),
+                gradient=ft.LinearGradient(
+                    begin=ft.Alignment.TOP_CENTER, end=ft.Alignment.BOTTOM_CENTER,
+                    colors=["#2a2f4a", "#0d0f1e"],
+                ),
+                border=None,
                 shadow=[ft.BoxShadow(blur_radius=10, color=ft.Colors.with_opacity(0.4, "black"))],
                 tooltip="Light modes",
                 ink=True,
@@ -10087,7 +10118,8 @@ class WLEDApp:
         c["live_text"].color = "#7b1fa2"
         
         # Dark purple background to make the border pop
-        c["live_badge"].bgcolor = "#1a001a" 
+        c["live_badge"].bgcolor = None
+        c["live_badge"].gradient = ft.LinearGradient(begin=ft.Alignment.TOP_CENTER, end=ft.Alignment.BOTTOM_CENTER, colors=["#3d0040", "#100010"])
         c["live_badge"].border = ft.Border.all(1, "#7b1fa2")
         
         c["live_badge"].tooltip = "LedFx has control — click to release back to WLED"
@@ -10138,7 +10170,8 @@ class WLEDApp:
         c["live_badge"].visible = True
         c["live_icon"].color = "grey500"
         c["live_text"].color = "grey500"
-        c["live_badge"].bgcolor = "#1e1e2a"
+        c["live_badge"].bgcolor = None
+        c["live_badge"].gradient = ft.LinearGradient(begin=ft.Alignment.TOP_CENTER, end=ft.Alignment.BOTTOM_CENTER, colors=["#363650", "#0f0f1a"])
         c["live_badge"].border = ft.Border.all(1, "grey700")
         c["live_badge"].tooltip = "Click to re-activate in LedFx"
         c["status"].value = "CHECKING..."
@@ -11300,15 +11333,17 @@ class WLEDApp:
             if ok:
                 c["live_icon"].color = "#7b1fa2"
                 c["live_text"].color = "#7b1fa2"
-                lb.bgcolor = "#1a001a"
-                lb.border  = ft.Border.all(1, "#7b1fa2")
-                lb.tooltip = "LedFx has control — click to release back to MagicHome"
+                lb.bgcolor   = None
+                lb.gradient  = ft.LinearGradient(begin=ft.Alignment.TOP_CENTER, end=ft.Alignment.BOTTOM_CENTER, colors=["#3d0040", "#100010"])
+                lb.border    = ft.Border.all(1, "#7b1fa2")
+                lb.tooltip   = "LedFx has control — click to release back to MagicHome"
             else:
                 c["live_icon"].color = "#e65100"
                 c["live_text"].color = "#e65100"
-                lb.bgcolor = "#1a0800"
-                lb.border  = ft.Border.all(1, "#e65100")
-                lb.tooltip = "LedFx sync problem — retrying power-on…"
+                lb.bgcolor   = None
+                lb.gradient  = ft.LinearGradient(begin=ft.Alignment.TOP_CENTER, end=ft.Alignment.BOTTOM_CENTER, colors=["#4d1c00", "#150500"])
+                lb.border    = ft.Border.all(1, "#e65100")
+                lb.tooltip   = "LedFx sync problem — retrying power-on…"
             try: lb.update()
             except: pass
         try:
@@ -11350,12 +11385,13 @@ class WLEDApp:
         # Purple live badge (mirrors WLED orange badge logic)
         lb = c.get("live_badge")
         if lb:
-            lb.visible  = True
+            lb.visible   = True
             c["live_icon"].color = "#7b1fa2"
             c["live_text"].color = "#7b1fa2"
-            lb.bgcolor  = "#1a001a"
-            lb.border   = ft.Border.all(1, "#7b1fa2")
-            lb.tooltip  = "LedFx has control — click to release back to MagicHome"
+            lb.bgcolor   = None
+            lb.gradient  = ft.LinearGradient(begin=ft.Alignment.TOP_CENTER, end=ft.Alignment.BOTTOM_CENTER, colors=["#3d0040", "#100010"])
+            lb.border    = ft.Border.all(1, "#7b1fa2")
+            lb.tooltip   = "LedFx has control — click to release back to MagicHome"
             try: lb.update()
             except: pass
         # Mark glow as "on" so the border animation loop includes this card —
@@ -11387,9 +11423,10 @@ class WLEDApp:
                 lb.visible  = True
                 c["live_icon"].color = "grey500"
                 c["live_text"].color = "grey500"
-                lb.bgcolor  = "#1e1e2a"
-                lb.border   = ft.Border.all(1, "grey700")
-                lb.tooltip  = "Click to sync this MagicHome device with LedFx"
+                lb.bgcolor   = None
+                lb.gradient  = ft.LinearGradient(begin=ft.Alignment.TOP_CENTER, end=ft.Alignment.BOTTOM_CENTER, colors=["#363650", "#0f0f1a"])
+                lb.border    = ft.Border.all(1, "grey700")
+                lb.tooltip   = "Click to sync this MagicHome device with LedFx"
             else:
                 lb.visible = False
             try: lb.update()
