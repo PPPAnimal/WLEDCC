@@ -3040,7 +3040,7 @@ class SpectrumController:
                 ft.Text("VU BG Image:", size=12, color="grey400"),
                 _bg_dd,
             ], spacing=8, vertical_alignment=ft.CrossAxisAlignment.CENTER),
-            _bg_contain_cb,
+            ft.Row([_bg_contain_cb]),
         ], spacing=2, horizontal_alignment=ft.CrossAxisAlignment.START,
         visible=(self._spec_mode in ("neon_drift", "retro_tech", "custom_vu", "hud_reactor", "rock_stage", "beat_saber", "neon_cascade")))
 
@@ -3165,7 +3165,7 @@ class SpectrumController:
                 _bac_state_lbl,
             ], spacing=6, vertical_alignment=ft.CrossAxisAlignment.CENTER))
             if _flash_cb:
-                _rows.append(_flash_cb)
+                _rows.append(ft.Row([_flash_cb]))
             self._bac_bs_slider = ft.Slider(min=0.2, max=5.0, value=_bs_i, divisions=48,
                                              on_change=_on_bs, width=140)
             self._bac_rf_slider = ft.Slider(min=0.05, max=2.0, value=_rf_i, divisions=39,
@@ -3185,10 +3185,11 @@ class SpectrumController:
                         ft.Slider(min=0.1, max=2.0,  value=_rs_i, divisions=38,
                                   on_change=_on_rs, width=140), _lrs], spacing=4),
             ]
-            return ft.Column(_rows, spacing=3, visible=visible_cond)
+            return ft.Column(_rows, spacing=3, visible=visible_cond,
+                             horizontal_alignment=ft.CrossAxisAlignment.START)
 
         _canvas_beat_params = _make_beat_params_col(
-            self._spec_mode in ("beat_saber", "neon_cascade", "rock_stage"),
+            self._spec_mode != "hallucination",
             show_flash_toggle=True)
 
         def _make_osc_params_col(visible_cond):

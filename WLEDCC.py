@@ -6322,20 +6322,9 @@ class WLEDApp:
                 # ROW 1: favicon tag | name | ✏ | ✕ | spacer | OPEN/CLOSE
                 ft.Row([
                     type_tag, name_label, edit_btn,
-                    ft.GestureDetector(
-                        on_tap=lambda _, k=key: self._remove_custom_card(k),
-                        mouse_cursor=ft.MouseCursor.CLICK,
-                        content=ft.Container(
-                            width=24, height=24, border_radius=5,
-                            alignment=ft.Alignment.CENTER, ink=True,
-                            tooltip="Remove",
-                            gradient=ft.LinearGradient(
-                                begin=ft.Alignment.TOP_CENTER, end=ft.Alignment.BOTTOM_CENTER,
-                                colors=["#6b0000", "#380000"],
-                            ),
-                            content=ft.Icon(ft.Icons.CLOSE, size=12, color="white"),
-                        ),
-                    ),
+                    ft.IconButton(ft.Icons.CLOSE, icon_size=13, icon_color="red400",
+                        tooltip="Remove this device",
+                        on_click=lambda _, k=key: self._remove_custom_card(k)),
                     ft.Container(expand=True),
                     action_btn,
                 ], vertical_alignment="center", spacing=3),
