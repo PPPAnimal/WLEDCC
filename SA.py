@@ -7460,16 +7460,80 @@ class SpectrumController:
             _p_angle = (_p_angle + _rot_speed) % (2 * math.pi)
             aux["_chroma_p_angle"] = _p_angle
 
-            _rdx_r = int(off_mag * math.cos(_p_angle))
-            _rdy_r = int(off_mag * math.sin(_p_angle))
-            _rdx_g = int(off_mag * math.cos(_p_angle + 2 * math.pi / 3))
-            _rdy_g = int(off_mag * math.sin(_p_angle + 2 * math.pi / 3))
-            _rdx_b = int(off_mag * math.cos(_p_angle + 4 * math.pi / 3))
-            _rdy_b = int(off_mag * math.sin(_p_angle + 4 * math.pi / 3))
+            # Per-particle chromatic split — each channel drawn at its own position.
+            # No image rolling → no wrap-around seam regardless of rotation angle.
+            _sx_r = off_mag * math.cos(_p_angle)
+            _sy_r = off_mag * math.sin(_p_angle)
+            _sx_g = off_mag * math.cos(_p_angle + 2 * math.pi / 3)
+            _sy_g = off_mag * math.sin(_p_angle + 2 * math.pi / 3)
+            _sx_b = off_mag * math.cos(_p_angle + 4 * math.pi / 3)
+            _sy_b = off_mag * math.sin(_p_angle + 4 * math.pi / 3)
 
-            base = np.array(base_img, dtype=np.float32)
+            _bp_energy  = aux.get("_bp_energy", 0.3)
+            _burst_mul  = aux.get("_bp_burst_mul", 1.0)
+            _brightness = 0.08 + _bp_energy * 0.92
+            _dot_f      = 0.35 + _bp_energy * 0.65
+            _pk_boost   = min(0.4, bass * 0.4 + mid * 0.2 + treble * 0.15)
+            _h_val      = self._spec_display_hue
+            _cx, _cy    = W / 2.0, H / 2.0
 
-            # Beat scale-pop: zoom base outward on kick for a punch feel
+            # Color mode — same beat-driven hue state machine as waveform/circle
+            _cm = self._tick_random_cm("hallucination", beat)
+            if "_chroma_hue_from" not in aux:
+                aux["_chroma_hue_from"] = 0.0
+                aux["_chroma_hue_to"]   = 0.0
+                aux["_chroma_hue_t"]    = 1.0
+                aux["_chroma_hue_seq"]  = [0.00, 0.08, 0.50, 0.33, 0.77]
+            if beat:
+                aux["_chroma_hue_from"] = self._lerp_h(
+                    aux["_chroma_hue_from"], aux["_chroma_hue_to"],
+                    self._ease(aux["_chroma_hue_t"]))
+                aux["_chroma_hue_to"]  = aux["_chroma_hue_seq"][0]
+                aux["_chroma_hue_seq"] = aux["_chroma_hue_seq"][1:] + [aux["_chroma_hue_seq"][0]]
+                aux["_chroma_hue_t"]   = 0.0
+            aux["_chroma_hue_t"] = min(1.0, aux["_chroma_hue_t"] + _dt_c / 0.55)
+            h = self._lerp_h(aux["_chroma_hue_from"], aux["_chroma_hue_to"],
+                             self._ease(aux["_chroma_hue_t"]))
+
+            _out_r = _PILImage.new("RGB", (W, H), (0, 0, 0))
+            _out_g = _PILImage.new("RGB", (W, H), (0, 0, 0))
+            _out_b = _PILImage.new("RGB", (W, H), (0, 0, 0))
+            _dr    = _PILDraw.Draw(_out_r)
+            _dg    = _PILDraw.Draw(_out_g)
+            _db    = _PILDraw.Draw(_out_b)
+
+            for pt in aux.get("bp", []):
+                _px, _py = pt[0], pt[1]
+                _r_px = max(1, int((0.5 + _bp_energy * 1.5 + bass * 1.5 + treble * 0.8)
+                                   * min(_burst_mul, 2.5)))
+                _brt = min(1.0, _brightness + _pk_boost)
+                _prx, _pry = int(_px + _sx_r), int(_py + _sy_r)
+                _pgx, _pgy = int(_px + _sx_g), int(_py + _sy_g)
+                _pbx, _pby = int(_px + _sx_b), int(_py + _sy_b)
+                if _cm == "gradient":
+                    _ph = (_h_val + math.atan2(_py - _cy, _px - _cx) / (2 * math.pi)) % 1.0
+                    _rc, _gc, _bc = colorsys.hsv_to_rgb(_ph, 1.0, _brt)
+                    _col_r = (min(255, int(_rc * 255 * _f_r * _dot_f)), 0, 0)
+                    _col_g = (0, min(255, int(_gc * 255 * _f_g * _dot_f)), 0)
+                    _col_b = (0, 0, min(255, int(_bc * 255 * _f_b * _dot_f)))
+                else:  # loop — beat-driven hue, three channels at 120° hue offsets
+                    _sc = 255 * _dot_f
+                    _rr, _rg, _rb = colorsys.hsv_to_rgb(h % 1.0,           1.0, _brt)
+                    _gr, _gg, _gb = colorsys.hsv_to_rgb((h + 1/3) % 1.0,   1.0, _brt)
+                    _br, _bg, _bb = colorsys.hsv_to_rgb((h + 2/3) % 1.0,   1.0, _brt)
+                    _col_r = (min(255, int(_rr*_f_r*_sc)), min(255, int(_rg*_f_r*_sc)), min(255, int(_rb*_f_r*_sc)))
+                    _col_g = (min(255, int(_gr*_f_g*_sc)), min(255, int(_gg*_f_g*_sc)), min(255, int(_gb*_f_g*_sc)))
+                    _col_b = (min(255, int(_br*_f_b*_sc)), min(255, int(_bg*_f_b*_sc)), min(255, int(_bb*_f_b*_sc)))
+                _dr.ellipse([_prx-_r_px, _pry-_r_px, _prx+_r_px, _pry+_r_px], fill=_col_r)
+                _dg.ellipse([_pgx-_r_px, _pgy-_r_px, _pgx+_r_px, _pgy+_r_px], fill=_col_g)
+                _db.ellipse([_pbx-_r_px, _pby-_r_px, _pbx+_r_px, _pby+_r_px], fill=_col_b)
+
+            _arr = (np.array(_out_r, dtype=np.float32)
+                    + np.array(_out_g, dtype=np.float32)
+                    + np.array(_out_b, dtype=np.float32))
+            _out_pil = _PILImage.fromarray(np.clip(_arr, 0, 255).astype(np.uint8)).convert("RGBA")
+
+            # Beat scale-pop applied to the composited output
             _zoom_pop = aux.get("_chroma_zoom_pop", 0.0)
             if beat:
                 _zoom_pop = 0.04 + bass * 0.10
@@ -7479,20 +7543,11 @@ class SpectrumController:
                 _bi  = getattr(_PILImage, "Resampling", _PILImage).BILINEAR
                 _zf  = 1.0 + _zoom_pop
                 _nw, _nh = int(W * _zf), int(H * _zf)
-                _ox, _oy = (_nw - W) // 2, (_nh - H) // 2
-                _tmp = _PILImage.fromarray(np.clip(base, 0, 255).astype(np.uint8))
-                _tmp = _tmp.resize((_nw, _nh), _bi).crop((_ox, _oy, _ox + W, _oy + H))
-                base = np.array(_tmp, dtype=np.float32)
+                _zox, _zoy = (_nw - W) // 2, (_nh - H) // 2
+                _out_pil = _out_pil.resize((_nw, _nh), _bi).crop(
+                    (_zox, _zoy, _zox + W, _zoy + H))
 
-            # Per-channel brightness tracks its mapped frequency band in both color modes
-            # (R=bass, G=mid, B=treble) — same pattern as waveform/circle chroma paths.
-            # gradient/loop distinction is already handled by hue-cycle speed in _draw_hallu_base.
-            self._tick_random_cm("hallucination", beat)  # advance state machine
-            # _f_r, _f_g, _f_b from shared preamble (R=bass, G=treble, B=mid, zero floor)
-            out = np.zeros_like(base)
-            out[..., 0] = np.roll(base[..., 0], (_rdy_r, _rdx_r), axis=(0, 1)) * _f_r
-            out[..., 1] = np.roll(base[..., 1], (_rdy_g, _rdx_g), axis=(0, 1)) * _f_g
-            out[..., 2] = np.roll(base[..., 2], (_rdy_b, _rdx_b), axis=(0, 1)) * _f_b
+            out = np.array(_out_pil, dtype=np.float32)
             out[..., 3] = 255
 
         else:
