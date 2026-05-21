@@ -1054,6 +1054,7 @@ class SpectrumController:
         self._config_dirty               = False
         self._sa_session_backup_written  = False
         self._menu_open             = False
+        self._menu_panel_gen        = 0
         self._settings_save_btn     = None
         self._settings_dirty_label  = None
         self._current_sf            = 1.0
@@ -2634,6 +2635,8 @@ class SpectrumController:
         except Exception as ex: self._status(f"Settings error: {ex}", "orange400")
 
     def _show_combined_settings(self, initial_tab=0):
+        self._menu_panel_gen += 1
+        _panel_gen = self._menu_panel_gen
         self._status("Spectrum settings opened")
         self._refresh_spectrum_sources()
 
@@ -3194,6 +3197,8 @@ class SpectrumController:
 
         # ── Hallucination sub-mode dropdown ──────────────────────────────
         async def on_hallu_submode_change(e):
+            if _panel_gen != self._menu_panel_gen:
+                return
             _sub = str(e.control.value or "mirror").lower()
             _valid = ("mirror", "chroma", "perlin", "morph")
             if _sub == self._spec_hallu_submode:
@@ -3213,6 +3218,8 @@ class SpectrumController:
                 self._spec_mode_transitioning = False
 
         async def on_hallu_base_change(e):
+            if _panel_gen != self._menu_panel_gen:
+                return
             if str(e.control.value or "waveform") == self._spec_hallu_base_kind:
                 return
             self._spec_mode_transitioning = True
@@ -4158,13 +4165,13 @@ class SpectrumController:
                     return g["label"]
             return m
 
-        _mode_name_lbl = ft.Text(_build_mode_name(), size=11, color="grey500", italic=True)
+        _mode_name_lbl = ft.Text(_build_mode_name(), size=11, color="grey500", italic=True,
+                                  overflow=ft.TextOverflow.ELLIPSIS, max_lines=1)
 
         panel = ft.Container(
             content=ft.Column([
                 ft.Row([
-                    _mode_name_lbl,
-                    ft.Container(expand=True),
+                    ft.Container(content=_mode_name_lbl, expand=True),
                     _menu_prev_btn,
                     _menu_next_btn,
                     _make_beat_indicators(),
@@ -7942,8 +7949,8 @@ class SpectrumController:
             rung_hue = (h_val + 0.08) % 1.0
             for i in range(rungs):
                 rx  = ((i + 0.5) / rungs) * W
-                yt  = cy + A * math.sin(k * rx + tt)
-                yb  = cy - A * math.sin(k * rx + tt)
+                yt  = cy + A * math.sin(k * (rx - W / 2) + tt)
+                yb  = cy - A * math.sin(k * (rx - W / 2) + tt)
                 depth = abs(yt - yb) / (2 * A) if A > 0 else 0.0
                 v   = 0.18 + depth * 0.52
                 _rh = (rx / W) * 0.33 if _is_grad else rung_hue
@@ -7955,7 +7962,7 @@ class SpectrumController:
             pts_top, pts_bot = [], []
             x = 0.0
             while x <= W:
-                s = math.sin(k * x + tt)
+                s = math.sin(k * (x - W / 2) + tt)
                 pts_top.append((x, cy + A * s))
                 pts_bot.append((x, cy - A * s))
                 x += 1.5
