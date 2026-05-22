@@ -540,6 +540,9 @@ _ROT_EXCITE_LERP_RAMP   = 1.0                         # rate (1/sec) at which le
 _ROT_EXCITE_CENTER_PROB = (1.0,  0.33, 0.25, 0.15)  # probability of picking center (0°) as next target
 _ROT_MAX_HIT_PROB       = 0.30                        # on beat, chance of targeting full rot_max when last target was below it
 _ROT_BEAT_FLIP_PROB     = 0.70                        # on beat, chance of flipping direction vs pushing further in same direction
+_ROT_TRAVEL_GATE_PROB   = 0.80                        # while traveling: chance a beat is allowed to redirect target
+_ROT_HOLD_GATE_PROB     = 0.50                        # while at target: chance a beat is allowed to pull away
+_ROT_NO_BEAT_TIMEOUT    = 4.0                         # seconds without a beat before next beat always reacts (overrides both gates)
 _ROT_MORPH_SPEED_SCALE  = 15.0                        # deg/sec per unit of _sa_rot_current for morph global spin
 _BEAT_SUB_BASS_FRAC  = 0.05   # .1 fraction of FFT bands used as sub-bass tap (~20-80 Hz)
 
@@ -1152,7 +1155,9 @@ class SpectrumController:
         self._sa_rot_current    = 0.0
         self._sa_rot_lerp_rate  = 1.5
         self._sa_rot_last_ts   = 0.0
-        self._sa_rot_prev_beat = False
+        self._sa_rot_prev_beat    = False
+        self._sa_rot_arrived      = False
+        self._sa_rot_last_beat_ts = 0.0
         # Time-based hallucination rendering
         self._hallu_last_render_ts  = 0.0
         self._hallu_img                        = None
@@ -6904,14 +6909,19 @@ class SpectrumController:
         return img
 
     def _run_rot_state(self, rot_deg, _rot_dt):
-        """Excite-driven rotation state machine shared by mirror and morph.
+        """Excite-driven rotation state machine shared by mirror, morph, and chroma.
         Updates self._sa_rot_current (degrees). rot_deg = slider magnitude."""
         _rot_level = self._sa_rot_level
         _rot_max   = abs(float(rot_deg)) * _ROT_EXCITE_SLIDER_PCT[_rot_level]
         self._sa_rot_target = max(-_rot_max, min(_rot_max, self._sa_rot_target))
         _beat_edge = self._sa_beat_detected and not self._sa_rot_prev_beat
         self._sa_rot_prev_beat = self._sa_beat_detected
-        if _beat_edge and _rot_level > 0 and _rot_max > 0:
+        _now = time.monotonic()
+        if _beat_edge:
+            self._sa_rot_last_beat_ts = _now
+
+        def _pick_new_target():
+            self._sa_rot_arrived = False
             if random.random() < _ROT_EXCITE_CENTER_PROB[_rot_level]:
                 self._sa_rot_target = 0.0
             else:
@@ -6921,12 +6931,30 @@ class SpectrumController:
                     self._sa_rot_target = _sign * _rot_max
                 else:
                     self._sa_rot_target = _sign * _rot_max * random.uniform(0.5, 1.0)
-        if _rot_max > 0 and abs(self._sa_rot_current - self._sa_rot_target) < max(0.15, _rot_max * 0.04):
-            if random.random() < _ROT_EXCITE_CENTER_PROB[_rot_level]:
-                self._sa_rot_target = 0.0
+
+        if _beat_edge and _rot_level > 0 and _rot_max > 0:
+            _starved = (_now - self._sa_rot_last_beat_ts) > _ROT_NO_BEAT_TIMEOUT
+            if _starved:
+                # No beat for a while — guaranteed reaction, skip both gates
+                _pick_new_target()
+            elif self._sa_rot_arrived:
+                # Holding at target — gate lets beat pull away to a new target
+                if random.random() < _ROT_HOLD_GATE_PROB:
+                    _pick_new_target()
             else:
-                _sign = math.copysign(1.0, self._sa_rot_target) if self._sa_rot_target != 0.0 else random.choice([-1.0, 1.0])
-                self._sa_rot_target = -_sign * _rot_max * random.uniform(0.4, 1.0)
+                # Traveling — gate lets beat redirect; other half accelerates toward target
+                if random.random() < _ROT_TRAVEL_GATE_PROB:
+                    _pick_new_target()
+                else:
+                    _tgt_sign = (math.copysign(1.0, self._sa_rot_target) if self._sa_rot_target != 0.0
+                                 else math.copysign(1.0, self._sa_rot_current) if self._sa_rot_current != 0.0
+                                 else 1.0)
+                    self._sa_rot_target = _tgt_sign * _rot_max
+
+        # Arrival: mark when current reaches target; hold until next beat
+        if _rot_max > 0 and abs(self._sa_rot_current - self._sa_rot_target) < max(0.15, _rot_max * 0.04):
+            self._sa_rot_arrived = True
+
         _alpha = 1.0 - math.exp(-self._sa_rot_lerp_rate * _rot_dt)
         self._sa_rot_current += (self._sa_rot_target - self._sa_rot_current) * _alpha
 
@@ -7601,30 +7629,7 @@ class SpectrumController:
             # ── Circle rotation ──────────────────────────────────────────────
             _circle_angle = aux.get("_chroma_circle_angle", 0.0)
             if _auto:
-                # Excite state machine: _sa_rot_current is angular velocity in deg/sec.
-                # slider / 2 * 360 deg/sec = slider / 2 rotations/sec (max at full excite).
-                _rot_max = (_excited_mult / 2.0) * 360.0 * _ROT_EXCITE_SLIDER_PCT[self._sa_rot_level]
-                self._sa_rot_target = max(-_rot_max, min(_rot_max, self._sa_rot_target))
-                _beat_edge = self._sa_beat_detected and not self._sa_rot_prev_beat
-                self._sa_rot_prev_beat = self._sa_beat_detected
-                if _beat_edge and self._sa_rot_level > 0 and _rot_max > 0:
-                    if random.random() < _ROT_EXCITE_CENTER_PROB[self._sa_rot_level]:
-                        self._sa_rot_target = 0.0
-                    else:
-                        _cur_sign = math.copysign(1.0, self._sa_rot_current) if self._sa_rot_current != 0.0 else 1.0
-                        _sign = -_cur_sign if random.random() < _ROT_BEAT_FLIP_PROB else _cur_sign
-                        if abs(self._sa_rot_target) < _rot_max * 0.95 and random.random() < _ROT_MAX_HIT_PROB:
-                            self._sa_rot_target = _sign * _rot_max
-                        else:
-                            self._sa_rot_target = _sign * _rot_max * random.uniform(0.5, 1.0)
-                if _rot_max > 0 and abs(self._sa_rot_current - self._sa_rot_target) < max(1.0, _rot_max * 0.04):
-                    if random.random() < _ROT_EXCITE_CENTER_PROB[self._sa_rot_level]:
-                        self._sa_rot_target = 0.0
-                    else:
-                        _sign = math.copysign(1.0, self._sa_rot_target) if self._sa_rot_target != 0.0 else random.choice([-1.0, 1.0])
-                        self._sa_rot_target = -_sign * _rot_max * random.uniform(0.4, 1.0)
-                _rot_alpha = 1.0 - math.exp(-self._sa_rot_lerp_rate * _dt_c)
-                self._sa_rot_current += (self._sa_rot_target - self._sa_rot_current) * _rot_alpha
+                self._run_rot_state((_excited_mult / 2.0) * 360.0, _dt_c)
                 _circle_angle += math.radians(self._sa_rot_current) * _dt_c
             else:
                 _circle_angle += (_excited_mult / 2.0) * 2 * math.pi * _dt_c

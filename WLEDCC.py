@@ -978,9 +978,9 @@ class WLEDApp:
                 self._rebuild_scene_rows_for_mode()
                 for _st in self._scene_toggle_texts:
                     _st.value = "LEDFX SCENES"; _st.color = "white"
-                for _t in self._scene_toggle_btns:
-                    _t.bgcolor = "purple900"
-                    try: _t.update()
+                for _tc in self._scene_toggle_conts:
+                    _tc.bgcolor = "purple900"
+                    try: _tc.update()
                     except: pass
                 if self._restore_wled_scene_on_ledfx_stop and self.auto_restore_wled_scene:
                     self._restore_wled_scene_on_ledfx_stop = False
@@ -3093,12 +3093,50 @@ class WLEDApp:
             on_tap=self.toggle_ledfx, mouse_cursor=ft.MouseCursor.CLICK,
             content=self._ledfx_btn_cont_narrow,
         )
-        self.ledfx_ui_btn_wide   = ft.Button(content=ft.Row([ft.Icon(ft.Icons.OPEN_IN_BROWSER, color="white"), ft.Text("LEDFX UI", color="white")], spacing=4, tight=True), bgcolor="purple900", visible=False, on_click=lambda _: webbrowser.open_new_tab("http://localhost:8888/#/devices"), height=36)
-        self.ledfx_ui_btn_narrow = ft.Button(content=ft.Row([ft.Icon(ft.Icons.OPEN_IN_BROWSER, color="white"), ft.Text("LEDFX UI", color="white")], spacing=4, tight=True), bgcolor="purple900", visible=False, on_click=lambda _: webbrowser.open_new_tab("http://localhost:8888/#/devices"), height=36)
+        self._ledfx_ui_cont_wide = ft.Container(
+            height=36, border_radius=6, ink=True, alignment=ft.Alignment.CENTER,
+            padding=ft.Padding.symmetric(horizontal=14), bgcolor="purple900",
+            content=ft.Row([ft.Icon(ft.Icons.OPEN_IN_BROWSER, color="white"), ft.Text("LEDFX UI", color="white")], spacing=4, tight=True),
+        )
+        self.ledfx_ui_btn_wide = ft.GestureDetector(
+            on_tap=lambda _: webbrowser.open_new_tab("http://localhost:8888/#/devices"),
+            mouse_cursor=ft.MouseCursor.CLICK,
+            content=self._ledfx_ui_cont_wide,
+            visible=False,
+        )
+        self._ledfx_ui_cont_narrow = ft.Container(
+            height=36, border_radius=6, ink=True, alignment=ft.Alignment.CENTER,
+            padding=ft.Padding.symmetric(horizontal=14), bgcolor="purple900",
+            content=ft.Row([ft.Icon(ft.Icons.OPEN_IN_BROWSER, color="white"), ft.Text("LEDFX UI", color="white")], spacing=4, tight=True),
+        )
+        self.ledfx_ui_btn_narrow = ft.GestureDetector(
+            on_tap=lambda _: webbrowser.open_new_tab("http://localhost:8888/#/devices"),
+            mouse_cursor=ft.MouseCursor.CLICK,
+            content=self._ledfx_ui_cont_narrow,
+            visible=False,
+        )
         self._scene_toggle_text_wide   = ft.Text("LEDFX SCENES", color="white")
         self._scene_toggle_text_narrow = ft.Text("LEDFX SCENES", color="white")
-        self.scene_toggle_btn_wide   = ft.Button(content=ft.Row([ft.Icon(ft.Icons.SWAP_HORIZ, color="white"), self._scene_toggle_text_wide],  spacing=4, tight=True), bgcolor="purple900", visible=False, on_click=self.toggle_scene_mode, height=36)
-        self.scene_toggle_btn_narrow = ft.Button(content=ft.Row([ft.Icon(ft.Icons.SWAP_HORIZ, color="white"), self._scene_toggle_text_narrow], spacing=4, tight=True), bgcolor="purple900", visible=False, on_click=self.toggle_scene_mode, height=36)
+        self._scene_toggle_cont_wide = ft.Container(
+            height=36, border_radius=6, ink=True, alignment=ft.Alignment.CENTER,
+            padding=ft.Padding.symmetric(horizontal=14), bgcolor="purple900",
+            content=ft.Row([ft.Icon(ft.Icons.SWAP_HORIZ, color="white"), self._scene_toggle_text_wide], spacing=4, tight=True),
+        )
+        self.scene_toggle_btn_wide = ft.GestureDetector(
+            on_tap=self.toggle_scene_mode, mouse_cursor=ft.MouseCursor.CLICK,
+            content=self._scene_toggle_cont_wide,
+            visible=False,
+        )
+        self._scene_toggle_cont_narrow = ft.Container(
+            height=36, border_radius=6, ink=True, alignment=ft.Alignment.CENTER,
+            padding=ft.Padding.symmetric(horizontal=14), bgcolor="purple900",
+            content=ft.Row([ft.Icon(ft.Icons.SWAP_HORIZ, color="white"), self._scene_toggle_text_narrow], spacing=4, tight=True),
+        )
+        self.scene_toggle_btn_narrow = ft.GestureDetector(
+            on_tap=self.toggle_scene_mode, mouse_cursor=ft.MouseCursor.CLICK,
+            content=self._scene_toggle_cont_narrow,
+            visible=False,
+        )
         self.wledcc_update_btn = ft.Button(
             "UPDATE APP",
             icon=ft.Icons.SYSTEM_UPDATE_ALT,
@@ -3125,8 +3163,9 @@ class WLEDApp:
         self._ledfx_btn_conts   = [self._ledfx_btn_cont_wide,    self._ledfx_btn_cont_narrow]
         self._ledfx_btn_texts   = [self._ledfx_btn_text_wide,    self._ledfx_btn_text_narrow]
         self._ledfx_ui_btns     = [self.ledfx_ui_btn_wide,       self.ledfx_ui_btn_narrow]
-        self._scene_toggle_btns = [self.scene_toggle_btn_wide,   self.scene_toggle_btn_narrow]
-        self._scene_toggle_texts= [self._scene_toggle_text_wide, self._scene_toggle_text_narrow]
+        self._scene_toggle_btns  = [self.scene_toggle_btn_wide,    self.scene_toggle_btn_narrow]
+        self._scene_toggle_conts = [self._scene_toggle_cont_wide, self._scene_toggle_cont_narrow]
+        self._scene_toggle_texts = [self._scene_toggle_text_wide, self._scene_toggle_text_narrow]
         self._ledfx_update_btns = [self.ledfx_update_btn_wide,   self.ledfx_update_btn_narrow]
         self._progress_bars     = [self.update_progress_bar]
         self._percent_texts     = [self.update_percent_text]
@@ -3642,9 +3681,9 @@ class WLEDApp:
             for _st in self._scene_toggle_texts:
                 _st.value = "WLED SCENES"
                 _st.color = "white"
-            for _t in self._scene_toggle_btns:
-                _t.bgcolor = "blue900"
-                try: _t.update()
+            for _tc in self._scene_toggle_conts:
+                _tc.bgcolor = "blue900"
+                try: _tc.update()
                 except: pass
             self._rebuild_scene_rows_for_mode()
             self._schedule_ledfx_scene_restore_after_delay(delay=2.5)
@@ -3657,9 +3696,9 @@ class WLEDApp:
                 self._pending_ledfx_scene_restore = True
             for _st in self._scene_toggle_texts:
                 _st.value = "LOADING..."
-            for _t in self._scene_toggle_btns:
-                _t.bgcolor = "grey700"
-                try: _t.update()
+            for _tc in self._scene_toggle_conts:
+                _tc.bgcolor = "grey700"
+                try: _tc.update()
                 except: pass
             self.log("[Scene] Switched to LedFx scenes", color="purple")
             # Always fetch fresh scene list from LedFx when switching to LedFx mode
@@ -3669,9 +3708,9 @@ class WLEDApp:
             self._scene_mode = "wled"
             for _st in self._scene_toggle_texts:
                 _st.value = "LEDFX SCENES"; _st.color = "white"
-            for _t in self._scene_toggle_btns:
-                _t.bgcolor = "purple900"
-                try: _t.update()
+            for _tc in self._scene_toggle_conts:
+                _tc.bgcolor = "purple900"
+                try: _tc.update()
                 except: pass
             self.log("[Scene] Switched to WLED scenes", color="cyan")
             # Release all LedFx-controlled devices so LedFx stops streaming and
