@@ -15,6 +15,8 @@ pil_datas, pil_binaries, pil_hiddenimports = collect_all('PIL')
 
 _common_datas = [
     ('version.txt', '.'),
+    ('Manual.txt', '.'),
+    ('CHANGELOG.md', '.'),
     ('*.jpg', '.'),
     *flet_datas,
     *pil_datas,

@@ -1,31 +1,37 @@
 ## NEW FEATURES Added in V4.7.2 | #ff9800
 
-**Spectrum Analyzer**
-- is now a standalone app. Main program calls it and docks it to the top of the screen.
-- DETACH button on the SA screen opens a separate instance that runs much faster.
-- Docked SA shares resources with WLEDCC so runs slower. On older systems, use the sampling
-- and idle effect on/off buttons to disable the docked SA and detach standalone for best performance.
-- SA display now supports background images (Band Logos).
-- SA display is now resizable, featuring auto aspect toggle.
-- New Hallucination series of SA display modes.
-- New Modern series of SA display modes.
-- SA control buttons now appear on hover, placed along the top row. Clicking the open screen area opens the Settings menu.
-- SA display has a separate JSON config file. Changes can be tested live, then saved or undone from the menu.
-- Save writes to config; Undo loads the last saved config.
-- Added 2 random playback modes: per-song and timer-based. Cycles through a user-selected list of display modes.
-- Checkboxes in settings select which modes are included in random playback.
-- Split settings page into separate tabs: SA Settings, Random/Idle, Visual EQ, Sound Sources.
-- Added Previous/Next buttons on the SA display to manually cycle through modes and sub-modes.
+**Spectrum Analyzer — New Display Modes**
+- SA is now a standalone app docked to the top of the screen.
+- DETACH button opens a separate faster instance. Use it on older systems for best performance.
+- Previous/Next arrow buttons on the display cycle through modes without opening settings.
+- New Classic group sub-modes: Waveform, L/R Wave, Oscilloscope, XY Scope.
+- New Modern group: Beat Saber, Neon Cascade, Rock Stage.
+- New Hallucination group: Mirror, Chromatic, Fish Tank, Morphing.
+  Each has a selectable base layer. Morphing base layers: DNA, Rings, Super, Ribbon.
 
+**Beat Scanner**
+- Live BPM detection with beat flash indicator (white pulse on each beat).
+- BPM readout and detection confidence shown in the Beat Scanner panel.
+- Per-mode beat sensitivity slider. Hallucination modes rotate in sync with detected beats.
 
-**Python/Flet update**  
+**SA Settings — Save / Load / Backup**
+- SAVE button turns green when you have unsaved changes.
+- LOAD popup: Last Saved Settings / Factory Defaults / Load Backup.
+- Auto backup created before any reset or restore.
+
+**WLEDCC Settings — Save / Load / Backup**
+- New SAVE CONFIG button commits settings to disk immediately.
+- New LOAD / RESTORE button: Last Saved Settings / Factory Defaults / Load Backup.
+- Auto backup created before any reset or restore.
+
+**Python/Flet update**
 - Converted app to support Python 3.14 and latest dependencies.
 
 **Bug Fixes**
 - Fixed power-on state for auto-restore of scenes on startup.
 - Improved WLED / LedFx device control toggle behavior.
 - Adjusted default SA settings for better out-of-box performance.
-- Way too many to list — general stability and UI refinements throughout.
+- General stability and UI refinements throughout.
 
 ---
 
@@ -49,18 +55,30 @@ Truely a ALL-IN-ONE Control Center for your music room.
 ## SA AND VU METERS | cyan
 MIC ICON - click to turn ON/OFF.
 GEAR ICON - Open Spectrum Analyzer Settings.
-Control FPS, Reactivity, select Meter to show and more.
-Some meter modes allow custom backgrounds.  Select them from dropdown below.
-You can even put your own jpg image files in app folder and load those.
-CUSTOM VU - this mode only shows needles but allows you to load jpg for BG image.
-Set meters to be fixed, or change randomly when song ends or timer.
-DISPLAY MODES — Classic SA, VU (L/R), Cyber City, Neon Drift, Retro-Tech,
-Custom VU, HUD Reactor, Beat Saber, Neon Cascade, Rock Stage, Hallucination.
-HALLUCINATION SUB-MODES — Recursive Mirror, Chromatic Aberration,
-Perlin Flow Fields, Geometry Morphing all have Waveform, Circle, Particles and Bar modes.
+Control FPS, Reactivity, select mode and more.
+Some modes allow custom backgrounds. Select from dropdown or drop your own jpg in the app folder.
+CUSTOM VU - loads a jpg background and lets you build your own meter layout.
+Set meters to fixed mode, or switch randomly when a song ends or on a timer.
+
+CLASSIC — Spectrum, VU (L/R), Cyber City, HUD Reactor,
+Waveform, L/R Wave, Oscilloscope, XY Scope.
+VU METERS — Neon Drift, Retro-Tech, Custom VU.
+MODERN — Beat Saber, Neon Cascade, Rock Stage.
+HALLUCINATION — Mirror, Chromatic, Fish Tank, Morphing.
+Each Hallucination sub-mode has selectable base layers:
+Mirror / Chromatic / Fish Tank: Waveform, Circular, Particles, Bars.
+Morphing: DNA, Rings, Super, Ribbon.
+
+BEAT SCANNER — Detects beats in real time and shows BPM.
+Beat Flash pulses a white circle on each beat. Beat Sensitivity adjusts detection threshold.
+Hallucination modes react to beats with rotation animation.
+
+SAVE / LOAD — SA settings have their own Save and Load buttons.
+Save turns green when you have unsaved changes. Load offers Last Saved, Factory Defaults, or a Backup.
+
 IDLE EFFECTS — Runs when audio is silent after set delay timer.
 Options: Random Cycle, Pulse, Text, Pac-Man, Tetris, Invaders, Snake, Star Wars.
-SENSITIVITY — Global analyzer gain (Applies a sound volume multiplier to effects).
+SENSITIVITY — Global analyzer gain (applies a sound volume multiplier to effects).
 REACTIVITY — How quickly bars jump to new audio levels, and how briefly peak markers hold before dropping.
 BAR DECAY — How fast bars fall after a peak.
 PEAK DECAY — How fast peak markers fall.
@@ -92,10 +110,17 @@ CLEAR LOG clears the messages.
 only clears the screen, logs still saved to file.
 OPEN FOLDER opens to saved logs and config folder.
 DEBUG ON/OFF shows extra troubleshooting details.
-DBG / AUTO OPEN check boxs to have log auto open in DEBUG mode.
+DBG / AUTO OPEN check boxes to have log auto open in DEBUG mode.
 CLOSE LOG hides this window.
-While window is open, use grab bar botton center to size it.
+While window is open, use grab bar bottom center to size it.
 MANUAL — Opens this guide.
+SAVE CONFIG — Saves your current WLEDCC settings to disk right now.
+Button turns green when you have unsaved changes.
+LOAD / RESTORE — Reload settings from three sources:
+Last Saved Settings — reloads the last file you explicitly saved.
+Factory Defaults — clears all device cards and settings back to fresh install.
+Load Backup — pick from a list of auto-saved timestamped backups.
+A backup is automatically created before any reset or restore.
 MERGE — attempts to fix duplicate cards.  Use this if device appears twice.
 keeps ID so device is linked to scenes/presets still.  (WIP).
 click MERGE, then drag the new card onto the old one.
