@@ -238,7 +238,9 @@ class WLEDApp:
         self._sa_legacy_config = {}
         self.brightness_debounce_timer = None
         self._save_timer = None          # debounce timer for save_cache
-        self._session_backup_written = False  # write one backup per session only
+        self._session_backup_written   = False  # write one backup per session only
+        self._needs_pre_save_backup    = False  # set when load/reset must back up before next save
+        self._wledcc_dirty             = False  # True when loaded state not yet saved to disk
         self.current_master_bri = 128
         self.prev_master_bri = 128
         self.individual_brightness = {}
@@ -3465,30 +3467,7 @@ class WLEDApp:
         self._apply_header_layout(saved_w)
         self._apply_master_layout(saved_w)
         
-        # Restore mixed card order (WLED + custom) exactly as saved.
-        # Only force the + Add Device card to the end.
-        _ordered_keys = [
-            k for k in self.card_order
-            if k != "__add_device__" and (k in self.cached_data or k in self.custom_devices)
-        ]
-        for k in _ordered_keys:
-            if k in self.cached_data:
-                self.add_device_card(self.cached_data[k], k, initial_online=False, dev_type=self.device_types.get(k, "wled"))
-            elif k in self.custom_devices:
-                info = self.custom_devices[k]
-                self._add_custom_card(k, info["name"], info["url"], info.get("is_local", False), is_exe=info.get("is_exe", False))
-
-        # Add any new/unordered WLED cards.
-        for ip in [ip for ip in self.cached_data if ip not in _ordered_keys]:
-            self.add_device_card(self.cached_data[ip], ip, initial_online=False, dev_type=self.device_types.get(ip, "wled"))
-
-        # Add any new/unordered custom cards.
-        for key, info in self.custom_devices.items():
-            if key in _ordered_keys:
-                continue
-            self._add_custom_card(key, info["name"], info["url"], info.get("is_local", False), is_exe=info.get("is_exe", False))
-        # Always show the + add device card last
-        self._add_card_placeholder()
+        self._rebuild_cards_from_cache()
 
     # ── Scene management ─────────────────────────────────────────────────────
 
@@ -3972,6 +3951,192 @@ class WLEDApp:
         c["fx_label"].value = label.upper()
         c["preset_label"].value = label.upper()[:10] + ("…" if len(label) > 10 else "")
 
+    # ── Card rebuild / load-reset helpers ────────────────────────────────────
+
+    def _rebuild_cards_from_cache(self):
+        """Populate device_list from self.cached_data / custom_devices / card_order.
+
+        Mirrors the startup logic in setup_ui() and can be called any time after
+        _apply_cache() has restored the data dicts and _clear_all_cards() has
+        emptied the live state.
+        """
+        _ordered_keys = [
+            k for k in self.card_order
+            if k != "__add_device__" and (k in self.cached_data or k in self.custom_devices)
+        ]
+        for k in _ordered_keys:
+            if k in self.cached_data:
+                self.add_device_card(self.cached_data[k], k, initial_online=False,
+                                     dev_type=self.device_types.get(k, "wled"))
+            elif k in self.custom_devices:
+                info = self.custom_devices[k]
+                self._add_custom_card(k, info["name"], info["url"],
+                                      info.get("is_local", False), is_exe=info.get("is_exe", False))
+        for ip in [ip for ip in self.cached_data if ip not in _ordered_keys]:
+            self.add_device_card(self.cached_data[ip], ip, initial_online=False,
+                                 dev_type=self.device_types.get(ip, "wled"))
+        for key, info in self.custom_devices.items():
+            if key not in _ordered_keys:
+                self._add_custom_card(key, info["name"], info["url"],
+                                      info.get("is_local", False), is_exe=info.get("is_exe", False))
+        self._add_card_placeholder()
+
+    def _clear_all_cards(self):
+        """Clear all device cards from the UI and reset live-state tracking dicts."""
+        self.device_list.controls = []
+        self.devices        = {}
+        self.cards          = {}
+        self.wled_devices   = set()
+        self.ledfx_devices  = set()
+        self.live_ips       = set()
+        self.fail_counts    = {}
+        self.locks          = {}
+        self.effect_maps    = {}
+        try: self.device_list.update()
+        except: pass
+
+    def _wledcc_backup_now(self):
+        """Copy wledcc_cache.json to a timestamped backup unconditionally.
+
+        Unlike the session-backup inside _do_save_cache(), this fires regardless
+        of how many saves have already happened this session, so the pre-reset
+        state is always recoverable.
+        """
+        if not os.path.exists(CACHE_FILE):
+            return
+        try:
+            ts      = datetime.now().strftime("%Y%m%d_%H%M%S")
+            bak     = os.path.join(LOG_DIR, f"wledcc_cache_backup_{ts}.json")
+            shutil.copy2(CACHE_FILE, bak)
+            existing = sorted(glob.glob(os.path.join(LOG_DIR, "wledcc_cache_backup_*.json")))
+            while len(existing) > CACHE_BACKUP_MAX:
+                try: os.remove(existing.pop(0))
+                except: pass
+        except Exception:
+            pass
+
+    def _do_wledcc_load(self, _=None):
+        """Show the Load Settings popup for WLEDCC (My Saved / Factory Defaults / Backup)."""
+
+        def _apply_load(choice, backup_path=None):
+            if choice == "saved":
+                try:
+                    with open(CACHE_FILE, "r") as f:
+                        c = json.load(f)
+                except Exception:
+                    c = {}
+            elif choice == "defaults":
+                self._needs_pre_save_backup = True   # back up current file on next explicit Save
+                c = {}
+            else:   # backup
+                self._needs_pre_save_backup = True   # back up current file on next explicit Save
+                try:
+                    with open(backup_path, "r") as f:
+                        c = json.load(f)
+                except Exception:
+                    c = {}
+            self._wledcc_dirty = (choice != "saved")
+            self._apply_cache(c)
+            # Sync sliders whose .value was baked in at setup_ui() time
+            self._title_speed_slider.value  = self.title_speed
+            self._border_speed_slider.value = self.border_speed
+            for _s in self._master_sliders:
+                _s.value = self.current_master_bri
+            self._clear_all_cards()
+            self._rebuild_cards_from_cache()   # reads self._wledcc_dirty for save btn colour
+            self._refresh_scene_btn(0)
+            try: self.page.update()
+            except: pass
+            if choice == "defaults":
+                self.log("Reset to factory defaults — no cards until scan or backup loaded", "#ff9800")
+            elif choice == "backup":
+                self.log(f"Backup loaded: {os.path.basename(backup_path)}", "#4fc3f7")
+
+        def _show_backup_picker():
+            _baks = sorted(
+                glob.glob(os.path.join(LOG_DIR, "wledcc_cache_backup_*.json")),
+                reverse=True,
+            )
+            _has_current = os.path.exists(CACHE_FILE)
+            if not _baks and not _has_current:
+                self.log("No backups found", "#e74c3c")
+                return
+
+            def _fmt(fn):
+                try:
+                    ts = os.path.basename(fn).replace("wledcc_cache_backup_", "").replace(".json", "")
+                    return f"{ts[0:4]}-{ts[4:6]}-{ts[6:8]} {ts[9:11]}:{ts[11:13]}:{ts[13:15]}"
+                except Exception:
+                    return os.path.basename(fn)
+
+            _bpick = [None]
+
+            def _close_and_load(choice, path=None):
+                _bpick[0].open = False
+                self.page.update()
+                _apply_load(choice, backup_path=path)
+
+            def _cancel_bpick(_=None):
+                _bpick[0].open = False
+                self.page.update()
+
+            _entries = []
+            if _has_current:
+                _entries.append(ft.TextButton(
+                    "Current saved config",
+                    on_click=lambda _: _close_and_load("saved"),
+                    style=ft.ButtonStyle(color="#4fc3f7"),
+                ))
+                if _baks:
+                    _entries.append(ft.Divider(height=1, color="white12"))
+            _entries += [
+                ft.TextButton(_fmt(b), on_click=lambda _, b=b: _close_and_load("backup", b))
+                for b in _baks
+            ]
+            _total = len(_baks) + (2 if (_has_current and _baks) else 1 if _has_current else 0)
+            _rows = ft.Column(_entries, spacing=2, scroll=ft.ScrollMode.AUTO)
+            _bpick[0] = ft.AlertDialog(
+                title=ft.Text("Select Backup", color="cyan"),
+                content=ft.Container(content=_rows, width=260,
+                                     height=min(320, _total * 44 + 8)),
+                actions=[ft.TextButton("Cancel", on_click=_cancel_bpick)],
+            )
+            self.page.overlay.append(_bpick[0])
+            _bpick[0].open = True
+            self.page.update()
+
+        def _pick(choice):
+            dlg.open = False
+            self.page.update()
+            if choice == "backup":
+                _show_backup_picker()
+            elif choice != "cancel":
+                _apply_load(choice)
+
+        dlg = ft.AlertDialog(
+            title=ft.Text("Load Settings", color="cyan"),
+            actions=[
+                ft.TextButton("Last Saved Settings", on_click=lambda _: _pick("saved")),
+                ft.TextButton("Factory Defaults",  on_click=lambda _: _pick("defaults")),
+                ft.TextButton("Load Backup",       on_click=lambda _: _pick("backup")),
+                ft.TextButton("Cancel",            on_click=lambda _: _pick("cancel")),
+            ],
+        )
+        self.page.overlay.append(dlg)
+        dlg.open = True
+        self.page.update()
+
+    def _do_wledcc_save(self, _=None):
+        """Commit in-memory state to disk immediately, then refresh the save button colour."""
+        if self._save_timer is not None:
+            self._save_timer.cancel()
+            self._save_timer = None
+        self._do_save_cache()
+        self._wledcc_dirty = False
+        self._add_card_placeholder()
+        try: self.page.update()
+        except: pass
+
     # ── Add-device card ──────────────────────────────────────────────────────
 
     def _add_card_placeholder(self):
@@ -3993,12 +4158,41 @@ class WLEDApp:
                 bgcolor="#0e0e14",
                 ink=True,
                 on_click=self._show_add_device_dialog,
-                tooltip="Add a new device",
                 content=ft.Column([
                     ft.Icon(ft.Icons.ADD_CIRCLE_OUTLINE, size=32, color="#2b2b3b"),
                     ft.Text("ADD DEVICE", size=10, color="#2b2b3b", weight="bold"),
+                    ft.Row([
+                        ft.Button(
+                            content=ft.Row([
+                                ft.Icon(ft.Icons.SETTINGS_BACKUP_RESTORE, size=13, color="#4fc3f7"),
+                                ft.Text("LOAD / RESTORE", size=9, color="#4fc3f7", weight="bold"),
+                            ], spacing=4, tight=True),
+                            on_click=self._do_wledcc_load,
+                            bgcolor="#0d1f30",
+                            style=ft.ButtonStyle(
+                                padding=ft.Padding.symmetric(horizontal=8, vertical=4),
+                                side=ft.BorderSide(1, "#1e4060"),
+                            ),
+                            tooltip="Load saved settings, restore a backup, or reset to factory defaults",
+                        ),
+                        ft.Button(
+                            content=ft.Row([
+                                ft.Icon(ft.Icons.SAVE, size=13,
+                                        color="#4fffb0" if self._wledcc_dirty else "#4fc3f7"),
+                                ft.Text("SAVE CONFIG", size=9, weight="bold",
+                                        color="#4fffb0" if self._wledcc_dirty else "#4fc3f7"),
+                            ], spacing=4, tight=True),
+                            on_click=self._do_wledcc_save,
+                            bgcolor="#0d2b1a" if self._wledcc_dirty else "#0d1f30",
+                            style=ft.ButtonStyle(
+                                padding=ft.Padding.symmetric(horizontal=8, vertical=4),
+                                side=ft.BorderSide(1, "#1e6040" if self._wledcc_dirty else "#1e4060"),
+                            ),
+                            tooltip="Save current settings to disk",
+                        ),
+                    ], spacing=6, tight=True),
                 ], alignment="center", horizontal_alignment="center", spacing=6),
-                padding=ft.Padding.symmetric(vertical=24),
+                padding=ft.Padding.symmetric(vertical=14),
             ),
         )
         self.device_list.controls.append(placeholder)
@@ -9662,6 +9856,10 @@ class WLEDApp:
             "last_wled_scene_idx": self.last_wled_scene_idx,
         }
         try:
+            if self._needs_pre_save_backup:
+                self._wledcc_backup_now()
+                self._needs_pre_save_backup  = False
+                self._session_backup_written = True   # suppress the dict-dump backup below
             # Write one backup per session (at first save only), then only update main file
             if not self._session_backup_written:
                 ts = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -9676,6 +9874,14 @@ class WLEDApp:
             # Now write main file
             with open(CACHE_FILE, "w") as f:
                 json.dump(data, f)
+            if self._wledcc_dirty:
+                self._wledcc_dirty = False
+                async def _refresh_save_btn():
+                    self._add_card_placeholder()
+                    try: self.page.update()
+                    except: pass
+                try: self.page.run_task(_refresh_save_btn)
+                except: pass
         except:
             pass
     def on_refresh_click(self, e):

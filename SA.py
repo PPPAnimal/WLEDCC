@@ -2827,7 +2827,8 @@ class SpectrumController:
                     glob.glob(os.path.join(_DATA_DIR, "SA-config_backup_*.json")),
                     reverse=True,
                 )
-                if not _baks:
+                _has_current = os.path.exists(SA_CONFIG_FILE)
+                if not _baks and not _has_current:
                     self._status("No backups found", "red400")
                     return
 
@@ -2840,27 +2841,36 @@ class SpectrumController:
 
                 _bpick = [None]
 
-                def _load_bak(path):
+                def _close_and_load(choice, path=None):
                     _bpick[0].open = False
                     self.page.update()
-                    _apply_load("backup", config_path=path)
+                    _apply_load(choice, config_path=path)
 
                 def _cancel_bpick(_=None):
                     _bpick[0].open = False
                     self.page.update()
 
-                _rows = ft.Column(
-                    [ft.TextButton(_fmt(b), on_click=lambda _, b=b: _load_bak(b))
-                     for b in _baks],
-                    spacing=2,
-                    scroll=ft.ScrollMode.AUTO,
-                )
+                _entries = []
+                if _has_current:
+                    _entries.append(ft.TextButton(
+                        "Current saved config",
+                        on_click=lambda _: _close_and_load("saved"),
+                        style=ft.ButtonStyle(color="cyan"),
+                    ))
+                    if _baks:
+                        _entries.append(ft.Divider(height=1, color="white12"))
+                _entries += [
+                    ft.TextButton(_fmt(b), on_click=lambda _, b=b: _close_and_load("backup", b))
+                    for b in _baks
+                ]
+                _total = len(_baks) + (2 if (_has_current and _baks) else 1 if _has_current else 0)
+                _rows = ft.Column(_entries, spacing=2, scroll=ft.ScrollMode.AUTO)
                 _bpick[0] = ft.AlertDialog(
                     title=ft.Text("Select Backup"),
                     content=ft.Container(
                         content=_rows,
                         width=260,
-                        height=min(320, len(_baks) * 44 + 8),
+                        height=min(320, _total * 44 + 8),
                     ),
                     actions=[ft.TextButton("Cancel", on_click=_cancel_bpick)],
                 )
@@ -2879,7 +2889,7 @@ class SpectrumController:
             dlg = ft.AlertDialog(
                 title=ft.Text("Load Settings"),
                 actions=[
-                    ft.TextButton("My Saved Settings", on_click=lambda _: _pick("saved")),
+                    ft.TextButton("Last Saved Settings", on_click=lambda _: _pick("saved")),
                     ft.TextButton("Factory Defaults",  on_click=lambda _: _pick("defaults")),
                     ft.TextButton("Load Backup",       on_click=lambda _: _pick("backup")),
                     ft.TextButton("Cancel",            on_click=lambda _: _pick("cancel")),
@@ -6915,7 +6925,7 @@ class SpectrumController:
             if random.random() < _ROT_EXCITE_CENTER_PROB[_rot_level]:
                 self._sa_rot_target = 0.0
             else:
-                _sign = -math.copysign(1.0, self._sa_rot_target) if self._sa_rot_target != 0.0 else 1.0
+                _sign = math.copysign(1.0, self._sa_rot_target) if self._sa_rot_target != 0.0 else random.choice([-1.0, 1.0])
                 self._sa_rot_target = -_sign * _rot_max * random.uniform(0.4, 1.0)
         _alpha = 1.0 - math.exp(-self._sa_rot_lerp_rate * _rot_dt)
         self._sa_rot_current += (self._sa_rot_target - self._sa_rot_current) * _alpha
@@ -7611,7 +7621,7 @@ class SpectrumController:
                     if random.random() < _ROT_EXCITE_CENTER_PROB[self._sa_rot_level]:
                         self._sa_rot_target = 0.0
                     else:
-                        _sign = -math.copysign(1.0, self._sa_rot_target) if self._sa_rot_target != 0.0 else 1.0
+                        _sign = math.copysign(1.0, self._sa_rot_target) if self._sa_rot_target != 0.0 else random.choice([-1.0, 1.0])
                         self._sa_rot_target = -_sign * _rot_max * random.uniform(0.4, 1.0)
                 _rot_alpha = 1.0 - math.exp(-self._sa_rot_lerp_rate * _dt_c)
                 self._sa_rot_current += (self._sa_rot_target - self._sa_rot_current) * _rot_alpha
