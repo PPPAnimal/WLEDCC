@@ -26,6 +26,7 @@ import json
 import math
 import random
 import glob
+import shutil
 import colorsys
 import subprocess
 import ctypes
@@ -1058,6 +1059,7 @@ class SpectrumController:
         self._spec_source_changed   = False
         self._config_dirty               = False
         self._sa_session_backup_written  = False
+        self._needs_pre_save_backup      = False
         self._menu_open             = False
         self._menu_panel_gen        = 0
         self._settings_save_btn      = None
@@ -1100,8 +1102,29 @@ class SpectrumController:
                           "auto_rot": True, "auto_spread": True},
             "waveform":  {"helix_amp": 0.36, "helix_k": 0.045, "helix_rungs": 18,
                           "helix_amp_auto": False, "helix_k_auto": False, "helix_rungs_auto": False},
-            "particles": {"sf_m_speed": 0.25, "sf_m_max": 8.0, "sf_n1": 0.55,
-                          "sf_m_speed_auto": False, "sf_m_max_auto": False, "sf_n1_auto": False},
+            "particles": {
+                "trail":         0.55,
+                "interval":      7.0,
+                "xfade":         1.6,
+                "spin":          0.55,
+                "yaw":           0.45,
+                "tilt":          0.22,
+                "perspective":   0.45,
+                "orbit_x":       3.4,
+                "orbit_z":       1.9,
+                "orbit_wobble":  0.30,
+                "split_gate":    0.50,
+                "merge_quiet":   2.5,
+                "beat_lock":     1.4,
+                "hue_drift":     0.05,
+                "shapes_enabled": [
+                    "circle", "star5", "rose5", "lemniscate",
+                    "trefoil", "torus_53", "torus_72",
+                    "maurer_6", "maurer_8", "butterfly",
+                    "spiro_5", "warped",
+                    "slinky", "globe", "donut", "box", "cube_x", "mobius", "dna",
+                ],
+            },
             "bars":      {"liss_a": 3.0, "liss_b": 2.0, "liss_phi_rate": 0.5,
                           "liss_a_auto": False, "liss_b_auto": False, "liss_phi_rate_auto": False},
         }
@@ -1194,7 +1217,8 @@ class SpectrumController:
 
     # ── Config ───────────────────────────────────────────────────────────────
 
-    def load_config(self, legacy_config=None, preserve_mode=False):
+    def load_config(self, legacy_config=None, preserve_mode=False,
+                    reset_to_defaults=False, config_path=None):
         """Load SA settings from SA-config.json.
 
         If the file is absent or empty and *legacy_config* is supplied (a dict
@@ -1203,17 +1227,28 @@ class SpectrumController:
 
         If *preserve_mode* is True the currently active display mode is kept
         and only its per-mode settings are reloaded (used by the Reload button).
+
+        If *reset_to_defaults* is True all settings revert to their hardcoded
+        defaults (equivalent to first-run with no config file).  The caller is
+        responsible for marking the config dirty and rebuilding the panel.
+
+        If *config_path* is supplied, that file is read instead of SA_CONFIG_FILE
+        (used to restore a backup without overwriting the active file first).
         """
         _active_mode = self._spec_mode
         def _clamp(v, lo, hi, default):
             try:   return max(lo, min(hi, float(v)))
             except: return default
 
-        try:
-            with open(SA_CONFIG_FILE, "r", encoding="utf-8") as f:
-                c = json.load(f)
-        except Exception:
+        if reset_to_defaults:
             c = {}
+        else:
+            _src = config_path or SA_CONFIG_FILE
+            try:
+                with open(_src, "r", encoding="utf-8") as f:
+                    c = json.load(f)
+            except Exception:
+                c = {}
         self._config_dirty = False
 
         # One-time migration: use parent app's cached values when our own file
@@ -1360,7 +1395,18 @@ class SpectrumController:
         # Load per-path config store (with one-time migration from older save formats)
         _idle_keys = {"idle_timeout", "idle_effect", "idle_speed", "idle_cycle_effects"}
         self._spec_mode_configs = {}
-        if "spec_mode_configs" in c:
+        if reset_to_defaults:
+            # Reset submode params to their hardcoded defaults.
+            # _apply_per_mode_settings won't touch this dict when _spec_mode_configs is empty,
+            # so it must be reset here explicitly.
+            self._spec_hallu_params_per_submode = {
+                "mirror":   {"zoom": 0.85, "rotDeg": 10.0, "opacity": 1.0, "beat_sens": 2.0, "dim_thresh": 0.08},
+                "chroma":   {"maxSplit": 14, "trail": 0.18, "speed": 1.0, "auto_speed": True},
+                "perlin":   {"noiseScale": 0.012, "evolveRate": 0.30},
+                "morph":    {"beat_sens": 1.0},
+            }
+            # _spec_mode_configs stays {} — migration must not run on factory reset
+        elif "spec_mode_configs" in c:
             for _k, _v in c["spec_mode_configs"].items():
                 if isinstance(_k, str) and isinstance(_v, dict):
                     self._spec_mode_configs[_k] = {ik: iv for ik, iv in _v.items()
@@ -1394,8 +1440,29 @@ class SpectrumController:
                           "auto_rot": True, "auto_spread": True},
             "waveform":  {"helix_amp": 0.36, "helix_k": 0.045, "helix_rungs": 18,
                           "helix_amp_auto": False, "helix_k_auto": False, "helix_rungs_auto": False},
-            "particles": {"sf_m_speed": 0.25, "sf_m_max": 8.0, "sf_n1": 0.55,
-                          "sf_m_speed_auto": False, "sf_m_max_auto": False, "sf_n1_auto": False},
+            "particles": {
+                "trail":         0.55,
+                "interval":      7.0,
+                "xfade":         1.6,
+                "spin":          0.55,
+                "yaw":           0.45,
+                "tilt":          0.22,
+                "perspective":   0.45,
+                "orbit_x":       3.4,
+                "orbit_z":       1.9,
+                "orbit_wobble":  0.30,
+                "split_gate":    0.50,
+                "merge_quiet":   2.5,
+                "beat_lock":     1.4,
+                "hue_drift":     0.05,
+                "shapes_enabled": [
+                    "circle", "star5", "rose5", "lemniscate",
+                    "trefoil", "torus_53", "torus_72",
+                    "maurer_6", "maurer_8", "butterfly",
+                    "spiro_5", "warped",
+                    "slinky", "globe", "donut", "box", "cube_x", "mobius", "dna",
+                ],
+            },
             "bars":      {"liss_a": 3.0, "liss_b": 2.0, "liss_phi_rate": 0.5,
                           "liss_a_auto": False, "liss_b_auto": False, "liss_phi_rate_auto": False},
         }
@@ -1430,6 +1497,27 @@ class SpectrumController:
 
         if os.path.basename(sys.argv[0]).lower().startswith("sa"):
             self._start_pos_tracker()
+
+    def _backup_config_now(self):
+        """Copy SA-config.json to a timestamped backup unconditionally.
+
+        Unlike the session-backup inside save_config(), this fires regardless
+        of how many saves have already happened this session.  Called before
+        loading factory defaults or restoring a backup so the current file is
+        always recoverable.
+        """
+        if not os.path.exists(SA_CONFIG_FILE):
+            return
+        _ts  = time.strftime("%Y%m%d_%H%M%S")
+        _bak = os.path.join(_DATA_DIR, f"SA-config_backup_{_ts}.json")
+        try:
+            shutil.copy2(SA_CONFIG_FILE, _bak)
+            _existing = sorted(glob.glob(os.path.join(_DATA_DIR, "SA-config_backup_*.json")))
+            while len(_existing) > 10:
+                try: os.remove(_existing.pop(0))
+                except: pass
+        except Exception:
+            pass
 
     def save_config(self, win_pos=None):
         """Persist SA settings to SA-config.json.
@@ -1491,6 +1579,12 @@ class SpectrumController:
             }
             if win_pos:
                 c.update(win_pos)
+            if self._needs_pre_save_backup:
+                # User loaded defaults or a backup and is now saving — copy the
+                # on-disk file (old config) to a backup BEFORE overwriting it.
+                self._backup_config_now()
+                self._needs_pre_save_backup      = False
+                self._sa_session_backup_written  = True   # suppress the dict-dump below
             if not self._sa_session_backup_written:
                 _ts  = time.strftime("%Y%m%d_%H%M%S")
                 _bak = os.path.join(_DATA_DIR, f"SA-config_backup_{_ts}.json")
@@ -1499,7 +1593,7 @@ class SpectrumController:
                         json.dump(c, _bf, indent=2)
                     self._sa_session_backup_written = True
                     _existing = sorted(glob.glob(os.path.join(_DATA_DIR, "SA-config_backup_*.json")))
-                    while len(_existing) > 5:
+                    while len(_existing) > 10:
                         try: os.remove(_existing.pop(0))
                         except: pass
                 except Exception:
@@ -2702,17 +2796,98 @@ class SpectrumController:
             _clear_panel_refs()
             self._close_menu_panel()
 
-        def _do_reload(_=None):
-            _tab = _tabs.selected_index
-            _keep_mode = self._spec_mode
-            self._spec_mode_transitioning = True
-            try:
-                _clear_panel_refs()
-                self.load_config(preserve_mode=True)
-                self._spec_mode = _keep_mode
-            finally:
-                self._spec_mode_transitioning = False
-            self._show_combined_settings(initial_tab=_tab)
+        def _do_load(_=None):
+            def _apply_load(choice, config_path=None):
+                _tab  = _tabs.selected_index
+                _keep = self._spec_mode
+                self._spec_mode_transitioning = True
+                try:
+                    _clear_panel_refs()
+                    if choice == "saved":
+                        self.load_config(preserve_mode=True)
+                    elif choice == "defaults":
+                        self.load_config(preserve_mode=True, reset_to_defaults=True)
+                    else:
+                        self.load_config(preserve_mode=True, config_path=config_path)
+                    self._spec_mode = _keep
+                finally:
+                    self._spec_mode_transitioning = False
+                if choice != "saved":
+                    self._needs_pre_save_backup  = True
+                    self._config_dirty           = True
+                self._menu_last_tab          = _tab
+                self._menu_rebuild_requested = True
+                if choice == "defaults":
+                    self._status("Factory defaults loaded — click Save to apply", "orange400")
+                elif choice == "backup":
+                    self._status(f"Backup loaded: {os.path.basename(config_path)}", "blue400")
+
+            def _show_backup_picker():
+                _baks = sorted(
+                    glob.glob(os.path.join(_DATA_DIR, "SA-config_backup_*.json")),
+                    reverse=True,
+                )
+                if not _baks:
+                    self._status("No backups found", "red400")
+                    return
+
+                def _fmt(fn):
+                    try:
+                        ts = os.path.basename(fn).replace("SA-config_backup_", "").replace(".json", "")
+                        return f"{ts[0:4]}-{ts[4:6]}-{ts[6:8]} {ts[9:11]}:{ts[11:13]}:{ts[13:15]}"
+                    except Exception:
+                        return os.path.basename(fn)
+
+                _bpick = [None]
+
+                def _load_bak(path):
+                    _bpick[0].open = False
+                    self.page.update()
+                    _apply_load("backup", config_path=path)
+
+                def _cancel_bpick(_=None):
+                    _bpick[0].open = False
+                    self.page.update()
+
+                _rows = ft.Column(
+                    [ft.TextButton(_fmt(b), on_click=lambda _, b=b: _load_bak(b))
+                     for b in _baks],
+                    spacing=2,
+                    scroll=ft.ScrollMode.AUTO,
+                )
+                _bpick[0] = ft.AlertDialog(
+                    title=ft.Text("Select Backup"),
+                    content=ft.Container(
+                        content=_rows,
+                        width=260,
+                        height=min(320, len(_baks) * 44 + 8),
+                    ),
+                    actions=[ft.TextButton("Cancel", on_click=_cancel_bpick)],
+                )
+                self.page.overlay.append(_bpick[0])
+                _bpick[0].open = True
+                self.page.update()
+
+            def _pick(choice):
+                dlg.open = False
+                self.page.update()
+                if choice == "backup":
+                    _show_backup_picker()
+                elif choice != "cancel":
+                    _apply_load(choice)
+
+            dlg = ft.AlertDialog(
+                title=ft.Text("Load Settings"),
+                actions=[
+                    ft.TextButton("My Saved Settings", on_click=lambda _: _pick("saved")),
+                    ft.TextButton("Factory Defaults",  on_click=lambda _: _pick("defaults")),
+                    ft.TextButton("Load Backup",       on_click=lambda _: _pick("backup")),
+                    ft.TextButton("Cancel",            on_click=lambda _: _pick("cancel")),
+                ],
+            )
+            self.page.overlay.append(dlg)
+            dlg.open = True
+            self.page.update()
 
         def _do_save(_=None):
             self._save_spec_profile()
@@ -3451,54 +3626,87 @@ class SpectrumController:
             ], spacing=2, visible=(_is_hallu and _cur_sub == "morph"))
 
         elif _cur_base == "particles":
-            _sf_spd_init = float(_bp.get("sf_m_speed", 0.25))
-            _sf_max_init = float(_bp.get("sf_m_max",   8.0))
-            _sf_n1_init  = float(_bp.get("sf_n1",      0.55))
-            _sf_spd_auto = bool(_bp.get("sf_m_speed_auto", False))
-            _sf_max_auto = bool(_bp.get("sf_m_max_auto",   False))
-            _sf_n1_auto  = bool(_bp.get("sf_n1_auto",      False))
+            _me_bp = self._spec_hallu_base_params.get("particles", {})
 
-            _sf_spd_lbl = ft.Text(f"{_sf_spd_init:.2f}", size=11, color="#ff9800", width=42)
-            _sf_max_lbl = ft.Text(f"{_sf_max_init:.1f}", size=11, color="#ff9800", width=42)
-            _sf_n1_lbl  = ft.Text(f"{_sf_n1_init:.2f}",  size=11, color="#ff9800", width=42)
+            def _morph_slider(label, key, _min, _max, divs, fmt):
+                _init = float(_me_bp.get(key, 0.0))
+                _lbl  = ft.Text(fmt(_init), size=11, color="#ff9800", width=46)
+                def _on(e):
+                    v = round(float(e.control.value), 3)
+                    _base_param_set("particles", key, v)
+                    _lbl.value = fmt(v); _lbl.update()
+                return ft.Row([
+                    ft.Text(label, size=11, color="grey400", width=100),
+                    ft.Slider(min=_min, max=_max, value=_init, divisions=divs,
+                              on_change=_on, width=150),
+                    _lbl,
+                ], spacing=8, vertical_alignment=ft.CrossAxisAlignment.CENTER)
 
-            def _on_sf_spd(e):
-                v = round(float(e.control.value), 2)
-                _base_param_set("particles", "sf_m_speed", v)
-                _sf_spd_lbl.value = f"{v:.2f}"; _sf_spd_lbl.update()
-            def _on_sf_max(e):
-                v = round(float(e.control.value), 1)
-                _base_param_set("particles", "sf_m_max", v)
-                _sf_max_lbl.value = f"{v:.1f}"; _sf_max_lbl.update()
-            def _on_sf_n1(e):
-                v = round(float(e.control.value), 2)
-                _base_param_set("particles", "sf_n1", v)
-                _sf_n1_lbl.value = f"{v:.2f}"; _sf_n1_lbl.update()
+            _me_sliders = ft.Column([
+                _morph_slider("Trail",       "trail",        0.0,  0.9,  90, lambda v: f"{v:.2f}"),
+                _morph_slider("Morph every", "interval",     2.0, 20.0,  36, lambda v: f"{v:.1f}s"),
+                _morph_slider("Crossfade",   "xfade",        0.2,  5.0,  48, lambda v: f"{v:.1f}s"),
+                ft.Divider(height=8, color="#222"),
+                _morph_slider("Spin rate",   "spin",         0.0,  2.0,  40, lambda v: f"{v:.2f}"),
+                _morph_slider("Yaw rate",    "yaw",          0.0,  1.5,  30, lambda v: f"{v:.2f}"),
+                _morph_slider("Tilt rate",   "tilt",         0.0,  1.0,  50, lambda v: f"{v:.2f}"),
+                _morph_slider("Perspective", "perspective",  0.0,  1.0,  50, lambda v: f"{v:.2f}"),
+                ft.Divider(height=8, color="#222"),
+                _morph_slider("Orbit width", "orbit_x",      1.0,  5.0,  40, lambda v: f"{v:.1f}"),
+                _morph_slider("Orbit depth", "orbit_z",      0.3,  2.5,  44, lambda v: f"{v:.2f}"),
+                _morph_slider("Wobble",      "orbit_wobble", 0.0,  0.8,  40, lambda v: f"{v:.2f}"),
+                ft.Divider(height=8, color="#222"),
+                _morph_slider("Split gate",  "split_gate",   0.2,  0.95, 75, lambda v: f"{v:.2f}"),
+                _morph_slider("Merge after", "merge_quiet",  0.5,  6.0,  55, lambda v: f"{v:.1f}s"),
+                _morph_slider("Beat lock",   "beat_lock",    0.2,  4.0,  38, lambda v: f"{v:.1f}s"),
+                _morph_slider("Hue drift",   "hue_drift",    0.0,  0.5,  50, lambda v: f"{v:.3f}"),
+            ], spacing=4, tight=True)
 
-            _morph_sliders_col = ft.Column([
-                ft.Row([ft.Text("M Sweep Speed:", size=11, color="grey400", width=100),
-                        ft.Slider(min=0.05, max=1.0, value=_sf_spd_init,
-                                  divisions=19, on_change=_on_sf_spd, width=140),
-                        _sf_spd_lbl,
-                        ft.Checkbox(label="Auto", value=_sf_spd_auto,
-                            on_change=lambda e: _base_param_set("particles","sf_m_speed_auto", bool(e.control.value)),
-                            active_color="#ff9800", scale=0.8)], spacing=4),
-                ft.Row([ft.Text("M Sweep Range:", size=11, color="grey400", width=100),
-                        ft.Slider(min=4, max=12, value=_sf_max_init,
-                                  divisions=16, on_change=_on_sf_max, width=140),
-                        _sf_max_lbl,
-                        ft.Checkbox(label="Auto", value=_sf_max_auto,
-                            on_change=lambda e: _base_param_set("particles","sf_m_max_auto", bool(e.control.value)),
-                            active_color="#ff9800", scale=0.8)], spacing=4),
-                ft.Row([ft.Text("Puffiness Bias:", size=11, color="grey400", width=100),
-                        ft.Slider(min=0.4, max=1.5, value=_sf_n1_init,
-                                  divisions=22, on_change=_on_sf_n1, width=140),
-                        _sf_n1_lbl,
-                        ft.Checkbox(label="Auto", value=_sf_n1_auto,
-                            on_change=lambda e: _base_param_set("particles","sf_n1_auto", bool(e.control.value)),
-                            active_color="#ff9800", scale=0.8)], spacing=4),
+            _shape_groups = [
+                ("Flat", ["circle","liss32","star5","rose5","lemniscate","nephroid","spiro_4"]),
+                ("Epic", ["trefoil","torus_53","torus_72","maurer_6","maurer_8",
+                          "butterfly","spiro_5","warped"]),
+                ("3D",   ["slinky","globe","donut","box","cube_x","mobius","dna"]),
+            ]
+            _enabled_set = set(_me_bp.get("shapes_enabled", []))
+
+            def _on_shape_toggle(name, e):
+                cur = list(self._spec_hallu_base_params.setdefault("particles", {})
+                           .get("shapes_enabled", []))
+                if e.control.value:
+                    if name not in cur: cur.append(name)
+                else:
+                    cur = [n for n in cur if n != name]
+                _base_param_set("particles", "shapes_enabled", sorted(set(cur)))
+
+            _shape_columns = []
+            for _gname, _names in _shape_groups:
+                _kids = [ft.Text(_gname, size=11, color="grey500",
+                                 weight=ft.FontWeight.W_600)]
+                for _nm in _names:
+                    _kids.append(ft.Checkbox(
+                        label=_nm, value=(_nm in _enabled_set),
+                        on_change=lambda e, nm=_nm: _on_shape_toggle(nm, e),
+                        active_color="#ff9800",
+                        label_style=ft.TextStyle(size=11, color="grey300"),
+                    ))
+                _shape_columns.append(ft.Column(_kids, spacing=2, tight=True))
+
+            _me_panel = ft.Column([
+                _me_sliders,
+                ft.Divider(height=10, color="#222"),
+                ft.Text("Shape pool", size=11, color="grey400"),
+                ft.Row(_shape_columns, spacing=18,
+                       vertical_alignment=ft.CrossAxisAlignment.START),
                 _make_beat_params_col(True, src=self._spec_hallu_params_per_submode.get("morph", {})),
-            ], spacing=2, visible=(_is_hallu and _cur_sub == "morph"))
+            ], spacing=6, tight=True)
+
+            _morph_sliders_col = ft.Column(
+                [_me_panel],
+                scroll=ft.ScrollMode.AUTO,
+                height=380,
+                visible=(_is_hallu and _cur_sub == "morph"),
+            )
 
         else:  # "bars" — Lissajous Ribbon
             _ls_a_init   = float(_bp.get("liss_a",        3.0))
@@ -4204,7 +4412,7 @@ class SpectrumController:
                 _tabs,
                 ft.Divider(height=1, color="grey700"),
                 ft.Row([
-                    ft.TextButton("UNDO", on_click=_do_reload),
+                    ft.TextButton("LOAD", on_click=_do_load),
                     _save_btn,
                     _save_exit_btn,
                     _close_row_btn,
@@ -4231,8 +4439,8 @@ class SpectrumController:
             self._menu_rebuild_requested = False
             try:
                 self._show_combined_settings(initial_tab=self._menu_last_tab)
-            except Exception:
-                pass
+            except Exception as _rebuild_ex:
+                self._status(f"Panel rebuild error: {_rebuild_ex}", "red400")
 
         self._compute_audio_frame()
         _mode = str(self._spec_mode or "classic").lower()
@@ -8015,77 +8223,382 @@ class SpectrumController:
                     draw.rectangle((rx-1, cy-1, rx+1, cy+1), fill=sp_col)
             return faded
 
-        # ── Superformula ──────────────────────────────────────────────────────
+        # ── Morph Engine — 3D orbital one-stroke shape carousel ──────────────
+        # Uses its own real-time clock: the function-level `dt` is peak-warped;
+        # real seconds are required for orbit periods and beat-lock timers.
         if kind == "particles":
-            try:
-                import numpy as np
-                _np_ok = True
-            except ImportError:
-                _np_ok = False
-            faded = _PILImage.blend(_PILImage.new("RGBA", (W, H), (0, 0, 0, 255)),
-                                    self._spec_hallu_prev_frame, 0.78)
-            draw  = _PILDraw.Draw(faded, "RGBA")
-            cx, cy   = W / 2, H / 2
-            base_rx  = W * 0.46
-            base_ry  = H * 0.44
-            sf_speed = bp.get("sf_m_speed", 0.25)
-            sf_max   = bp.get("sf_m_max",   8.0)
-            sf_n1    = bp.get("sf_n1",       0.55)
-            # Blend between two adjacent integer m's so the superformula always
-            # closes: r(0)=r(2π) only holds when m is an integer, so non-integer
-            # m produces a gap. Smoothstep-blending two integer-m curves keeps
-            # the animation smooth and guarantees both endpoints are identical.
-            m_float = 3 + (math.sin(t * sf_speed) * 0.5 + 0.5) * sf_max + mid * 0.8
-            m_low   = int(math.floor(m_float))
-            m_high  = m_low + 1
-            _frac   = m_float - m_low
-            blend   = _frac * _frac * (3 - 2 * _frac)   # smoothstep
-            n1 = sf_n1 + bass * 0.30
-            n2 = 1.50 + treble * 0.50
-            n3 = n2
-            N  = 360
-            _TWO_PI = 2 * math.pi
+            real_dt = float(_dt) if _dt is not None else (1.0 / 30.0)
+            if real_dt <= 0 or real_dt > 0.2:
+                real_dt = 1.0 / 30.0
+            me_t = aux.get("me_t", 0.0) + real_dt
+            aux["me_t"] = me_t
+            TWO_PI = 2.0 * math.pi
 
-            def _sf_samples(m_int):
-                if _np_ok:
-                    theta = np.linspace(0, _TWO_PI, N + 1, dtype=np.float32)
-                    t1 = np.abs(np.cos(m_int * theta / 4)) ** n2
-                    t2 = np.abs(np.sin(m_int * theta / 4)) ** n3
-                    s  = t1 + t2
-                    with np.errstate(divide="ignore", invalid="ignore"):
-                        r_a = np.where(s > 1e-9, s ** (-1.0 / n1), 0.0)
-                    r_a = np.where(np.isfinite(r_a), r_a, 0.0)
-                    mx  = float(r_a.max()) or 1.0
-                    return (r_a / mx).tolist()
+            trail        = float(bp.get("trail",         0.55))
+            interval     = float(bp.get("interval",      7.0))
+            xfade        = float(bp.get("xfade",         1.6))
+            spin_rate    = float(bp.get("spin",          0.55))
+            yaw_rate     = float(bp.get("yaw",           0.45))
+            tilt_rate    = float(bp.get("tilt",          0.22))
+            persp        = float(bp.get("perspective",   0.45))
+            orbit_x      = float(bp.get("orbit_x",       3.4))
+            orbit_z      = float(bp.get("orbit_z",       1.9))
+            orbit_wobble = float(bp.get("orbit_wobble",  0.30))
+            split_gate   = float(bp.get("split_gate",    0.50))
+            merge_quiet  = float(bp.get("merge_quiet",   2.5))
+            beat_lock    = float(bp.get("beat_lock",     1.4))
+            hue_drift    = float(bp.get("hue_drift",     0.05))
+            enabled_names = list(bp.get("shapes_enabled", []))
+
+            # ── Shape library — every curve returns (x, y, z), closed at u=2π
+            def s_circle(u):     return (math.cos(u), math.sin(u), 0.0)
+            def s_liss32(u):     return (math.sin(3*u), math.sin(2*u), 0.0)
+            def s_rose5(u):
+                r = math.cos(5*u); return (r*math.cos(u), r*math.sin(u), 0.0)
+            def s_lemniscate(u):
+                d = 1.0 + math.sin(u)**2
+                return (math.cos(u)/d, math.sin(u)*math.cos(u)/d, 0.0)
+            def s_nephroid(u):
+                return ((3*math.cos(u) - math.cos(3*u))/4.0,
+                        (3*math.sin(u) - math.sin(3*u))/4.0, 0.0)
+            def s_star5(u):
+                r = 0.55 + 0.45*math.cos(5*u)
+                return (r*math.cos(u), r*math.sin(u), 0.0)
+
+            def _torus_flat(p_, q_, R=1.0, r=0.45):
+                norm = R + r
+                def f(u):
+                    rr = R + r*math.cos(q_*u)
+                    return ((rr*math.cos(p_*u))/norm, (rr*math.sin(p_*u))/norm, 0.0)
+                return f
+            s_trefoil  = _torus_flat(2, 3)
+            s_torus_53 = _torus_flat(5, 3)
+            s_torus_72 = _torus_flat(7, 2)
+
+            def _maurer(k_, d_deg):
+                d_ = math.radians(d_deg)
+                def f(u):
+                    n  = (u / TWO_PI) * 360.0
+                    th = n * d_
+                    r  = math.cos(k_ * th)
+                    return (r*math.cos(th), r*math.sin(th), 0.0)
+                return f
+            s_maurer_6 = _maurer(6, 71)
+            s_maurer_8 = _maurer(8, 139)
+
+            def s_butterfly(u):
+                u4    = u * 4.0
+                e     = math.exp(math.cos(u4))
+                drift = math.sin(u4 * 0.5) ** 5
+                fac   = e - 2.0*math.cos(4*u4) - drift
+                return ((math.sin(u4) * fac) / 5.5,
+                        (math.cos(u4) * fac) / 5.5, 0.0)
+
+            def _hypotrochoid(R, r, d):
+                norm = abs(R - r) + abs(d)
+                k_   = (R - r) / r
+                def f(u):
+                    return (((R-r)*math.cos(u) + d*math.cos(k_*u)) / norm,
+                            ((R-r)*math.sin(u) - d*math.sin(k_*u)) / norm, 0.0)
+                return f
+            s_spiro_5 = _hypotrochoid(5, 1, 1.6)
+            s_spiro_4 = _hypotrochoid(4, 1, 0.9)
+
+            def s_warped(u):
+                pm = 0.55 * math.sin(7*u)
+                return (math.sin(3*u + pm), math.sin(2*u), 0.0)
+
+            def s_slinky(u):
+                R, r, q_ = 0.72, 0.28, 14
+                rr = R + r*math.cos(q_*u)
+                return (rr*math.cos(u), r*math.sin(q_*u), rr*math.sin(u))
+
+            def s_globe(u):
+                lat = (math.pi/2) * math.sin(u)
+                lon = u * 12.0
+                c   = math.cos(lat)
+                return (c*math.cos(lon), math.sin(lat), c*math.sin(lon))
+
+            def s_donut(u):
+                R, r, P, Q = 0.7, 0.3, 2, 5
+                rr = R + r*math.cos(Q*u)
+                return (rr*math.cos(P*u), r*math.sin(Q*u), rr*math.sin(P*u))
+
+            _CUBE_V = [(-1,-1,-1), ( 1,-1,-1), ( 1, 1,-1), (-1, 1,-1),
+                       (-1,-1, 1), ( 1,-1, 1), ( 1, 1, 1), (-1, 1, 1)]
+            _CUBE_PATH   = [0,1,2,3,0,4,5,1,5,6,2,6,7,3,7,4,0]
+            _CUBE_X_PATH = [0,1,2,3,0,4,5,1,5,6,2,6,7,3,7,4,0,6,1,7,2,4,3,5,0]
+
+            def _polyline3(path_):
+                verts = _CUBE_V
+                segs  = len(path_) - 1
+                def f(u):
+                    f0 = (u / TWO_PI) * segs
+                    i_ = min(segs - 1, int(f0))
+                    tt = f0 - i_
+                    a  = verts[path_[i_]]
+                    b  = verts[path_[i_+1]]
+                    s_ = 0.85
+                    return ((a[0] + (b[0]-a[0])*tt) * s_,
+                            (a[1] + (b[1]-a[1])*tt) * s_,
+                            (a[2] + (b[2]-a[2])*tt) * s_)
+                return f
+            s_box    = _polyline3(_CUBE_PATH)
+            s_cube_x = _polyline3(_CUBE_X_PATH)
+
+            def s_mobius(u):
+                u2   = u * 2.0
+                v    = 0.3
+                f_   = 1.0 + v * math.cos(u2 / 2.0)
+                norm = 1.0 / (1.0 + v)
+                return (f_ * math.cos(u2) * norm,
+                        v  * math.sin(u2 / 2.0) * norm,
+                        f_ * math.sin(u2) * norm)
+
+            def s_dna(u):
+                wind = u * 6.0
+                r    = 0.35
+                if u < math.pi:
+                    tt = u / math.pi
+                    return (r*math.cos(wind), tt*2 - 1, r*math.sin(wind))
                 else:
-                    out, max_r = [], 0.0
-                    for i in range(N + 1):
-                        th = (i / N) * _TWO_PI
-                        sv = abs(math.cos(m_int * th / 4)) ** n2 + abs(math.sin(m_int * th / 4)) ** n3
-                        r  = (sv ** (-1.0 / n1)) if sv > 1e-9 else 0.0
-                        if not math.isfinite(r): r = 0.0
-                        out.append(r)
-                        if r > max_r: max_r = r
-                    norm = (1.0 / max_r) if max_r > 0 else 1.0
-                    return [v * norm for v in out]
+                    tt = (u - math.pi) / math.pi
+                    ph = wind + math.pi
+                    return (r*math.cos(ph), 1 - tt*2, r*math.sin(ph))
 
-            r_low  = _sf_samples(m_low)
-            r_high = _sf_samples(m_high)
+            SHAPES = {
+                "circle": s_circle,         "liss32": s_liss32,
+                "star5":  s_star5,          "rose5":  s_rose5,
+                "lemniscate": s_lemniscate, "nephroid": s_nephroid,
+                "trefoil": s_trefoil,
+                "torus_53": s_torus_53,     "torus_72": s_torus_72,
+                "maurer_6": s_maurer_6,     "maurer_8": s_maurer_8,
+                "butterfly": s_butterfly,
+                "spiro_5": s_spiro_5,       "spiro_4": s_spiro_4,
+                "warped":  s_warped,
+                "slinky":  s_slinky,        "globe": s_globe,
+                "donut":   s_donut,         "box":   s_box,
+                "cube_x":  s_cube_x,        "mobius": s_mobius,
+                "dna":     s_dna,
+            }
+            SHAPE_KEYS = list(SHAPES.keys())
 
-            for layer in range(2):
-                shrink = 1.0 - layer * 0.18
-                hue    = (h_val + layer * 0.08) % 1.0
-                v      = 0.85 - layer * 0.10
-                rc, gc, bc = colorsys.hsv_to_rgb(hue, 0.95, v)
-                col = (int(rc*255), int(gc*255), int(bc*255), 220 - layer * 40)
+            enabled = [k for k in enabled_names if k in SHAPES]
+            if not enabled:
+                enabled = SHAPE_KEYS[:]
+
+            # ── Shape carousel ───────────────────────────────────────────────
+            if "me_sa" not in aux:
+                aux["me_sa"]      = enabled[0]
+                aux["me_sb"]      = enabled[1 if len(enabled) > 1 else 0]
+                aux["me_next_at"] = me_t + interval
+
+            if aux["me_sa"] not in enabled:
+                aux["me_sa"] = enabled[0]
+            if aux["me_sb"] not in enabled:
+                aux["me_sb"] = enabled[1 if len(enabled) > 1 else 0]
+
+            if me_t >= aux["me_next_at"]:
+                aux["me_sa"] = aux["me_sb"]
+                choices = [k for k in enabled if k != aux["me_sa"]] or [aux["me_sa"]]
+                aux["me_sb"] = random.choice(choices)
+                aux["me_next_at"] = me_t + interval
+
+            time_left = aux["me_next_at"] - me_t
+            if time_left < xfade:
+                raw_b = 1.0 - (time_left / xfade)
+                blend = raw_b * raw_b * (3 - 2*raw_b)
+            else:
+                blend = 0.0
+
+            # ── Split / merge state machine ──────────────────────────────────
+            if "me_count" not in aux:
+                aux["me_count"]        = 1
+                aux["me_count_target"] = 1
+                aux["me_count_ch_t"]   = me_t
+                aux["me_prev_count"]   = 1
+                aux["me_quiet_since"]  = me_t
+                aux["me_prev_beat"]    = False
+                aux["me_orbit_clock"]  = 0.0
+                aux["me_orbit_speed"]  = TWO_PI / 30.0
+                aux["me_insts"]        = [
+                    {"scale": 0.0, "phase_off": 0.0,         "spin": 0.0,
+                     "yaw": 0.0,   "tilt": 0.0,  "hue_off": 0.00},
+                    {"scale": 0.0, "phase_off": math.pi,     "spin": 0.0,
+                     "yaw": 1.0,   "tilt": 0.4,  "hue_off": 0.17},
+                    {"scale": 0.0, "phase_off": 4*math.pi/3, "spin": 0.0,
+                     "yaw": 2.0,   "tilt": -0.3, "hue_off": 0.34},
+                ]
+
+            cur_beat    = bool(getattr(self, "_sa_beat_detected", False))
+            rising_beat = cur_beat and not aux["me_prev_beat"]
+            aux["me_prev_beat"] = cur_beat
+
+            if not (bass < 0.18 and mid < 0.22):
+                aux["me_quiet_since"] = me_t
+            quiet_dur    = me_t - aux["me_quiet_since"]
+            since_change = me_t - aux["me_count_ch_t"]
+            is_strong    = rising_beat and bass > split_gate and since_change > beat_lock
+
+            if quiet_dur > merge_quiet and aux["me_count_target"] > 1:
+                aux["me_count_target"] = 1
+                aux["me_count_ch_t"]   = me_t
+            elif is_strong and aux["me_count_target"] < 3:
+                aux["me_count_target"] += 1
+                aux["me_count_ch_t"]   = me_t
+            aux["me_count"] = aux["me_count_target"]
+            n_active = aux["me_count"]
+
+            # ── Orbit clock — speed driven by shared excite level (0..3) ────
+            _ORBIT_PERIODS = (30.0, 18.0, 9.0, 4.0)
+            _excite_lvl    = max(0, min(3, int(getattr(self, "_sa_rot_level", 0))))
+            target_speed   = TWO_PI / _ORBIT_PERIODS[_excite_lvl]
+            aux["me_orbit_speed"] += (target_speed - aux["me_orbit_speed"]) * min(1.0, real_dt * 0.5)
+            aux["me_orbit_clock"]  = (aux["me_orbit_clock"] + aux["me_orbit_speed"] * real_dt) % TWO_PI
+
+            # ── New instances enter at the BACK of the orbit at scale 0 ─────
+            prev_count = aux["me_prev_count"]
+            if n_active > prev_count:
+                for i in range(prev_count, n_active):
+                    aux["me_insts"][i]["phase_off"] = math.pi
+                    aux["me_insts"][i]["scale"]     = 0.0
+            aux["me_prev_count"] = n_active
+
+            # ── Per-instance ease: scale + shortest-arc orbit phase ──────────
+            ease = min(1.0, real_dt * 3.2)
+            for i in range(3):
+                inst   = aux["me_insts"][i]
+                tScale = 1.0 if i < n_active else 0.0
+                inst["scale"] += (tScale - inst["scale"]) * ease
+                if   n_active == 1: target_ph = 0.0
+                elif n_active == 2: target_ph = i * math.pi
+                else:               target_ph = i * TWO_PI / 3.0
+                cur   = inst["phase_off"]
+                delta = ((target_ph - cur) % TWO_PI + 3*math.pi) % TWO_PI - math.pi
+                inst["phase_off"] = (cur + delta * ease) % TWO_PI
+
+            # ── Per-instance spin / yaw / tilt (audio-coupled, independent) ─
+            spin_rates = (
+                 spin_rate * (1.00 + bass   * 0.80),
+                -spin_rate * (0.75 + mid    * 0.60),
+                 spin_rate * (1.30 + treble * 0.50),
+            )
+            yaw_rates = (
+                 yaw_rate * (0.80 + bass   * 0.45),
+                -yaw_rate * (0.65 + mid    * 0.40),
+                 yaw_rate * (1.10 + treble * 0.30),
+            )
+            tilt_rates = (tilt_rate * 0.60, -tilt_rate * 0.40, tilt_rate * 0.85)
+            for i in range(3):
+                inst = aux["me_insts"][i]
+                inst["spin"] = (inst["spin"] + spin_rates[i] * real_dt) % TWO_PI
+                inst["yaw"]  = (inst["yaw"]  + yaw_rates[i]  * real_dt) % TWO_PI
+                inst["tilt"] = (inst["tilt"] + tilt_rates[i] * real_dt) % TWO_PI
+
+            aux["me_hue"] = (aux.get("me_hue", 0.0) + real_dt * hue_drift) % 1.0
+            base_hue = h_val
+
+            # ── Build trail frame ────────────────────────────────────────────
+            prev = self._spec_hallu_prev_frame
+            if prev is None or prev.size != (W, H):
+                prev = _PILImage.new("RGBA", (W, H), (0, 0, 0, 255))
+            faded = _PILImage.blend(
+                _PILImage.new("RGBA", (W, H), (0, 0, 0, 255)), prev, trail)
+            draw  = _PILDraw.Draw(faded, "RGBA")
+
+            # ── Sample A/B curves once per frame ─────────────────────────────
+            N    = 360
+            fnA  = SHAPES[aux["me_sa"]]
+            fnB  = SHAPES[aux["me_sb"]]
+            a_pts = [fnA((k / N) * TWO_PI) for k in range(N + 1)]
+            b_pts = [fnB((k / N) * TWO_PI) for k in range(N + 1)]
+
+            # ── Camera + orbit geometry ──────────────────────────────────────
+            # True perspective division keeps straight 3D lines straight in 2D
+            # under arbitrary rotation (the linear 1+z*p hack warps mid-rotation).
+            cam_d  = 3.0 + (1.0 - persp) * 6.0
+            wobble = math.sin(me_t * 0.15) * orbit_wobble
+            cosW, sinW = math.cos(wobble), math.sin(wobble)
+            pix    = (H / 2.0) * 0.82
+            cen_x  = W / 2.0
+            cen_y  = H / 2.0
+
+            drawables = []
+            for i in range(3):
+                inst = aux["me_insts"][i]
+                if inst["scale"] < 0.02:
+                    continue
+                phase  = aux["me_orbit_clock"] + inst["phase_off"]
+                ox_pre = orbit_x * math.cos(phase)
+                oz_pre = orbit_z * math.sin(phase)
+                ox =  ox_pre
+                oy = -oz_pre * sinW
+                oz =  oz_pre * cosW
+                drawables.append((oz, i, inst, ox, oy))
+            drawables.sort(key=lambda d: d[0])    # far-to-near (ascending oz)
+
+            for oz, i, inst, ox, oy in drawables:
+                cf    = cam_d / max(0.5, cam_d - oz)
+                cx_px = cen_x + ox * cf * pix
+                cy_px = cen_y + oy * cf * pix
+
+                nearness = (oz / max(1e-6, orbit_z) + 1.0) * 0.5
+                nearness = max(0.0, min(1.0, nearness))
+                d_alpha  = 0.45 + 0.55 * nearness
+
+                cyR = math.cos(inst["yaw"]);  syR = math.sin(inst["yaw"])
+                cxR = math.cos(inst["tilt"]); sxR = math.sin(inst["tilt"])
+                csZ = math.cos(inst["spin"]); snZ = math.sin(inst["spin"])
+                s_  = inst["scale"]
                 pts = []
-                for i in range(N + 1):
-                    theta = (i / N) * _TWO_PI
-                    r     = r_low[i] + blend * (r_high[i] - r_low[i])
-                    pts.append((cx + base_rx * r * shrink * math.cos(theta),
-                                cy + base_ry * r * shrink * math.sin(theta)))
-                pts.append(pts[0])
-                draw.line(pts, fill=col, width=2)
+                for k in range(N + 1):
+                    a = a_pts[k]; b = b_pts[k]
+                    x = a[0] + blend * (b[0] - a[0])
+                    y = a[1] + blend * (b[1] - a[1])
+                    z = a[2] + blend * (b[2] - a[2])
+
+                    xr  =  x * cyR + z * syR
+                    zr  = -x * syR + z * cyR
+                    yr  =  y * cxR - zr * sxR
+                    zr2 =  y * sxR + zr * cxR
+
+                    wx = ox + xr  * s_
+                    wy = oy + yr  * s_
+                    wz = oz + zr2 * s_
+
+                    pf = cam_d / max(0.5, cam_d - wz)
+                    px = cen_x + wx * pf * pix
+                    py = cen_y + wy * pf * pix
+
+                    dx = px - cx_px
+                    dy = py - cy_px
+                    pts.append((cx_px + dx * csZ - dy * snZ,
+                                cy_px + dx * snZ + dy * csZ))
+                pts[-1] = pts[0]    # snap closure
+
+                hue = (base_hue + inst["hue_off"] + (1.0 - nearness) * 0.12) % 1.0
+                for layer in range(2):
+                    sat   = 0.95 - layer * 0.20
+                    val   = (0.90 - layer * 0.10) * d_alpha
+                    rc, gc, bc = colorsys.hsv_to_rgb(hue, sat, val)
+                    base_w = 5 if layer == 0 else 2
+                    width  = max(1, int(round(base_w * (0.55 + nearness * 0.55))))
+                    alpha  = int((110 if layer == 0 else 230) * d_alpha)
+                    col    = (int(rc*255), int(gc*255), int(bc*255), alpha)
+                    try:
+                        draw.line(pts, fill=col, width=width, joint="curve")
+                    except TypeError:
+                        draw.line(pts, fill=col, width=width)
+
+                if treble > 0.45 and nearness > 0.55:
+                    rcs, gcs, bcs = colorsys.hsv_to_rgb(hue, 0.55, 1.0)
+                    sp_col = (int(rcs*255), int(gcs*255), int(bcs*255),
+                              int(255 * d_alpha))
+                    for _ in range(3):
+                        k = int(random.random() * N)
+                        sx, sy = pts[k]
+                        draw.rectangle((sx-1, sy-1, sx+1, sy+1), fill=sp_col)
+
             return faded
 
         # ── Lissajous Ribbon ──────────────────────────────────────────────────
