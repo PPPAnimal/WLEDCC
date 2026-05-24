@@ -96,6 +96,7 @@ LOG_MAX = 10  # keep this many session log files
 LOG_DIR = os.path.join(os.environ.get("APPDATA", os.path.dirname(os.path.abspath(__file__))), "WLEDCC")
 os.makedirs(LOG_DIR, exist_ok=True)  # create folder on first run if it doesn't exist
 CACHE_FILE = os.path.join(LOG_DIR, "wledcc_cache.json")
+TELEMETRY_URL = "https://script.google.com/macros/s/AKfycbzcsRVjbRMjoKKKCvzxinf9EMVUF1toayTk4FR9T1f98MgA2VxNDUwu18_-jFicz-re/exec"
 GITHUB_RELEASES_URL = "https://api.github.com/repos/Aircoookie/WLED/releases/latest"
 LEDFX_RELEASES_URL = "https://api.github.com/repos/LedFx/LedFx/releases/latest"
 WLEDCC_RELEASES_API_URL = "https://api.github.com/repos/PPPAnimal/WLEDCC/releases/latest"
@@ -386,6 +387,21 @@ class WLEDApp:
         self._exe_pick_callback = None          # set before opening exe_picker
         self.exe_picker = ft.FilePicker(on_upload=self._on_exe_pick_result)
 
+        # Telemetry counters — defaults apply on first run (no cache file yet)
+        self.telem_is_new_user    = True
+        self.telem_new_launches   = 0
+        self.telem_new_hours      = 0.0
+        self.telem_new_ledfx      = 0
+        self.telem_new_winamp     = 0
+        self.telem_new_spotify    = 0
+        self.telem_total_launches = 0
+        self.telem_total_hours    = 0.0
+        self._telem_session_start   = None
+        self._telem_ledfx_counted   = False
+        self._telem_winamp_counted  = False
+        self._telem_spotify_exe_counted = False
+        self._telem_spotify_url_counted = False
+
         self.load_cache()
         _default_cards_seeded = self._seed_default_custom_cards()
         if self.save_logs_to_disk:
@@ -405,6 +421,8 @@ class WLEDApp:
         self.log(f"[Version] Reading from: {_VERSION_FILE}", color="grey500")
         if getattr(self, "_cache_load_warning", None):
             self.log(self._cache_load_warning, color="red400")
+        threading.Thread(target=self._telem_init, daemon=True).start()
+        threading.Thread(target=self._telem_hour_tick, daemon=True).start()
         threading.Thread(target=self.fetch_latest_release, daemon=True).start()
         threading.Thread(target=self.check_wledcc_updates, daemon=True).start()
 
@@ -926,6 +944,9 @@ class WLEDApp:
             # LedFx just started — show grey badge on all WLED cards immediately,
             # fetch LedFx scenes for the scene toggle
             if is_running and not _was_running:
+                if not self._telem_ledfx_counted:
+                    self.telem_new_ledfx += 1
+                    self._telem_ledfx_counted = True
                 self.log("[Live] LedFx started — showing badges on all WLED devices", color="cyan")
                 if self.auto_restore_ledfx_scene and self.last_ledfx_scene_id:
                     self._pending_ledfx_scene_restore = True
@@ -1534,6 +1555,13 @@ class WLEDApp:
         if self._exit_in_progress:
             return
 
+        # Pre-compute fractional hours now so they're already saved before Close is clicked.
+        # Safe to call early — _telem_close() clears _telem_session_start so a second call
+        # at actual close is a no-op.
+        if not self._cleanup_started:
+            self._telem_close()
+            self.save_cache()
+
         if self.exit_dialog is None:
             self.exit_status_text = ft.Text("", size=11, color="grey400")
             self.exit_stop_ledfx_auto_cb = ft.Checkbox(
@@ -1637,7 +1665,25 @@ class WLEDApp:
         self._finalize_exit()
 
     def _finalize_exit(self):
-        self.cleanup(None)
+        # Fast essential teardown (telem already done at dialog-open time)
+        if not self._cleanup_started:
+            self._cleanup_started = True
+            self._telem_close()
+        self.running = False
+        if self._sa:
+            try:   self._sa.stop()
+            except Exception: pass
+        self.brightness_queue.put(None)
+        if self._save_timer is not None:
+            self._save_timer.cancel()
+            self._save_timer = None
+            self._do_save_cache()
+        if self._log_fh:
+            try: self._log_fh.close()
+            except: pass
+        self._log_fh = None
+
+        # Destroy window — user sees app gone immediately
         try:
             async def _safe_destroy():
                 try:
@@ -1645,13 +1691,14 @@ class WLEDApp:
                 except Exception:
                     pass
             self.page.run_task(_safe_destroy)
-            return
         except:
-            pass
-        try:
-            self.page.window_destroy()
-        except:
-            pass
+            try:
+                self.page.window_destroy()
+            except:
+                pass
+
+        # Slow teardown runs after window is gone — user never waits for it
+        threading.Thread(target=self._exit_slow_teardown, daemon=False).start()
         
     def _first_run_path_scan(self):
         """Scan for Winamp and LedFx paths exactly once on first run. After that, wait for user to click launch."""
@@ -5326,6 +5373,8 @@ class WLEDApp:
             self._spotify_media_listener_thread = threading.Thread(target=self._spotify_media_listener_loop, daemon=True)
             self._spotify_media_listener_active = True
             self._spotify_media_listener_thread.start()
+            if not self._telem_spotify_url_counted:
+                self.telem_new_spotify += 1; self._telem_spotify_url_counted = True
             self.log("[Spotify] GSMTC listener started", color="grey500")
         elif (not _should) and self._spotify_media_listener_active:
             self._spotify_media_listener_stop.set()
@@ -6068,6 +6117,10 @@ class WLEDApp:
                     "kind": "exe", "pid": running_pid, "managed": False, "path": target
                 }
                 self._update_custom_card_launch_ui(key, True)
+                if self._is_winamp_target(target) and not self._telem_winamp_counted:
+                    self.telem_new_winamp += 1; self._telem_winamp_counted = True
+                elif self._is_spotify_exe_target(target) and not self._telem_spotify_exe_counted:
+                    self.telem_new_spotify += 1; self._telem_spotify_exe_counted = True
                 self.log(f"[App] '{name}' already running (PID {running_pid})", color="cyan")
                 return
             try:
@@ -6078,8 +6131,12 @@ class WLEDApp:
                 self._update_custom_card_launch_ui(key, True)
                 if self._is_winamp_target(target):
                     self._queue_winamp_play(target)
+                    if not self._telem_winamp_counted:
+                        self.telem_new_winamp += 1; self._telem_winamp_counted = True
                 elif self._is_spotify_exe_target(target):
                     self._queue_spotify_desktop_play(key)
+                    if not self._telem_spotify_exe_counted:
+                        self.telem_new_spotify += 1; self._telem_spotify_exe_counted = True
                 prefix = "[Auto Start]" if auto else "[App]"
                 self.log(f"{prefix} Launched '{name}' (PID {proc.pid})", color="green400")
             except Exception as ex:
@@ -6092,10 +6149,14 @@ class WLEDApp:
                 "kind": "url", "pid": running_pid, "managed": False, "url": target
             }
             self._update_custom_card_launch_ui(key, True)
+            if self._is_spotify_url_target(target) and not self._telem_spotify_url_counted:
+                self.telem_new_spotify += 1; self._telem_spotify_url_counted = True
             self.log(f"[Web] '{name}' already open (PID {running_pid})", color="cyan")
             return
 
         if self._is_spotify_url_target(target):
+            if not self._telem_spotify_url_counted:
+                self.telem_new_spotify += 1; self._telem_spotify_url_counted = True
             try:
                 self._ensure_spotify_playback(key, target, auto=auto, allow_open=True, force_dedicated_open=True)
             except Exception as ex:
@@ -6316,6 +6377,8 @@ class WLEDApp:
                         "url": target if not is_exe else None,
                     }
                     self._update_custom_card_launch_ui(key, True)
+                    if is_exe and self._is_winamp_target(target) and not self._telem_winamp_counted:
+                        self.telem_new_winamp += 1; self._telem_winamp_counted = True
                     self.log(f"[App] '{card_name}' detected running", color="grey500")
             time.sleep(4.0)
 
@@ -8721,6 +8784,7 @@ class WLEDApp:
         _args = [_exe] if os.path.isfile(_exe) else [_sys.executable, _py]
         if self.debug_mode:
             _args.append("--debug-mode")
+        _args.append("--docked")
         try:
             subprocess.Popen(_args, cwd=_here)
             self.log(f"[SA] Launched {'SA.exe' if os.path.isfile(_exe) else 'SA.py'}", color="cyan")
@@ -9674,6 +9738,15 @@ class WLEDApp:
         self.ledfx_devices = set()  # Populated dynamically when LedFx poll detects active devices
         self.poll_counters = {}  # ip -> consecutive poll count
 
+        self.telem_is_new_user    = c.get("telem_is_new_user",    True)
+        self.telem_new_launches   = c.get("telem_new_launches",   0)
+        self.telem_new_hours      = c.get("telem_new_hours",      0.0)
+        self.telem_new_ledfx      = c.get("telem_new_ledfx",      0)
+        self.telem_new_winamp     = c.get("telem_new_winamp",     0)
+        self.telem_new_spotify    = c.get("telem_new_spotify",    0)
+        self.telem_total_launches = c.get("telem_total_launches", 0)
+        self.telem_total_hours    = c.get("telem_total_hours",    0.0)
+
     def load_cache(self):
         """Load cache from disk. On failure, tries backups from newest to oldest."""
         self._cache_load_warning = None  # will be logged after UI is ready
@@ -9736,6 +9809,9 @@ class WLEDApp:
             "exit_remember_actions", "exit_auto_stop_ledfx", "exit_auto_all_off",
             "ledfx_auto_start", "auto_start_ledfx_on_launch",
             "auto_restore_wled_scene", "auto_restore_ledfx_scene", "last_ledfx_scene_id",
+            "telem_is_new_user", "telem_new_launches", "telem_new_hours",
+            "telem_new_ledfx", "telem_new_winamp", "telem_new_spotify",
+            "telem_total_launches", "telem_total_hours",
         }
         _DICT_KEYS = {
             "devices", "types", "custom_names", "display_names",
@@ -9893,6 +9969,14 @@ class WLEDApp:
             "auto_restore_ledfx_scene": self.auto_restore_ledfx_scene,
             "last_ledfx_scene_id": self.last_ledfx_scene_id,
             "last_wled_scene_idx": self.last_wled_scene_idx,
+            "telem_is_new_user":    self.telem_is_new_user,
+            "telem_new_launches":   self.telem_new_launches,
+            "telem_new_hours":      round(self.telem_new_hours, 4),
+            "telem_new_ledfx":      self.telem_new_ledfx,
+            "telem_new_winamp":     self.telem_new_winamp,
+            "telem_new_spotify":    self.telem_new_spotify,
+            "telem_total_launches": self.telem_total_launches,
+            "telem_total_hours":    round(self.telem_total_hours, 4),
         }
         try:
             if self._needs_pre_save_backup:
@@ -11087,22 +11171,91 @@ class WLEDApp:
         # last SET value, not the actual OS size. page.on_resize (e.width) is
         # the only reliable source and handles all resize/maximize/restore cases.
 
-    def cleanup(self, e):
-        if self._cleanup_started:
+    def _telem_send(self):
+        try:
+            # Snapshot before POST — any increments during the network call are preserved
+            _launches = self.telem_new_launches
+            _hours    = self.telem_new_hours
+            _ledfx    = self.telem_new_ledfx
+            _winamp   = self.telem_new_winamp
+            _spotify  = self.telem_new_spotify
+            payload = {
+                "source":   "wledcc",
+                "version":  APP_VERSION,
+                "new_user": 1 if self.telem_is_new_user else 0,
+                "launches": _launches,
+                "hours":    round(_hours, 2),
+                "ledfx":    _ledfx,
+                "winamp":   _winamp,
+                "spotify":  _spotify,
+            }
+            requests.post(TELEMETRY_URL, json=payload, timeout=5)
+            # Subtract what was sent rather than zeroing, so concurrent increments survive
+            self.telem_is_new_user   = False
+            self.telem_new_launches -= _launches
+            self.telem_new_hours    -= _hours
+            self.telem_new_ledfx    -= _ledfx
+            self.telem_new_winamp   -= _winamp
+            self.telem_new_spotify  -= _spotify
+            self.save_cache()
+            self.log("[Telemetry] Sent.", color="cyan", debug=True)
+            return True
+        except Exception:
+            return False
+
+    def _telem_init(self):
+        self._telem_session_start  = time.time()
+        self.telem_new_launches   += 1
+        self.telem_total_launches += 1
+        self.save_cache()
+        self._telem_send()
+
+    def _telem_hour_tick(self):
+        while self.running:
+            time.sleep(3600)
+            if not self.running:
+                break
+            self.telem_new_hours   += 1.0
+            self.telem_total_hours += 1.0
+            self.save_cache()
+
+    def _telem_close(self):
+        if self._telem_session_start is None:
             return
-        self._cleanup_started = True
+        elapsed_hrs = (time.time() - self._telem_session_start) / 3600
+        fraction = elapsed_hrs % 1.0  # full hours already captured by hour tick
+        self.telem_new_hours   += fraction
+        self.telem_total_hours += fraction
+        self._telem_session_start = None
+
+    def _exit_slow_teardown(self):
+        """Slow exit tasks — safe to run in a background thread after the window is gone."""
         try:
             self._run_custom_autoclose_on_exit()
         except:
             pass
+        self._mh_stop_bridge()
+        self.mh_bulb_queues.clear()
+        # Give background threads time to see running=False before Flet tears down
+        time.sleep(0.8)
+        try:
+            if self.browser:
+                self.browser.cancel()
+            self.zeroconf.close()
+        except:
+            pass
+
+    def cleanup(self, e):
+        if self._cleanup_started:
+            return
+        self._cleanup_started = True
+        self._telem_close()
+        self.save_cache()
         self.running = False
         if self._sa:
             try:   self._sa.stop()
             except Exception: pass
         self.brightness_queue.put(None)
-        # Stop MH bridge and all bulb workers cleanly
-        self._mh_stop_bridge()
-        self.mh_bulb_queues.clear()
         # Flush any pending debounced save before closing
         if self._save_timer is not None:
             self._save_timer.cancel()
@@ -11112,14 +11265,7 @@ class WLEDApp:
             try: self._log_fh.close()
             except: pass
         self._log_fh = None
-        # Give all background threads time to see running=False and stop their UI updates
-        # before Flet tears down the websocket — prevents socket.send() exceptions
-        time.sleep(0.8)
-        try:
-            if self.browser:
-                self.browser.cancel()
-            self.zeroconf.close()
-        except: pass
+        self._exit_slow_teardown()
 
     def _safe_ui_update(self, control):
         """Update a control only if the app is still running."""

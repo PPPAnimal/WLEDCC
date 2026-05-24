@@ -743,7 +743,125 @@ class _BeatDetector:
 _VERSION_DIR = os.path.dirname(sys.executable if getattr(sys, "frozen", False) else os.path.abspath(__file__))
 _DATA_DIR    = os.path.join(os.environ.get("APPDATA", _VERSION_DIR), "WLEDCC")
 os.makedirs(_DATA_DIR, exist_ok=True)
-SA_CONFIG_FILE = os.path.join(_DATA_DIR, "SA-config.json")
+SA_CONFIG_FILE    = os.path.join(_DATA_DIR, "SA-config.json")
+_TELEMETRY_URL    = "https://script.google.com/macros/s/AKfycbzcsRVjbRMjoKKKCvzxinf9EMVUF1toayTk4FR9T1f98MgA2VxNDUwu18_-jFicz-re/exec"
+_SA_TELEM_FILE    = os.path.join(_DATA_DIR, "sa_telemetry.json")
+_SA_IS_DOCKED     = "--docked" in sys.argv
+
+# ── SA standalone telemetry helpers (no-ops when docked) ─────────────────────
+_SA_TELEM_LOCK = _SA_TELEM_FILE + ".lock"
+
+def _sa_telem_acquire_lock():
+    """O_EXCL is atomic — only one process creates the file. Retries ~0.5 s.
+    Stale locks (> 5 s old) are removed automatically in case of a prior crash."""
+    for _ in range(10):
+        try:
+            fd = os.open(_SA_TELEM_LOCK, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            return fd
+        except FileExistsError:
+            try:
+                if time.time() - os.path.getmtime(_SA_TELEM_LOCK) > 5:
+                    os.unlink(_SA_TELEM_LOCK)
+            except Exception:
+                pass
+            time.sleep(0.05)
+    return -1
+
+def _sa_telem_release_lock(fd):
+    try:
+        os.close(fd)
+        os.unlink(_SA_TELEM_LOCK)
+    except Exception:
+        pass
+
+def _sa_telem_load():
+    try:
+        if os.path.exists(_SA_TELEM_FILE):
+            with open(_SA_TELEM_FILE) as _f:
+                return json.load(_f)
+    except Exception:
+        pass
+    return {}
+
+def _sa_telem_save(state):
+    try:
+        with open(_SA_TELEM_FILE, "w") as _f:
+            json.dump(state, _f)
+    except Exception:
+        pass
+
+def _sa_telem_update(delta_launches=0, delta_hours=0.0, delta_total_l=0, delta_total_h=0.0, set_is_new=None, session_start=None):
+    """Locked read-modify-write on the telemetry file."""
+    fd = _sa_telem_acquire_lock()
+    try:
+        state = _sa_telem_load()
+        state["new_launches"]   = state.get("new_launches",   0)   + delta_launches
+        state["new_hours"]      = state.get("new_hours",      0.0) + delta_hours
+        state["total_launches"] = state.get("total_launches", 0)   + delta_total_l
+        state["total_hours"]    = state.get("total_hours",    0.0) + delta_total_h
+        if set_is_new is not None:
+            state["is_new_user"] = set_is_new
+        if session_start is not None:
+            state["session_start"] = session_start
+        _sa_telem_save(state)
+        return state
+    finally:
+        _sa_telem_release_lock(fd)
+
+def _sa_telem_send(is_new, launches, hours, version):
+    import urllib.request as _ur
+    try:
+        payload = {
+            "source":   "sa",
+            "version":  version,
+            "new_user": 1 if is_new else 0,
+            "launches": launches,
+            "hours":    round(hours, 2),
+        }
+        req = _ur.Request(
+            _TELEMETRY_URL,
+            data=json.dumps(payload).encode(),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        _ur.urlopen(req, timeout=5)
+        return True
+    except Exception:
+        return False
+
+def _sa_telem_init(app):
+    try:
+        _vf = os.path.join(_VERSION_DIR, "version.txt")
+        with open(_vf) as _f:
+            _ver = _f.read().strip()
+    except Exception:
+        _ver = ""
+    app._sa_telem_version = _ver
+    app._sa_telem_session_start = time.time()
+
+    state = _sa_telem_update(delta_launches=1, delta_total_l=1, session_start=app._sa_telem_session_start)
+    is_new      = state.get("is_new_user",   True)
+    new_launches = state.get("new_launches", 1)
+    new_hours    = state.get("new_hours",    0.0)
+
+    if _sa_telem_send(is_new, new_launches, new_hours, _ver):
+        # Subtract what was sent — preserves any increments that happened during the POST
+        _sa_telem_update(delta_launches=-new_launches, delta_hours=-new_hours, set_is_new=False)
+
+def _sa_telem_hour_tick(app):
+    while getattr(app, "_sa_telem_running", True):
+        time.sleep(3600)
+        if not getattr(app, "_sa_telem_running", True):
+            break
+        _sa_telem_update(delta_hours=1.0, delta_total_h=1.0)
+
+def _sa_telem_close(app):
+    if getattr(app, "_sa_telem_session_start", None) is None:
+        return
+    app._sa_telem_running = False
+    fraction = ((time.time() - app._sa_telem_session_start) / 3600) % 1.0
+    _sa_telem_update(delta_hours=fraction, delta_total_h=fraction)
+    app._sa_telem_session_start = None
 
 # ── Background image defaults per NVU mode ───────────────────────────────────
 _NVU_BG_DEFAULTS = {
@@ -9300,6 +9418,13 @@ class SpectrumApp:
         self._sc.sync_status_visibility()  # Sync initial debug mode state
         self._status_overlay.visible = self._debug_mode
         self._status_overlay.update()
+        # ── Telemetry (standalone only) ────────────────────────────────────
+        self._sa_telem_session_start = None
+        self._sa_telem_running       = True
+        self._sa_telem_version       = ""
+        if not _SA_IS_DOCKED:
+            threading.Thread(target=lambda: _sa_telem_init(self), daemon=True).start()
+            threading.Thread(target=lambda: _sa_telem_hour_tick(self), daemon=True).start()
         # ── Window event handler (close) + resize hook ────────────────────
         page.window.on_event = self._on_window_event
         page.on_resize        = lambda e: self._recompute_scale()
@@ -9512,6 +9637,8 @@ class SpectrumApp:
 
     def _on_window_event(self, e):
         if getattr(e, "data", None) == "close":
+            if not _SA_IS_DOCKED:
+                _sa_telem_close(self)
             if self._hook_installed:
                 try:
                     hwnd = getattr(self._sc, "_own_hwnd", None)

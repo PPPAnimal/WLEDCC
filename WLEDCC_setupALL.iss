@@ -66,7 +66,6 @@ Type: files; Name: "{app}\Retro Yellow.jpg"
 procedure CurUninstallStepChanged(CurUninstallStep: TUninstallStep);
 var
   ProfilesDir: string;
-  FindRec: TFindRec;
   DataDir: string;
   DeleteData: Boolean;
 begin
